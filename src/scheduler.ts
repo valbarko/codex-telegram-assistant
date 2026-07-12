@@ -4,6 +4,7 @@ import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import type { CodexHub, Conversation, TurnObserver } from "./codex-engine.js";
+import { quietCodexPrompt } from "./prompt-policy.js";
 import type { Alarm, AssistantDatabase, WorkItem } from "./storage.js";
 
 export class BackgroundScheduler {
@@ -80,7 +81,7 @@ export class BackgroundScheduler {
       approval: async () => "decline",
     };
     try {
-      await conversation.run(task.prompt, observer);
+      await conversation.run(quietCodexPrompt(task.prompt), observer);
       this.database.updateTask(task.id, { status: "done", finishedAt: Date.now(), threadId: conversation.snapshot().threadId });
       this.saveConversation(task.owner, conversation);
       await this.send(task.owner, `✅ ${task.title}${response.trim() ? `\n\n${response.trim()}` : ""}`);

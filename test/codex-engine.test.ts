@@ -61,4 +61,29 @@ describe("CodexHub", () => {
     await running;
     expect(response).toEqual({ decision: "acceptForSession" });
   });
+
+  it("forwards app-server user questions instead of silently declining them", async () => {
+    const transport = new FakeTransport();
+    transport.autoComplete = false;
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1");
+    const userInput = vi.fn(async () => ({ calendar: { answers: ["Подключить"] } }));
+    const running = conversation.run("Проверка", {
+      text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {}, userInput,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const response = await transport.host?.("item/tool/requestUserInput", {
+      threadId: "thread-1", itemId: "question", autoResolutionMs: 60_000,
+      questions: [{ id: "calendar", header: "Календарь", question: "Подключить?", isOther: false, isSecret: false,
+        options: [{ label: "Подключить", description: "Продолжить" }] }],
+    });
+    transport.complete();
+    await running;
+    expect(userInput).toHaveBeenCalledWith({
+      autoResolutionMs: 60_000,
+      questions: [{ id: "calendar", header: "Календарь", question: "Подключить?", isOther: false, isSecret: false,
+        options: [{ label: "Подключить", description: "Продолжить" }] }],
+    });
+    expect(response).toEqual({ answers: { calendar: { answers: ["Подключить"] } } });
+  });
 });

@@ -15,7 +15,7 @@ describe("TelegramTurnView", () => {
     });
     const editMessageText = vi.fn(async () => true);
     const ctx = { chat: { id: 7 }, reply, api: { editMessageText } };
-    const view = new TelegramTurnView(ctx as never, async () => "decline", false);
+    const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false);
 
     view.text("Разрешение получено. ");
     await vi.advanceTimersByTimeAsync(0);

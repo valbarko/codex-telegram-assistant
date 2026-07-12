@@ -8,9 +8,11 @@ import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import { structureTranscript, transcribeAudio } from "./audio.js";
-import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver } from "./codex-engine.js";
+import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
+  type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
 import { activateCodexWithResume, addCalendarEvent, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
 import { understandAlarm } from "./reminder-language.js";
+import { quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type WorkItem } from "./storage.js";
 
 const TELEGRAM_LIMIT = 4000;
@@ -25,6 +27,15 @@ interface ApprovalWaiter {
 
 interface PendingCalendarEvent { title: string; start: number; }
 
+interface UserQuestionWaiter {
+  context: string;
+  options: readonly string[];
+  acceptsText: boolean;
+  waitingText: boolean;
+  settle: (answers: string[]) => void;
+  timer: NodeJS.Timeout;
+}
+
 export class TelegramApplication {
   readonly bot: Bot<Context>;
   private readonly pending = new Map<string, PendingInput>();
@@ -32,6 +43,8 @@ export class TelegramApplication {
   private readonly projectChoices = new Map<string, string[]>();
   private readonly taskProjectChoices = new Map<string, { taskId: string; projects: string[] }>();
   private readonly calendarEvents = new Map<string, PendingCalendarEvent>();
+  private readonly userQuestions = new Map<string, UserQuestionWaiter>();
+  private readonly userQuestionByContext = new Map<string, string>();
 
   constructor(
     private readonly configuration: AppConfiguration,
@@ -137,6 +150,7 @@ export class TelegramApplication {
     this.bot.command("abort", async (ctx) => {
       const context = contextId(ctx);
       this.cancelApprovals(context);
+      this.cancelUserQuestion(context);
       await (await this.conversation(ctx)).interrupt();
       await ctx.reply("Текущий ход остановлен.");
     });
@@ -206,6 +220,7 @@ export class TelegramApplication {
     this.bot.callbackQuery(/^task:project:(.+)$/, async (ctx) => this.chooseTaskProject(ctx, ctx.match![1]));
     this.bot.callbackQuery(/^taskproject:(\d+)$/, async (ctx) => this.assignTaskProject(ctx, Number(ctx.match![1])));
     this.bot.callbackQuery(/^event:(confirm|cancel):(.+)$/, async (ctx) => this.confirmCalendarEvent(ctx));
+    this.bot.callbackQuery(/^question:([^:]+):(\d+|other)$/, async (ctx) => this.answerUserQuestion(ctx));
     this.bot.callbackQuery("home:task", async (ctx) => {
       this.pending.set(contextId(ctx), "task");
       await ctx.answerCallbackQuery();
@@ -278,6 +293,17 @@ export class TelegramApplication {
     const text = ctx.message?.text?.trim();
     if (!text || text.startsWith("/")) return;
     const key = contextId(ctx);
+    const questionToken = this.userQuestionByContext.get(key);
+    const question = questionToken ? this.userQuestions.get(questionToken) : undefined;
+    if (question) {
+      if (!question.waitingText && !question.acceptsText) {
+        await ctx.reply("Выберите один из вариантов кнопкой.");
+        return;
+      }
+      this.finishUserQuestion(questionToken!, [text]);
+      await ctx.reply("Ответ передан в текущую задачу.");
+      return;
+    }
     const pending = this.pending.get(key);
     if (pending) {
       this.pending.delete(key);
@@ -290,8 +316,9 @@ export class TelegramApplication {
       await ctx.reply(captureCard(captured), { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
       return;
     }
+    if (await this.handleLocalIntent(ctx, text)) return;
     const conversation = await this.conversation(ctx);
-    const routed = looksLikeMail(text) ? gmailPrompt(text) : text;
+    const routed = looksLikeMail(text) ? gmailPrompt(text) : quietCodexPrompt(text);
     if (conversation.snapshot().running) {
       await conversation.steer(routed);
       await ctx.reply("↪️ Уточнение добавлено в текущий ход.");
@@ -300,9 +327,34 @@ export class TelegramApplication {
     await this.executePrompt(ctx, routed);
   }
 
+  private async handleLocalIntent(ctx: Context, text: string): Promise<boolean> {
+    const intent = localIntent(text);
+    if (!intent) return false;
+    if (intent === "calendar-list") {
+      await this.showCalendar(ctx);
+      return true;
+    }
+    if (intent === "calendar-create") {
+      await this.offerCalendarEvent(ctx, text);
+      return true;
+    }
+    const parsed = understandAlarm(text);
+    if (!parsed) {
+      await ctx.reply("Не понял время. Например: «поставь будильник на 14:00» или «напомни завтра в 10 позвонить Анне».");
+      return true;
+    }
+    const label = parsed.label === "Напоминание" && /будильник/i.test(text) ? "Будильник" : parsed.label;
+    const alarm = this.database.createAlarm({ owner: ownerId(ctx), label, nextAt: parsed.at, cadence: parsed.cadence });
+    await ctx.reply(`⏰ <b>Напоминание в Telegram установлено</b>\n${escape(alarm.label)}\n${formatDate(alarm.nextAt)}`, {
+      parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить", `alarm:delete:${alarm.id}`),
+    });
+    return true;
+  }
+
   private async executePrompt(ctx: Context, prompt: string): Promise<void> {
     const conversation = await this.conversation(ctx);
-    const view = new TelegramTurnView(ctx, (request) => this.askApproval(ctx, request), this.configuration.showUsage);
+    const view = new TelegramTurnView(ctx, (request) => this.askApproval(ctx, request),
+      (request) => this.askUserInput(ctx, request), this.configuration.showUsage);
     try {
       await conversation.run(prompt, view);
       await view.finish();
@@ -310,6 +362,74 @@ export class TelegramApplication {
     } catch (error) {
       await view.fail(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  private async askUserInput(ctx: Context, prompt: UserInputPrompt): Promise<UserInputAnswers> {
+    const result: UserInputAnswers = {};
+    for (const question of prompt.questions) {
+      if (question.isSecret) {
+        await ctx.reply(`🔐 <b>${escape(question.header || "Секретный ввод")}</b>\nСекрет нельзя безопасно запросить через Telegram. Выполните этот шаг на Mac.`, { parse_mode: "HTML" });
+        result[question.id] = { answers: [] };
+        continue;
+      }
+      result[question.id] = { answers: await this.askOneQuestion(ctx, question, prompt.autoResolutionMs) };
+    }
+    return result;
+  }
+
+  private async askOneQuestion(ctx: Context, question: UserInputQuestion, autoResolutionMs?: number): Promise<string[]> {
+    const context = contextId(ctx);
+    this.cancelUserQuestion(context);
+    const token = randomUUID().slice(0, 10);
+    const options = (question.options ?? []).map((option) => option.label);
+    const keyboard = new InlineKeyboard();
+    options.forEach((label, index) => keyboard.text(label, `question:${token}:${index}`).row());
+    if (question.isOther) keyboard.text("Другой ответ ✍️", `question:${token}:other`);
+    const timeout = Math.min(Math.max(autoResolutionMs ?? 10 * 60_000, 5_000), 10 * 60_000);
+    const answer = new Promise<string[]>((settle) => {
+      const timer = setTimeout(() => this.finishUserQuestion(token, []), timeout);
+      this.userQuestions.set(token, {
+        context, options, acceptsText: question.isOther || !options.length, waitingText: !options.length, settle, timer,
+      });
+      this.userQuestionByContext.set(context, token);
+    });
+    const details = (question.options ?? []).map((option) => option.description ? `• <b>${escape(option.label)}</b> — ${escape(option.description)}` : "").filter(Boolean);
+    await ctx.reply([`<b>❓ ${escape(question.header || "Нужен ответ")}</b>`, escape(question.question), ...details].join("\n\n"), {
+      parse_mode: "HTML", reply_markup: keyboard,
+    });
+    return answer;
+  }
+
+  private async answerUserQuestion(ctx: Context): Promise<void> {
+    const token = ctx.match![1];
+    const selection = ctx.match![2];
+    const waiter = this.userQuestions.get(token);
+    if (!waiter || waiter.context !== contextId(ctx)) return void await ctx.answerCallbackQuery({ text: "Вопрос уже закрыт" });
+    if (selection === "other") {
+      waiter.waitingText = true;
+      await ctx.answerCallbackQuery({ text: "Напишите ответ" });
+      await ctx.reply("Отправьте свой ответ одним сообщением.");
+      return;
+    }
+    const answer = waiter.options[Number(selection)];
+    if (!answer) return void await ctx.answerCallbackQuery({ text: "Вариант устарел" });
+    this.finishUserQuestion(token, [answer]);
+    await ctx.answerCallbackQuery({ text: `Ответ: ${answer}` });
+    if (ctx.callbackQuery?.message) await ctx.editMessageText(`✅ Ответ передан: <b>${escape(answer)}</b>`, { parse_mode: "HTML" });
+  }
+
+  private finishUserQuestion(token: string, answers: string[]): void {
+    const waiter = this.userQuestions.get(token);
+    if (!waiter) return;
+    clearTimeout(waiter.timer);
+    this.userQuestions.delete(token);
+    if (this.userQuestionByContext.get(waiter.context) === token) this.userQuestionByContext.delete(waiter.context);
+    waiter.settle(answers);
+  }
+
+  private cancelUserQuestion(context: string): void {
+    const token = this.userQuestionByContext.get(context);
+    if (token) this.finishUserQuestion(token, []);
   }
 
   private async askApproval(ctx: Context, prompt: ApprovalPrompt): Promise<ApprovalChoice> {
@@ -415,6 +535,10 @@ export class TelegramApplication {
   private async createCalendarEvent(ctx: Context): Promise<void> {
     const input = commandArgument(ctx);
     if (!input) return void await ctx.reply("Формат: <code>/event завтра в 15:00 Созвон с Анной</code>", { parse_mode: "HTML" });
+    await this.offerCalendarEvent(ctx, input);
+  }
+
+  private async offerCalendarEvent(ctx: Context, input: string): Promise<void> {
     const parsed = understandAlarm(input);
     if (!parsed) return void await ctx.reply("Не понял дату и время события.");
     const token = randomUUID().slice(0, 10);
@@ -654,6 +778,7 @@ export class TelegramTurnView implements TurnObserver {
   constructor(
     private readonly ctx: Context,
     readonly approval: (prompt: ApprovalPrompt) => Promise<ApprovalChoice>,
+    readonly userInput: (prompt: UserInputPrompt) => Promise<UserInputAnswers>,
     private readonly showUsage: boolean,
   ) {}
 
@@ -744,6 +869,14 @@ function oneLine(value: string, limit: number): string { const text = value.repl
 function formatDate(value: number): string { return new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short", timeZone: "Europe/Moscow" }).format(new Date(value)); }
 function distinct(values: string[]): string[] { return [...new Set(values)]; }
 function looksLikeMail(value: string): boolean { const text = value.toLocaleLowerCase("ru-RU"); return /(?:последн|нов|входящ|непрочитанн|найди|покажи|прочитай|ответь).{0,40}(?:письм|почт|gmail)|(?:письм|почт|gmail).{0,40}(?:последн|нов|входящ|непрочитанн|найди|покажи|прочитай|ответь)/i.test(text); }
+export type LocalIntent = "reminder" | "calendar-create" | "calendar-list";
+export function localIntent(value: string): LocalIntent | null {
+  const text = value.toLocaleLowerCase("ru-RU");
+  if (/(?:напомни|напоминание|будильник)/i.test(text)) return "reminder";
+  if (/(?:создай|добавь|запланируй|поставь).{0,40}(?:событ|встреч)|(?:событ|встреч).{0,40}(?:создай|добавь|запланируй|поставь)/i.test(text)) return "calendar-create";
+  if (/(?:покажи|какие|что|расписание|ближайш).{0,40}(?:календар|событ|встреч)|(?:календар|событ|встреч).{0,40}(?:покажи|какие|что|расписание|ближайш)/i.test(text)) return "calendar-list";
+  return null;
+}
 function gmailPrompt(user: string): string { return `Используй подключённый Gmail как источник почты. Не используй Apple Mail или shell. Чтение и поиск разрешены. Ничего не отправляй, не архивируй, не удаляй и не изменяй без отдельного подтверждения. Не описывай внутренний workflow.\n\n${user}`; }
 function searchResults(query: string, hits: ReturnType<AssistantDatabase["search"]>, threads: StoredThread[]): string { const lines = [`<b>🔎 ${escape(query)}</b>`]; for (const hit of hits) lines.push(`${hit.type === "task" ? "📋" : hit.type === "memory" ? "📚" : "📥"} ${escape(oneLine(hit.text, 180))}`); for (const thread of threads) lines.push(`🧵 ${escape(oneLine(thread.title, 180))}`); return lines.length === 1 ? `${lines[0]}\nНичего не найдено.` : lines.join("\n"); }
 function forwardedSource(ctx: Context): { sender?: string; time?: number } { const origin = ctx.message?.forward_origin; if (!origin) return {}; if (origin.type === "user") return { sender: [origin.sender_user.first_name, origin.sender_user.last_name].filter(Boolean).join(" "), time: origin.date * 1000 }; if (origin.type === "hidden_user") return { sender: origin.sender_user_name, time: origin.date * 1000 }; if (origin.type === "channel") return { sender: origin.chat.title, time: origin.date * 1000 }; return { time: origin.date * 1000 }; }

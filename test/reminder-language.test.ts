@@ -14,4 +14,14 @@ describe("understandAlarm", () => {
     expect(understandAlarm("по будням в 18 итоги", now)).toMatchObject({ label: "итоги", cadence: "weekdays" });
   });
   it("rejects an elapsed time", () => expect(understandAlarm("сегодня в 9 поздно", now)).toBeNull());
+  it("understands a standalone alarm time", () => {
+    expect(understandAlarm("поставь будильник на 14:00", now)).toEqual({
+      label: "Напоминание", at: new Date(2026, 6, 12, 14, 0, 0).getTime(), cadence: "once",
+    });
+  });
+  it("understands a comma between today and event time", () => {
+    expect(understandAlarm("создай событие сегодня, 18:00 Позвонить клиенту", now)).toEqual({
+      label: "Позвонить клиенту", at: new Date(2026, 6, 12, 18, 0, 0).getTime(), cadence: "once",
+    });
+  });
 });

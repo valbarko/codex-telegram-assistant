@@ -24,12 +24,12 @@ export function understandAlarm(source: string, now = new Date()): ParsedAlarm |
     while ([0, 6].includes(new Date(at).getDay())) at = plusDays(at, 1);
     return result(input, workdays[0], at, "weekdays");
   }
-  const tomorrow = input.match(/(?:^|\s)завтра(?:\s+в)?\s*(\d{1,2})?(?::(\d{2}))?/i);
+  const tomorrow = input.match(/(?:^|\s)завтра\s*[,;]?\s*(?:(?:в|на)\s*)?(\d{1,2})?(?::(\d{2}))?/i);
   if (tomorrow) {
     const date = new Date(now); date.setDate(date.getDate() + 1); date.setHours(Number(tomorrow[1] ?? 9), Number(tomorrow[2] ?? 0), 0, 0);
     return result(input, tomorrow[0], date.getTime(), "once");
   }
-  const today = input.match(/(?:^|\s)сегодня(?:\s+в)?\s*(\d{1,2})(?::(\d{2}))?/i);
+  const today = input.match(/(?:^|\s)сегодня\s*[,;]?\s*(?:(?:в|на)\s*)?(\d{1,2})(?::(\d{2}))?/i);
   if (today) {
     const date = new Date(now); date.setHours(Number(today[1]), Number(today[2] ?? 0), 0, 0);
     return date.getTime() > now.getTime() ? result(input, today[0], date.getTime(), "once") : null;
@@ -40,11 +40,15 @@ export function understandAlarm(source: string, now = new Date()): ParsedAlarm |
     const date = new Date(year, Number(explicit[2]) - 1, Number(explicit[1]), Number(explicit[4] ?? 9), Number(explicit[5] ?? 0));
     return date.getTime() > now.getTime() ? result(input, explicit[0], date.getTime(), "once") : null;
   }
+  const clock = input.match(/(?:^|\s)(?:в|на)\s*(\d{1,2})(?::(\d{2}))?(?=\s|$|[,.!?])/i);
+  if (clock) return result(input, clock[0], nextClock(now, Number(clock[1]), Number(clock[2] ?? 0)), "once");
   return null;
 }
 
 function result(input: string, matched: string, at: number, cadence: Alarm["cadence"]): ParsedAlarm {
-  const label = input.replace(/^\s*(?:напомни(?:\s+мне)?|создай напоминание)\s*/i, "").replace(matched.trim(), "").replace(/^\s*[|,.:;-]?\s*|\s*[|,.:;-]?\s*$/g, "");
+  const label = input
+    .replace(/^\s*(?:напомни(?:\s+мне)?|создай\s+напоминание|поставь\s+будильник|установи\s+будильник|создай\s+событие|добавь\s+событие|запланируй\s+(?:событие|встречу))\s*/i, "")
+    .replace(matched.trim(), "").replace(/^\s*[|,.:;-]?\s*|\s*[|,.:;-]?\s*$/g, "");
   return { label: label || "Напоминание", at, cadence };
 }
 

@@ -13,6 +13,21 @@ export interface ApprovalPrompt {
   root?: string;
 }
 
+export interface UserInputOption { label: string; description: string; }
+export interface UserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options?: readonly UserInputOption[];
+}
+export interface UserInputPrompt {
+  questions: readonly UserInputQuestion[];
+  autoResolutionMs?: number;
+}
+export type UserInputAnswers = Record<string, { answers: string[] }>;
+
 export interface TurnObserver {
   text(delta: string): void;
   toolStarted(id: string, label: string): void;
@@ -21,6 +36,7 @@ export interface TurnObserver {
   plan?(steps: readonly { text: string; done: boolean }[]): void;
   usage?(last: TokenCount, total: TokenCount): void;
   approval?(prompt: ApprovalPrompt): Promise<ApprovalChoice>;
+  userInput?(prompt: UserInputPrompt): Promise<UserInputAnswers>;
 }
 
 export interface TokenCount {
@@ -286,7 +302,10 @@ export class Conversation {
   }
 
   private async answerHostRequest(name: string, payload: RpcRecord, observer: TurnObserver): Promise<unknown> {
-    if (name === "item/tool/requestUserInput") return { answers: {} };
+    if (name === "item/tool/requestUserInput") {
+      const prompt = readUserInput(payload);
+      return { answers: observer.userInput ? await observer.userInput(prompt) : {} };
+    }
     const requested = approvalFrom(name, payload);
     if (!requested) throw new Error(`Unsupported host request: ${name}`);
     const choice = observer.approval ? await observer.approval(requested) : "decline";
@@ -299,6 +318,23 @@ export class Conversation {
     }
     return { decision: choice };
   }
+}
+
+function readUserInput(payload: RpcRecord): UserInputPrompt {
+  const questions = (Array.isArray(payload.questions) ? payload.questions : []).map((value): UserInputQuestion | null => {
+    const question = record(value);
+    const id = text(question, "id");
+    if (!id) return null;
+    const options = Array.isArray(question.options) ? question.options.map((option) => {
+      const item = record(option);
+      return { label: text(item, "label"), description: text(item, "description") };
+    }).filter((option) => option.label) : undefined;
+    return {
+      id, header: text(question, "header"), question: text(question, "question"),
+      isOther: question.isOther === true, isSecret: question.isSecret === true, options,
+    };
+  }).filter((question): question is UserInputQuestion => question !== null);
+  return { questions, autoResolutionMs: typeof payload.autoResolutionMs === "number" ? payload.autoResolutionMs : undefined };
 }
 
 function toProtocolInput(input: AssistantInput): RpcRecord[] {
