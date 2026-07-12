@@ -6,6 +6,11 @@ export interface ParsedAlarm {
   cadence: Alarm["cadence"];
 }
 
+export function normalizeCalendarTitle(label: string): string {
+  const title = label.trim().replace(/\s+/g, " ");
+  return /^[а-яё]/u.test(title) ? `${title[0]!.toLocaleUpperCase("ru-RU")}${title.slice(1)}` : title;
+}
+
 export function understandAlarm(source: string, now = new Date()): ParsedAlarm | null {
   const input = source.trim().replace(/\s+/g, " ");
   if (!input) return null;
@@ -47,7 +52,7 @@ export function understandAlarm(source: string, now = new Date()): ParsedAlarm |
 
 function result(input: string, matched: string, at: number, cadence: Alarm["cadence"]): ParsedAlarm {
   const label = input
-    .replace(/^\s*(?:напомни(?:\s+мне)?|создай\s+напоминание|поставь\s+будильник|установи\s+будильник|создай\s+событие|добавь\s+событие|запланируй\s+(?:событие|встречу))\s*/i, "")
+    .replace(/^\s*(?:(?:создай|добавь|запланируй|поставь)\s+(?:(?:задачу|событие|встречу)\s+)?(?:в\s+)?календар(?:ь|е)(?:\s+на)?|напомни(?:\s+мне)?|создай\s+напоминание|поставь\s+будильник|установи\s+будильник|создай\s+событие|добавь\s+событие|запланируй\s+(?:событие|встречу))\s*/i, "")
     .replace(matched.trim(), "").replace(/^\s*[|,.:;-]?\s*|\s*[|,.:;-]?\s*$/g, "");
   return { label: label || "Напоминание", at, cadence };
 }

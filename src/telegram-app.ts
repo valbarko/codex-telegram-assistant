@@ -12,8 +12,8 @@ import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, 
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
 import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
 import { MemoryService, type RecallHit } from "./memory-service.js";
-import { understandAlarm } from "./reminder-language.js";
-import { quietCodexPrompt } from "./prompt-policy.js";
+import { normalizeCalendarTitle, understandAlarm } from "./reminder-language.js";
+import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type WorkItem } from "./storage.js";
 
 const TELEGRAM_LIMIT = 4000;
@@ -349,15 +349,21 @@ export class TelegramApplication {
       await ctx.reply(captureCard(captured), { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
       return;
     }
-    if (localIntent(text)) {
-      await this.rememberIncoming(ctx, text, "action");
-      if (await this.handleLocalIntent(ctx, text)) return;
+    const intent = localIntent(text);
+    let localFallback = false;
+    if (intent) {
+      if (await this.handleLocalIntent(ctx, text)) {
+        await this.rememberIncoming(ctx, text, "action");
+        return;
+      }
+      localFallback = true;
     }
     const conversation = await this.conversation(ctx);
     const project = conversation.snapshot().workspace;
     const augmented = await this.memory.augmentPrompt(ownerId(ctx), text, project);
     await this.memory.record({ owner: ownerId(ctx), body: text, role: "user", kind: "message", project, source: "telegram-text" });
-    const routed = looksLikeMail(text) ? gmailPrompt(augmented) : quietCodexPrompt(augmented);
+    const routed = looksLikeMail(text) ? gmailPrompt(augmented)
+      : quietCodexPrompt(localFallback ? localCommandFallbackPrompt(augmented) : augmented);
     if (conversation.snapshot().running) {
       await conversation.steer(routed);
       await ctx.reply("↪️ Уточнение добавлено в текущий ход.");
@@ -374,14 +380,10 @@ export class TelegramApplication {
       return true;
     }
     if (intent === "calendar-create") {
-      await this.offerCalendarEvent(ctx, text);
-      return true;
+      return this.offerCalendarEvent(ctx, text, false);
     }
     const parsed = understandAlarm(text);
-    if (!parsed) {
-      await ctx.reply("Не понял время. Например: «поставь будильник на 14:00» или «напомни завтра в 10 позвонить Анне».");
-      return true;
-    }
+    if (!parsed) return false;
     const label = parsed.label === "Напоминание" && /будильник/i.test(text) ? "Будильник" : parsed.label;
     let systemAlarm = true;
     try {
@@ -619,13 +621,18 @@ export class TelegramApplication {
     await this.offerCalendarEvent(ctx, input);
   }
 
-  private async offerCalendarEvent(ctx: Context, input: string): Promise<void> {
+  private async offerCalendarEvent(ctx: Context, input: string, replyOnFailure = true): Promise<boolean> {
     const parsed = understandAlarm(input);
-    if (!parsed) return void await ctx.reply("Не понял дату и время события.");
+    if (!parsed) {
+      if (replyOnFailure) await ctx.reply("Не понял дату и время события.");
+      return false;
+    }
+    const title = normalizeCalendarTitle(parsed.label);
     const token = randomUUID().slice(0, 10);
-    this.calendarEvents.set(token, { title: parsed.label, start: parsed.at });
+    this.calendarEvents.set(token, { title, start: parsed.at });
     const keyboard = new InlineKeyboard().text("✅ Создать", `event:confirm:${token}`).text("Отмена", `event:cancel:${token}`);
-    await ctx.reply(`Создать событие?\n<b>${escape(parsed.label)}</b>\n${formatDate(parsed.at)}`, { parse_mode: "HTML", reply_markup: keyboard });
+    await ctx.reply(`Создать событие?\n<b>${escape(title)}</b>\n${formatDate(parsed.at)}`, { parse_mode: "HTML", reply_markup: keyboard });
+    return true;
   }
 
   private async confirmCalendarEvent(ctx: Context): Promise<void> {
@@ -965,6 +972,7 @@ export type LocalIntent = "reminder" | "calendar-create" | "calendar-list";
 export function localIntent(value: string): LocalIntent | null {
   const text = value.toLocaleLowerCase("ru-RU");
   if (/(?:напомни|напоминание|будильник)/i.test(text)) return "reminder";
+  if (/(?:создай|добавь|запланируй|поставь).{0,40}(?:в\s+)?календар(?:ь|е)/i.test(text)) return "calendar-create";
   if (/(?:создай|добавь|запланируй|поставь).{0,40}(?:событ|встреч)|(?:событ|встреч).{0,40}(?:создай|добавь|запланируй|поставь)/i.test(text)) return "calendar-create";
   if (/(?:покажи|какие|что|расписание|ближайш).{0,40}(?:календар|событ|встреч)|(?:календар|событ|встреч).{0,40}(?:покажи|какие|что|расписание|ближайш)/i.test(text)) return "calendar-list";
   return null;
