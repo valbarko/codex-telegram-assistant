@@ -1,4 +1,7 @@
 import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
@@ -61,6 +64,29 @@ activate
 end tell
 end run`;
   await appleScript(script, [address, subject, body]);
+}
+
+export async function addSystemAlarm(start: number): Promise<void> {
+  const shortcut = process.env.ALARM_SHORTCUT_NAME?.trim() || "Codex Alarm";
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-alarm-"));
+  const input = path.join(directory, "alarm-time.txt");
+  try {
+    await writeFile(input, shortcutDateInput(start), "utf8");
+    await execute("/usr/bin/shortcuts", ["run", shortcut, "--input-path", input], {
+      timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+export function shortcutDateInput(value: number): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hourCycle: "h23", timeZone: "Europe/Moscow",
+  }).formatToParts(new Date(value));
+  const take = (type: Intl.DateTimeFormatPartTypes): string => parts.find((part) => part.type === type)?.value || "";
+  return `${take("year")}-${take("month")}-${take("day")} ${take("hour")}:${take("minute")}:${take("second")}`;
 }
 
 export async function activateCodexWithResume(workspace: string, threadId: string): Promise<string> {

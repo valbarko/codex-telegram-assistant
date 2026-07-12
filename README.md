@@ -57,6 +57,20 @@ Install the local transcription dependency in a dedicated Python environment and
 
 The bot returns sender/date metadata when Telegram provides it, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward. It is not sent into Codex and does not create a project conversation.
 
+## System alarms on macOS
+
+Natural requests such as `поставь будильник на 14:00` create both a Clock alarm on the Mac and a fallback Telegram reminder. The Clock integration uses a local Shortcut so it does not need Accessibility or Computer Use permissions.
+
+Create a shortcut named `Codex Alarm` once:
+
+1. Add the Clock action **Add Alarm**.
+2. In its **Time** field, choose **Insert Variable → Shortcut Input**.
+3. Keep the default alarm label or choose your own.
+
+The bot runs it through `/usr/bin/shortcuts` and passes an explicit local date and time. Set `ALARM_SHORTCUT_NAME` if you use another shortcut name. If the shortcut fails, the Telegram reminder is still created and the response reports the two outcomes separately.
+
+Deleting a reminder in Telegram does not delete the corresponding Clock alarm; manage system alarms in the Clock app.
+
 ## Run continuously
 
 After a successful foreground smoke test:

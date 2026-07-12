@@ -10,7 +10,7 @@ import type { AppConfiguration } from "./configuration.js";
 import { structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
-import { activateCodexWithResume, addCalendarEvent, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
+import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
 import { understandAlarm } from "./reminder-language.js";
 import { quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type WorkItem } from "./storage.js";
@@ -344,9 +344,18 @@ export class TelegramApplication {
       return true;
     }
     const label = parsed.label === "Напоминание" && /будильник/i.test(text) ? "Будильник" : parsed.label;
+    let systemAlarm = true;
+    try {
+      await addSystemAlarm(parsed.at);
+    } catch (error) {
+      systemAlarm = false;
+      console.error("System alarm creation failed", error);
+    }
     const alarm = this.database.createAlarm({ owner: ownerId(ctx), label, nextAt: parsed.at, cadence: parsed.cadence });
-    await ctx.reply(`⏰ <b>Напоминание в Telegram установлено</b>\n${escape(alarm.label)}\n${formatDate(alarm.nextAt)}`, {
-      parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить", `alarm:delete:${alarm.id}`),
+    const status = [systemAlarm ? "✅ Системный будильник на Mac создан" : "⚠️ Системный будильник создать не удалось",
+      "✅ Напоминание в Telegram установлено"];
+    await ctx.reply(`⏰ <b>${escape(alarm.label)}</b>\n${formatDate(alarm.nextAt)}\n\n${status.join("\n")}`, {
+      parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить TG-напоминание", `alarm:delete:${alarm.id}`),
     });
     return true;
   }
