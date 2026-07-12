@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { understandAlarm } from "../src/reminder-language.js";
+import { normalizeCalendarTitle, understandAlarm } from "../src/reminder-language.js";
 
 describe("understandAlarm", () => {
   const now = new Date(2026, 6, 12, 10, 0, 0);
@@ -23,5 +23,12 @@ describe("understandAlarm", () => {
     expect(understandAlarm("создай событие сегодня, 18:00 Позвонить клиенту", now)).toEqual({
       label: "Позвонить клиенту", at: new Date(2026, 6, 12, 18, 0, 0).getTime(), cadence: "once",
     });
+  });
+  it("removes the calendar command envelope from the event title", () => {
+    const parsed = understandAlarm("создай задачу в календаре на сегодня 18:00 встреча", now);
+    expect(parsed).toEqual({
+      label: "встреча", at: new Date(2026, 6, 12, 18, 0, 0).getTime(), cadence: "once",
+    });
+    expect(normalizeCalendarTitle(parsed!.label)).toBe("Встреча");
   });
 });
