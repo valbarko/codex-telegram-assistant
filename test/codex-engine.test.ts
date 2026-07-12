@@ -1,0 +1,64 @@
+import { describe, expect, it, vi } from "vitest";
+
+import type { AppConfiguration } from "../src/configuration.js";
+import { CodexHub } from "../src/codex-engine.js";
+import type { EventListener, HostRequestListener, RpcRecord } from "../src/appserver-transport.js";
+
+class FakeTransport {
+  event?: EventListener;
+  host?: HostRequestListener;
+  calls: Array<{ name: string; payload: RpcRecord }> = [];
+  autoComplete = true;
+  async connect() {}
+  listen(listener: EventListener) { this.event = listener; return () => { this.event = undefined; }; }
+  answerRequestsFor(_thread: string, listener?: HostRequestListener) { this.host = listener; }
+  emit() {}
+  close() {}
+  async call<T>(name: string, payload: RpcRecord): Promise<T> {
+    this.calls.push({ name, payload });
+    if (name === "thread/start" || name === "thread/resume") return { thread: { id: "thread-1" }, cwd: "/work", model: "gpt" } as T;
+    if (name === "turn/start") {
+      queueMicrotask(() => {
+        this.event?.("turn/started", { threadId: "thread-1", turn: { id: "turn-1" } });
+        this.event?.("item/agentMessage/delta", { threadId: "thread-1", turnId: "turn-1", delta: "Готово" });
+        if (this.autoComplete) this.complete();
+      });
+      return { turn: { id: "turn-1" } } as T;
+    }
+    return {} as T;
+  }
+  complete() { this.event?.("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } }); }
+}
+
+const config: AppConfiguration = {
+  telegramToken: "x", allowedUsers: new Set([1]), homeDirectory: "/home", dataDirectory: "/data", defaultWorkspace: "/work",
+  projectAliases: {}, defaultModel: "gpt", defaultProfile: "review", maxUploadBytes: 1, showUsage: false,
+  profiles: [{ id: "review", title: "Review", sandbox: "workspace-write", approvals: "on-request" }],
+};
+
+describe("CodexHub", () => {
+  it("streams a turn through the independent app-server abstraction", async () => {
+    const transport = new FakeTransport();
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1");
+    const text = vi.fn();
+    await conversation.run("Проверка", { text, toolStarted() {}, toolProgress() {}, toolFinished() {} });
+    expect(text).toHaveBeenCalledWith("Готово");
+    expect(transport.calls.map((call) => call.name)).toEqual(["thread/start", "turn/start"]);
+  });
+
+  it("maps command approvals to host responses", async () => {
+    const transport = new FakeTransport();
+    transport.autoComplete = false;
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1");
+    const running = conversation.run("Проверка", {
+      text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {}, approval: async () => "acceptForSession",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const response = await transport.host?.("item/commandExecution/requestApproval", { threadId: "thread-1", itemId: "cmd", command: "pwd" });
+    transport.complete();
+    await running;
+    expect(response).toEqual({ decision: "acceptForSession" });
+  });
+});

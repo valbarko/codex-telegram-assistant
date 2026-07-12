@@ -1,0 +1,29 @@
+{
+  "name": "codex-telegram-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independent Telegram client and personal assistant for Codex app-server",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/main.ts",
+    "start": "node dist/main.js",
+    "test": "vitest run",
+    "migrate": "tsx src/migrate-user-data.ts"
+  },
+  "dependencies": {
+    "@grammyjs/auto-retry": "2.0.2",
+    "better-sqlite3": "12.11.1",
+    "grammy": "1.38.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "24.3.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2",
+    "vitest": "3.2.7"
+  }
+}
