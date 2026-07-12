@@ -641,12 +641,15 @@ export class TelegramApplication {
   }
 }
 
-class TelegramTurnView implements TurnObserver {
+export class TelegramTurnView implements TurnObserver {
   private answer = "";
   private messageId?: number;
   private lastEdit = 0;
   private timer?: NodeJS.Timeout;
   private lastUsage?: string;
+  private drain?: Promise<void>;
+  private needsFlush = false;
+  private finalRequested = false;
 
   constructor(
     private readonly ctx: Context,
@@ -667,23 +670,44 @@ class TelegramTurnView implements TurnObserver {
   }
 
   async finish(): Promise<void> {
-    if (this.timer) clearTimeout(this.timer);
-    await this.flush(true);
+    this.cancelTimer();
+    await this.requestFlush(true);
   }
 
   async fail(message: string): Promise<void> {
-    if (this.timer) clearTimeout(this.timer);
+    this.cancelTimer();
     this.answer = this.answer ? `${this.answer}\n\nОшибка: ${message}` : `Ошибка: ${message}`;
-    await this.flush(true);
+    await this.requestFlush(true);
   }
 
   private schedule(): void {
     if (this.timer) return;
     const delay = Math.max(0, 1000 - (Date.now() - this.lastEdit));
-    this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, delay);
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.requestFlush().catch((error) => console.error("Telegram stream update failed", error));
+    }, delay);
   }
 
-  private async flush(final = false): Promise<void> {
+  private requestFlush(final = false): Promise<void> {
+    this.needsFlush = true;
+    this.finalRequested ||= final;
+    if (!this.drain) {
+      this.drain = this.drainFlushes().finally(() => { this.drain = undefined; });
+    }
+    return this.drain;
+  }
+
+  private async drainFlushes(): Promise<void> {
+    while (this.needsFlush) {
+      this.needsFlush = false;
+      const final = this.finalRequested;
+      this.finalRequested = false;
+      await this.write(final);
+    }
+  }
+
+  private async write(final: boolean): Promise<void> {
     const source = `${this.answer.trim() || (final ? "Готово" : "…")}${final && this.showUsage && this.lastUsage ? `\n\n${this.lastUsage}` : ""}`;
     const text = source.slice(0, TELEGRAM_LIMIT - 50);
     if (!this.messageId) {
@@ -693,6 +717,11 @@ class TelegramTurnView implements TurnObserver {
       await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, text).catch(() => undefined);
     }
     this.lastEdit = Date.now();
+  }
+
+  private cancelTimer(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
   }
 }
 
