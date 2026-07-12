@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import { createInterface } from "node:readline";
 
 export type RpcRecord = Record<string, unknown>;
@@ -60,7 +62,7 @@ export class AppServerTransport {
 
   private async open(): Promise<void> {
     this.intentionalStop = false;
-    const executable = process.env.CODEX_CLI_PATH?.trim() || "codex";
+    const executable = codexExecutable();
     const child = spawn(executable, ["app-server", "--stdio"], { env: process.env, stdio: ["pipe", "pipe", "pipe"] });
     this.child = child;
     createInterface({ input: child.stdout }).on("line", (line) => this.receive(line));
@@ -145,6 +147,20 @@ export class AppServerTransport {
     for (const deferred of this.waiting.values()) deferred.fail(error);
     this.waiting.clear();
   }
+}
+
+function codexExecutable(): string {
+  const configured = process.env.CODEX_CLI_PATH?.trim();
+  if (configured) return configured;
+  const home = process.env.HOME || "";
+  const candidates = [
+    "/Applications/Codex.app/Contents/Resources/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    path.join(home, ".local", "bin", "codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) || "codex";
 }
 
 function safeDefault(name: string): unknown {
