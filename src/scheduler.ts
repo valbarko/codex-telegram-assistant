@@ -4,6 +4,7 @@ import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import type { CodexHub, Conversation, TurnObserver } from "./codex-engine.js";
+import type { MemoryService } from "./memory-service.js";
 import { quietCodexPrompt } from "./prompt-policy.js";
 import type { Alarm, AssistantDatabase, WorkItem } from "./storage.js";
 
@@ -16,6 +17,7 @@ export class BackgroundScheduler {
     private readonly database: AssistantDatabase,
     private readonly hub: CodexHub,
     private readonly bot: Bot<Context>,
+    private readonly memory: MemoryService,
   ) {}
 
   start(): void {
@@ -81,9 +83,12 @@ export class BackgroundScheduler {
       approval: async () => "decline",
     };
     try {
-      await conversation.run(quietCodexPrompt(task.prompt), observer);
+      const prompt = await this.memory.augmentPrompt(task.owner, task.prompt, workspace);
+      await this.memory.record({ owner: task.owner, body: `Запуск фоновой задачи: ${task.prompt}`, role: "action", kind: "action", project: workspace, source: "scheduler" });
+      await conversation.run(quietCodexPrompt(prompt), observer);
       this.database.updateTask(task.id, { status: "done", finishedAt: Date.now(), threadId: conversation.snapshot().threadId });
       this.saveConversation(task.owner, conversation);
+      if (response.trim()) await this.memory.record({ owner: task.owner, body: response.trim(), role: "assistant", kind: "response", project: workspace, source: "scheduler-final" });
       await this.send(task.owner, `✅ ${task.title}${response.trim() ? `\n\n${response.trim()}` : ""}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

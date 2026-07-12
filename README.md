@@ -10,7 +10,7 @@ This repository is an independent implementation with its own source structure, 
 - Separate contexts for Telegram chats and forum topics.
 - Streaming answers and interactive command, file, and permission approvals.
 - Project aliases and recently active thread selection.
-- Tasks, inbox, FIFO Codex queue, reminders, scheduled runs, memory, search, and daily digests.
+- Tasks, inbox, FIFO Codex queue, reminders, scheduled runs, long-term semantic memory, search, and daily digests.
 - Voice transcription with local MLX Whisper. Voice messages never start a Codex thread.
 - Gmail reading through the connected Codex app; Apple Mail only for visible drafts.
 - Local Apple Calendar listing and event creation.
@@ -22,6 +22,7 @@ This repository is an independent implementation with its own source structure, 
 - Node.js 22+
 - An installed and authenticated `codex` CLI with `codex app-server`
 - A Telegram bot token from BotFather
+- MemSearch with local ONNX embeddings (`uv tool install "memsearch[onnx]"`)
 - Optional voice support: Python with `mlx-whisper`
 
 ## Local setup
@@ -48,8 +49,16 @@ The `.env` file, SQLite state, logs, model caches, and local paths are ignored b
 - `/remind` and `/schedule` — notification or Codex run at a later time
 - `/digest on` — daily task summaries at 09:00 and 20:00
 - `/calendar`, `/event`, `/draft`, `/mac` — local Mac integrations
+- `/recall`, `/forget`, `/about_me` — recall, delete, and inspect personal memory
+- `/memory_status`, `/memory_pause`, `/memory_export` — control and export long-term memory
 
 The persistent Telegram keyboard keeps common actions one tap away. A text sent while Codex is working steers the active turn; after it finishes, the next text starts a new turn in the same thread.
+
+## Long-term memory
+
+The assistant stores sanitized user messages, voice transcripts, actions, and final Codex answers. SQLite tracks exact records, namespaces, pause state, and deletions; Markdown under the private data directory is the readable archive; MemSearch/Milvus provides hybrid semantic recall. Global memory and the active project's memory are searched separately and then merged.
+
+Passwords, API tokens, bearer credentials, JWTs, Telegram bot tokens, and OTP-like values are rejected or redacted before either SQLite or Markdown is written. MemSearch is a derived local index and can be rebuilt from the archive. If MemSearch is unavailable, `/recall` falls back to a scoped local text search.
 
 ## Voice messages
 

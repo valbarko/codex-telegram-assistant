@@ -55,6 +55,30 @@ export interface MemoryNote {
   changedAt: number;
 }
 
+export type MemoryRole = "user" | "assistant" | "action";
+export type MemoryKind = "message" | "voice" | "response" | "action" | "explicit";
+
+export interface MemoryEvent {
+  id: string;
+  owner: string;
+  namespace: "global" | "project";
+  project?: string;
+  role: MemoryRole;
+  kind: MemoryKind;
+  body: string;
+  source?: string;
+  createdAt: number;
+  deletedAt?: number;
+}
+
+export interface MemoryStatus {
+  paused: boolean;
+  active: number;
+  deleted: number;
+  global: number;
+  project: number;
+}
+
 export interface SavedConversation {
   context: string;
   threadId?: string;
@@ -194,6 +218,60 @@ export class AssistantDatabase {
     return this.sql.prepare("DELETE FROM memories WHERE id=?").run(id).changes > 0;
   }
 
+  recordMemoryEvent(input: Pick<MemoryEvent, "owner" | "namespace" | "role" | "kind" | "body"> &
+    Partial<Pick<MemoryEvent, "project" | "source">>): MemoryEvent {
+    const event: MemoryEvent = {
+      id: randomUUID(), owner: input.owner, namespace: input.namespace, project: input.project,
+      role: input.role, kind: input.kind, body: input.body.trim(), source: input.source, createdAt: Date.now(),
+    };
+    if (!event.body) throw new Error("Memory event body is required");
+    this.sql.prepare(`INSERT INTO memory_events(id,owner,namespace,project,role,kind,body,source,created_at,deleted_at)
+      VALUES(@id,@owner,@namespace,@project,@role,@kind,@body,@source,@createdAt,NULL)`).run(nullable(event));
+    return event;
+  }
+
+  memoryEvent(id: string): MemoryEvent | undefined {
+    return mapMemoryEvent(this.sql.prepare("SELECT * FROM memory_events WHERE id=?").get(id));
+  }
+
+  memoryEvents(owner: string, options: { includeDeleted?: boolean; limit?: number } = {}): MemoryEvent[] {
+    const deleted = options.includeDeleted ? "" : " AND deleted_at IS NULL";
+    return this.sql.prepare(`SELECT * FROM memory_events WHERE owner=?${deleted} ORDER BY created_at DESC LIMIT ?`)
+      .all(owner, options.limit ?? 5000).map(mapMemoryEvent).filter(present);
+  }
+
+  forgetMemoryEvent(owner: string, id: string): MemoryEvent | undefined {
+    const event = this.memoryEvent(id);
+    if (!event || event.owner !== owner || event.deletedAt) return undefined;
+    this.sql.prepare("UPDATE memory_events SET deleted_at=? WHERE id=? AND owner=?").run(Date.now(), id, owner);
+    return this.memoryEvent(id);
+  }
+
+  memoryPaused(owner: string): boolean {
+    const row = this.sql.prepare("SELECT paused FROM memory_settings WHERE owner=?").get(owner) as { paused?: number } | undefined;
+    return Boolean(row?.paused);
+  }
+
+  setMemoryPaused(owner: string, paused: boolean): void {
+    this.sql.prepare(`INSERT INTO memory_settings(owner,paused,changed_at) VALUES(?,?,?)
+      ON CONFLICT(owner) DO UPDATE SET paused=excluded.paused,changed_at=excluded.changed_at`)
+      .run(owner, paused ? 1 : 0, Date.now());
+  }
+
+  memoryStatus(owner: string): MemoryStatus {
+    const rows = this.sql.prepare(`SELECT namespace, deleted_at IS NOT NULL AS deleted, COUNT(*) AS count
+      FROM memory_events WHERE owner=? GROUP BY namespace, deleted`).all(owner) as Array<{ namespace: "global" | "project"; deleted: number; count: number }>;
+    const result: MemoryStatus = { paused: this.memoryPaused(owner), active: 0, deleted: 0, global: 0, project: 0 };
+    for (const row of rows) {
+      if (row.deleted) result.deleted += row.count;
+      else {
+        result.active += row.count;
+        result[row.namespace] += row.count;
+      }
+    }
+    return result;
+  }
+
   createAlarm(input: Pick<Alarm, "owner" | "label" | "nextAt"> & Partial<Pick<Alarm, "cadence" | "mode" | "prompt" | "project">>): Alarm {
     const alarm: Alarm = {
       id: randomUUID(), owner: input.owner, label: input.label.trim(), nextAt: input.nextAt,
@@ -246,6 +324,9 @@ export class AssistantDatabase {
       CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY, owner TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, sender TEXT, source_time INTEGER, state TEXT NOT NULL, created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS capture_owner_state ON captures(owner,state,created_at);
       CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY, owner TEXT NOT NULL, body TEXT NOT NULL, tags TEXT, created_at INTEGER NOT NULL, changed_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS memory_events(id TEXT PRIMARY KEY, owner TEXT NOT NULL, namespace TEXT NOT NULL, project TEXT, role TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, source TEXT, created_at INTEGER NOT NULL, deleted_at INTEGER);
+      CREATE INDEX IF NOT EXISTS memory_event_owner_scope ON memory_events(owner,namespace,project,created_at);
+      CREATE TABLE IF NOT EXISTS memory_settings(owner TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0, changed_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS alarms(id TEXT PRIMARY KEY, owner TEXT NOT NULL, label TEXT NOT NULL, next_at INTEGER NOT NULL, cadence TEXT NOT NULL, mode TEXT NOT NULL, prompt TEXT, project TEXT, enabled INTEGER NOT NULL);
     `);
   }
@@ -282,6 +363,15 @@ function mapCapture(row: unknown): CapturedItem | undefined {
 function mapMemory(row: unknown): MemoryNote | undefined {
   const r = object(row); if (!r) return undefined;
   return { id: str(r.id), owner: str(r.owner), body: str(r.body), tags: maybe(r.tags), createdAt: Number(r.created_at), changedAt: Number(r.changed_at) };
+}
+
+function mapMemoryEvent(row: unknown): MemoryEvent | undefined {
+  const r = object(row); if (!r) return undefined;
+  return {
+    id: str(r.id), owner: str(r.owner), namespace: str(r.namespace) as MemoryEvent["namespace"], project: maybe(r.project),
+    role: str(r.role) as MemoryRole, kind: str(r.kind) as MemoryKind, body: str(r.body), source: maybe(r.source),
+    createdAt: Number(r.created_at), deletedAt: num(r.deleted_at),
+  };
 }
 
 function mapAlarm(row: unknown): Alarm | undefined {

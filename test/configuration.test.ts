@@ -15,6 +15,7 @@ describe("readConfiguration", () => {
     const config = readConfiguration(cwd, { TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12,34", HOME: "/home/person" });
     expect(config.allowedUsers).toEqual(new Set([12, 34]));
     expect(config.dataDirectory).toBe("/home/person/.local/share/codex-telegram-assistant");
+    expect(config.memsearchExecutable).toBe("/home/person/.local/bin/memsearch");
     expect(config.profiles.map((profile) => profile.id)).toEqual(["default", "review", "readonly"]);
   });
 
