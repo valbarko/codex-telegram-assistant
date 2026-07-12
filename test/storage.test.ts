@@ -33,4 +33,13 @@ describe("AssistantDatabase", () => {
     database.saveConversation({ context: "1:42", threadId: "thr", workspace: "/work", model: "gpt", profileId: "review" });
     expect(database.conversation("1:42")).toMatchObject({ threadId: "thr", workspace: "/work", profileId: "review" });
   });
+
+  it("stores scoped memory events and supports pause and soft deletion", () => {
+    const global = database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "message", body: "Люблю короткие ответы" });
+    database.recordMemoryEvent({ owner: "1", namespace: "project", project: "/work/trainer", role: "assistant", kind: "response", body: "Добавили отчёт" });
+    expect(database.memoryStatus("1")).toMatchObject({ active: 2, global: 1, project: 1, deleted: 0, paused: false });
+    expect(database.forgetMemoryEvent("1", global.id)?.deletedAt).toBeTypeOf("number");
+    database.setMemoryPaused("1", true);
+    expect(database.memoryStatus("1")).toMatchObject({ active: 1, deleted: 1, paused: true });
+  });
 });

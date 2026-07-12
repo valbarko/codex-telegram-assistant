@@ -16,6 +16,7 @@ export interface AppConfiguration {
   allowedUsers: ReadonlySet<number>;
   homeDirectory: string;
   dataDirectory: string;
+  memsearchExecutable: string;
   defaultWorkspace: string;
   projectAliases: Readonly<Record<string, string>>;
   defaultModel?: string;
@@ -42,6 +43,7 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     allowedUsers,
     homeDirectory,
     dataDirectory,
+    memsearchExecutable: path.resolve(env.MEMSEARCH_BIN?.trim() || path.join(homeDirectory, ".local", "bin", "memsearch")),
     defaultWorkspace,
     projectAliases: parseAliases(env.PROJECT_ALIASES_JSON || env.WORKSPACE_LABELS_JSON),
     defaultModel: optional(env.CODEX_MODEL),

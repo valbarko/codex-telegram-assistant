@@ -4,20 +4,21 @@ import os from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
-import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, InputFile, Keyboard, type Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import { structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
 import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
+import { MemoryService, type RecallHit } from "./memory-service.js";
 import { understandAlarm } from "./reminder-language.js";
 import { quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type WorkItem } from "./storage.js";
 
 const TELEGRAM_LIMIT = 4000;
 
-type PendingInput = "task" | "capture" | "memory" | "search" | "reminder";
+type PendingInput = "task" | "capture" | "memory" | "search" | "reminder" | "recall" | "forget";
 
 interface ApprovalWaiter {
   context: string;
@@ -50,6 +51,7 @@ export class TelegramApplication {
     private readonly configuration: AppConfiguration,
     private readonly hub: CodexHub,
     private readonly database: AssistantDatabase,
+    private readonly memory: MemoryService,
   ) {
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
@@ -74,6 +76,12 @@ export class TelegramApplication {
       { command: "reminders", description: "Активные напоминания" },
       { command: "remember", description: "Сохранить в память" },
       { command: "memory", description: "Память ассистента" },
+      { command: "recall", description: "Найти в долговременной памяти" },
+      { command: "forget", description: "Удалить запись из памяти" },
+      { command: "about_me", description: "Что ассистент знает обо мне" },
+      { command: "memory_status", description: "Состояние долговременной памяти" },
+      { command: "memory_pause", description: "Приостановить или включить память" },
+      { command: "memory_export", description: "Экспорт долговременной памяти" },
       { command: "search", description: "Поиск по рабочей памяти" },
       { command: "launch_profiles", description: "Профиль разрешений" },
       { command: "mail", description: "Последние письма через Gmail" },
@@ -107,6 +115,18 @@ export class TelegramApplication {
       await next();
     });
 
+    this.bot.use(async (ctx, next) => {
+      const text = ctx.message?.text?.trim();
+      if (text?.startsWith("/")) {
+        await this.memory.record({ owner: ownerId(ctx), body: text, role: "action", kind: "action", project: this.memoryProject(ctx), source: "telegram-command" });
+      }
+      const callback = ctx.callbackQuery?.data;
+      if (callback) {
+        await this.memory.record({ owner: ownerId(ctx), body: callback, role: "action", kind: "action", project: this.memoryProject(ctx), source: "telegram-button" });
+      }
+      await next();
+    });
+
     this.bot.command("start", async (ctx) => {
       await ctx.reply("<b>Codex Telegram Assistant работает.</b>\n\nОткройте /home или отправьте сообщение.", {
         parse_mode: "HTML", reply_markup: persistentKeyboard(),
@@ -117,7 +137,8 @@ export class TelegramApplication {
       await ctx.reply([
         "<b>Основное</b>", "/home · /task · /tasks · /inbox", "",
         "<b>Codex</b>", "/chat · /new · /sessions · /session · /rename · /fork · /archive · /abort", "",
-        "<b>Ассистент</b>", "/remind · /reminders · /remember · /memory · /search", "",
+        "<b>Ассистент</b>", "/remind · /reminders · /remember · /memory · /recall · /about_me", "",
+        "<b>Память</b>", "/memory_status · /memory_pause · /memory_export · /forget", "",
         "<b>Mac</b>", "/calendar · /event · /draft · /mac", "",
         "<b>Автоматизация</b>", "/schedule · /digest", "",
         "Голосовые расшифровываются отдельно и не запускают Codex.",
@@ -133,6 +154,12 @@ export class TelegramApplication {
     this.bot.command("tasks", async (ctx) => this.showTasks(ctx));
     this.bot.command("reminders", async (ctx) => this.showReminders(ctx));
     this.bot.command("memory", async (ctx) => this.showMemory(ctx));
+    this.bot.command("recall", async (ctx) => this.captureCommand(ctx, "recall"));
+    this.bot.command("forget", async (ctx) => this.captureCommand(ctx, "forget"));
+    this.bot.command("about_me", async (ctx) => this.showAboutMe(ctx));
+    this.bot.command("memory_status", async (ctx) => ctx.reply(this.memory.status(ownerId(ctx))));
+    this.bot.command("memory_pause", async (ctx) => this.toggleMemory(ctx));
+    this.bot.command("memory_export", async (ctx) => this.exportMemory(ctx));
 
     this.bot.command("chat", async (ctx) => {
       const conversation = await this.conversation(ctx);
@@ -235,7 +262,8 @@ export class TelegramApplication {
       await ctx.answerCallbackQuery({ text: this.database.deleteAlarm(ctx.match![1]) ? "Удалено" : "Не найдено" });
     });
     this.bot.callbackQuery(/^memory:delete:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery({ text: this.database.forget(ctx.match![1]) ? "Удалено" : "Не найдено" });
+      const deleted = await this.memory.forget(ownerId(ctx), ctx.match![1]) || this.database.forget(ctx.match![1]);
+      await ctx.answerCallbackQuery({ text: deleted ? "Удалено" : "Не найдено" });
     });
 
     this.bot.on(["message:voice", "message:audio"], async (ctx) => this.audioMessage(ctx));
@@ -267,6 +295,7 @@ export class TelegramApplication {
       const forwarded = forwardedSource(ctx);
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : undefined);
+      await this.memory.record({ owner: ownerId(ctx), body: raw, role: "user", kind: "voice", project: this.memoryProject(ctx), source: sender ? `telegram-voice:${sender}` : "telegram-voice" });
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
       for (const part of htmlChunks(structureTranscript(raw, { sender, sentAt }), TELEGRAM_LIMIT)) {
         await ctx.reply(part, { parse_mode: "HTML" });
@@ -286,6 +315,7 @@ export class TelegramApplication {
     const name = message.document?.file_name || message.video?.file_name || (message.photo ? "Фотография" : "Файл");
     const body = [name, message.caption].filter(Boolean).join("\n");
     const captured = this.database.capture({ owner: ownerId(ctx), kind: message.photo ? "photo" : message.video ? "video" : "document", body, sender: source.sender, sourceTime: source.time });
+    await this.memory.record({ owner: ownerId(ctx), body, role: "action", kind: "action", project: this.memoryProject(ctx), source: "telegram-attachment" });
     await ctx.reply(`${captureCard(captured)}\n\n<i>Codex-тред не запускался.</i>`, { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
   }
 
@@ -300,6 +330,7 @@ export class TelegramApplication {
         await ctx.reply("Выберите один из вариантов кнопкой.");
         return;
       }
+      await this.rememberIncoming(ctx, text);
       this.finishUserQuestion(questionToken!, [text]);
       await ctx.reply("Ответ передан в текущую задачу.");
       return;
@@ -307,18 +338,26 @@ export class TelegramApplication {
     const pending = this.pending.get(key);
     if (pending) {
       this.pending.delete(key);
+      if (pending !== "memory") await this.rememberIncoming(ctx, text);
       await this.acceptPending(ctx, pending, text);
       return;
     }
     if (ctx.message?.forward_origin) {
+      await this.rememberIncoming(ctx, text);
       const source = forwardedSource(ctx);
       const captured = this.database.capture({ owner: ownerId(ctx), kind: "forward", body: text, sender: source.sender, sourceTime: source.time });
       await ctx.reply(captureCard(captured), { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
       return;
     }
-    if (await this.handleLocalIntent(ctx, text)) return;
+    if (localIntent(text)) {
+      await this.rememberIncoming(ctx, text, "action");
+      if (await this.handleLocalIntent(ctx, text)) return;
+    }
     const conversation = await this.conversation(ctx);
-    const routed = looksLikeMail(text) ? gmailPrompt(text) : quietCodexPrompt(text);
+    const project = conversation.snapshot().workspace;
+    const augmented = await this.memory.augmentPrompt(ownerId(ctx), text, project);
+    await this.memory.record({ owner: ownerId(ctx), body: text, role: "user", kind: "message", project, source: "telegram-text" });
+    const routed = looksLikeMail(text) ? gmailPrompt(augmented) : quietCodexPrompt(augmented);
     if (conversation.snapshot().running) {
       await conversation.steer(routed);
       await ctx.reply("↪️ Уточнение добавлено в текущий ход.");
@@ -368,6 +407,8 @@ export class TelegramApplication {
       await conversation.run(prompt, view);
       await view.finish();
       this.persist(ctx, conversation);
+      const answer = view.content();
+      if (answer) await this.memory.record({ owner: ownerId(ctx), body: answer, role: "assistant", kind: "response", project: conversation.snapshot().workspace, source: "codex-final" });
     } catch (error) {
       await view.fail(error instanceof Error ? error.message : String(error));
     }
@@ -486,7 +527,10 @@ export class TelegramApplication {
     const command = ctx.message?.text?.replace(/^\/\w+(?:@\w+)?\s*/i, "").trim() || "";
     if (command) return this.acceptPending(ctx, kind, command);
     this.pending.set(contextId(ctx), kind);
-    const prompts: Record<PendingInput, string> = { task: "Напишите новую задачу.", capture: "Что добавить в инбокс?", memory: "Что запомнить?", search: "Что найти?", reminder: "Когда и о чём напомнить?" };
+    const prompts: Record<PendingInput, string> = {
+      task: "Напишите новую задачу.", capture: "Что добавить в инбокс?", memory: "Что запомнить?",
+      search: "Что найти?", reminder: "Когда и о чём напомнить?", recall: "Что вспомнить?", forget: "Пришлите ID записи, которую нужно забыть.",
+    };
     await ctx.reply(prompts[kind]);
   }
 
@@ -499,11 +543,17 @@ export class TelegramApplication {
       const captured = this.database.capture({ owner, kind: value.includes("http") ? "link" : "text", body: value });
       await ctx.reply(captureCard(captured), { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
     } else if (kind === "memory") {
-      this.database.remember(owner, value); await ctx.reply("📚 Сохранено в память.");
+      const event = await this.memory.record({ owner, body: value, role: "user", kind: "explicit", project: this.memoryProject(ctx), source: "telegram-remember" });
+      await ctx.reply(event ? `📚 Сохранено в память.\nID: <code>${event.id}</code>` : "🔐 Не сохранено: сообщение похоже на секрет или память приостановлена.", { parse_mode: "HTML" });
     } else if (kind === "search") {
       const hits = this.database.search(owner, value, 20);
       const threads = await this.hub.threads(10, value).catch(() => []);
       await ctx.reply(searchResults(value, hits, threads), { parse_mode: "HTML" });
+    } else if (kind === "recall") {
+      const hits = await this.memory.recall(owner, value, this.memoryProject(ctx), 10);
+      await ctx.reply(recallResults(value, hits), { parse_mode: "HTML" });
+    } else if (kind === "forget") {
+      await ctx.reply(await this.memory.forget(owner, value.trim()) ? "🗑 Запись удалена из памяти и будет удалена из индекса." : "Запись не найдена.");
     } else {
       const parsed = understandAlarm(value);
       if (!parsed) return void await ctx.reply("Не понял время. Например: завтра в 10 позвонить Анне.");
@@ -525,9 +575,31 @@ export class TelegramApplication {
   }
 
   private async showMemory(ctx: Context): Promise<void> {
-    const memories = this.database.memories(ownerId(ctx));
-    if (!memories.length) return void await ctx.reply("Память пуста.");
-    for (const note of memories) await ctx.reply(`📚 ${escape(oneLine(note.body, 600))}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить", `memory:delete:${note.id}`) });
+    const owner = ownerId(ctx);
+    const events = this.database.memoryEvents(owner, { limit: 20 }).filter((event) => event.kind === "explicit");
+    const legacy = this.database.memories(owner);
+    if (!events.length && !legacy.length) return void await ctx.reply(`Память пуста.\n\n${this.memory.status(owner)}`);
+    for (const event of events) await ctx.reply(`📚 ${escape(oneLine(event.body, 600))}\n<code>${event.id}</code>`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить", `memory:delete:${event.id}`) });
+    for (const note of legacy) await ctx.reply(`📚 ${escape(oneLine(note.body, 600))}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить", `memory:delete:${note.id}`) });
+  }
+
+  private async showAboutMe(ctx: Context): Promise<void> {
+    const hits = await this.memory.recall(ownerId(ctx), "личные факты предпочтения цели работа проекты привычки обо мне", undefined, 10);
+    await ctx.reply(hits.length ? `<b>Что я помню о вас</b>\n\n${hits.map((hit) => `• ${escape(oneLine(hit.body, 500))}`).join("\n")}` : "Пока недостаточно данных для профиля. Используйте /remember для важных фактов.", { parse_mode: "HTML" });
+  }
+
+  private async toggleMemory(ctx: Context): Promise<void> {
+    const owner = ownerId(ctx);
+    const argument = commandArgument(ctx).toLocaleLowerCase("ru-RU");
+    const paused = /^(?:on|вкл|включить)$/.test(argument) ? false : /^(?:off|выкл|выключить|pause)$/.test(argument) ? true : !this.memory.paused(owner);
+    this.memory.setPaused(owner, paused);
+    await ctx.reply(paused ? "⏸ Память приостановлена: новые сообщения не сохраняются и recall отключён." : "▶️ Память включена.");
+  }
+
+  private async exportMemory(ctx: Context): Promise<void> {
+    const owner = ownerId(ctx);
+    const data = this.memory.export(owner);
+    await ctx.replyWithDocument(new InputFile(Buffer.from(data, "utf8"), `memory-export-${new Date().toISOString().slice(0, 10)}.json`), { caption: "Экспорт долговременной памяти" });
   }
 
   private async showCalendar(ctx: Context): Promise<void> {
@@ -758,13 +830,22 @@ export class TelegramApplication {
       this.database.createTask({ owner: item.owner, title: oneLine(item.body, 140), prompt: item.body });
       this.database.resolveCapture(id, "task");
     } else if (action === "memory") {
-      this.database.remember(item.owner, item.body, "inbox"); this.database.resolveCapture(id, "memory");
+      await this.memory.record({ owner: item.owner, body: item.body, role: "user", kind: "explicit", project: this.memoryProject(ctx), source: "telegram-inbox" });
+      this.database.resolveCapture(id, "memory");
     } else this.database.resolveCapture(id, "discarded");
     await ctx.answerCallbackQuery({ text: "Готово" });
   }
 
   private projectName(project: string): string {
     return this.configuration.projectAliases[project] || this.configuration.projectAliases[path.basename(project)] || path.basename(project);
+  }
+
+  private memoryProject(ctx: Context): string | undefined {
+    return this.database.conversation(contextId(ctx))?.workspace;
+  }
+
+  private async rememberIncoming(ctx: Context, body: string, kind: "message" | "action" = "message"): Promise<void> {
+    await this.memory.record({ owner: ownerId(ctx), body, role: kind === "action" ? "action" : "user", kind, project: this.memoryProject(ctx), source: "telegram-text" });
   }
 
   private cancelApprovals(context: string): void {
@@ -802,6 +883,8 @@ export class TelegramTurnView implements TurnObserver {
   usage(last: { input: number; cached: number; output: number }): void {
     this.lastUsage = `in ${last.input} · cached ${last.cached} · out ${last.output}`;
   }
+
+  content(): string { return this.answer.trim(); }
 
   async finish(): Promise<void> {
     this.cancelTimer();
@@ -888,6 +971,10 @@ export function localIntent(value: string): LocalIntent | null {
 }
 function gmailPrompt(user: string): string { return `Используй подключённый Gmail как источник почты. Не используй Apple Mail или shell. Чтение и поиск разрешены. Ничего не отправляй, не архивируй, не удаляй и не изменяй без отдельного подтверждения. Не описывай внутренний workflow.\n\n${user}`; }
 function searchResults(query: string, hits: ReturnType<AssistantDatabase["search"]>, threads: StoredThread[]): string { const lines = [`<b>🔎 ${escape(query)}</b>`]; for (const hit of hits) lines.push(`${hit.type === "task" ? "📋" : hit.type === "memory" ? "📚" : "📥"} ${escape(oneLine(hit.text, 180))}`); for (const thread of threads) lines.push(`🧵 ${escape(oneLine(thread.title, 180))}`); return lines.length === 1 ? `${lines[0]}\nНичего не найдено.` : lines.join("\n"); }
+function recallResults(query: string, hits: RecallHit[]): string {
+  if (!hits.length) return `<b>🧠 ${escape(query)}</b>\nНичего релевантного не найдено.`;
+  return [`<b>🧠 ${escape(query)}</b>`, ...hits.map((hit) => `\n• ${escape(oneLine(hit.body, 450))}\n<code>${hit.id}</code> · ${hit.namespace === "global" ? "глобальная" : "проектная"}`)].join("\n");
+}
 function forwardedSource(ctx: Context): { sender?: string; time?: number } { const origin = ctx.message?.forward_origin; if (!origin) return {}; if (origin.type === "user") return { sender: [origin.sender_user.first_name, origin.sender_user.last_name].filter(Boolean).join(" "), time: origin.date * 1000 }; if (origin.type === "hidden_user") return { sender: origin.sender_user_name, time: origin.date * 1000 }; if (origin.type === "channel") return { sender: origin.chat.title, time: origin.date * 1000 }; return { time: origin.date * 1000 }; }
 function commandArgument(ctx: Context): string { return ctx.message?.text?.replace(/^\/\w+(?:@\w+)?\s*/i, "").trim() || ""; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
