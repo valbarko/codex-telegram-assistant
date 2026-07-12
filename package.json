@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Independent Telegram client and personal assistant for Codex app-server",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22"

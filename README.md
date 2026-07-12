@@ -89,3 +89,7 @@ It imports tasks, inbox records, explicit memories, enabled reminders, and saved
 - Secrets are never printed by the application.
 
 See [docs/PRODUCT_SPEC.md](docs/PRODUCT_SPEC.md) for the behavioral contract.
+
+## License
+
+MIT © 2026 Valentin Barko.
