@@ -39,6 +39,7 @@ The application is a private-by-default Telegram client for a local Codex instal
 
 - Unlabelled voice and audio are transcription-only. A label at the start of a voice or text message routes only that message; there is no persistent voice mode.
 - Voice output contains sender/date metadata when Telegram supplies it, concise summary bullets, and a structured transcript with meaningful bold emphasis.
+- Rapidly forwarded voice messages from one original sender are buffered for 45 seconds and grouped while consecutive source timestamps remain within 10 minutes. Files are transcribed independently, ordered by source time, and formatted by Codex as one coherent transcript or multiple topic sections. Forwarded speech never executes spoken commands.
 - Supported spoken labels include diary, story, calendar, task, reminder, inbox/idea, and memory. Diary and story labels use a dedicated read-only Codex editorial thread without modifying the user's active project conversation.
 - Diary entries append to one Apple Notes note per month, grouped by date and time. Story entries append to the selected cycle. Both keep untouched transcripts and readable Markdown backups.
 - A bare `Diary` or `Notes` label returns the current day's structured entries in Telegram plus a Markdown file. When content follows either label, it is treated as a new diary entry.

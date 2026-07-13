@@ -9,6 +9,7 @@ This repository is an independent implementation with its own source structure, 
 - **Codex from Telegram:** create, resume, steer, interrupt, and hand off threads with separate contexts for chats and forum topics.
 - **Live agent interaction:** stream answers and handle command, file, user-input, and permission approvals without returning to the Mac.
 - **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
+- **Forwarded voice packages:** collect rapidly forwarded voice messages from the same original sender, preserve their order, and use Codex to merge one topic or split genuine topic changes.
 - **Apple Notes publishing:** append diary entries to one monthly note grouped by date, keep story continuity, and retain readable Markdown plus untouched transcript backups.
 - **Spoken and text commands:** route one-shot labels such as `Дневник`, `Рассказ`, `Календарь`, `Задача`, and `Напоминание` to the correct workflow.
 - **Safe calendar automation:** parse common dates locally, fall back to validated Codex extraction for ambiguous phrasing, and require confirmation before creating Apple Calendar events.
@@ -69,6 +70,8 @@ Passwords, API tokens, bearer credentials, JWTs, Telegram bot tokens, and OTP-li
 Install the local transcription dependency in a dedicated Python environment and set `WHISPER_PYTHON` to its interpreter. The default model is `mlx-community/whisper-large-v3-turbo`.
 
 An unlabelled voice message is a plain transcription. The bot returns sender/date metadata, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward.
+
+Forwarded voice and audio messages use package processing. After each forwarded item, the bot waits 45 seconds for more messages from the same original sender. Original messages join the same package while consecutive source timestamps are no more than 10 minutes apart. Every file is transcribed separately and ordered by its Telegram source time; Codex then creates one coherent transcript or separates real topic changes with short headings. A different sender or a larger source-time gap starts a new package. Forwarded speech is always treated as content and can never trigger calendar, task, reminder, or other spoken commands.
 
 Destinations are one-shot labels for both voice and text, not persistent modes. Start the message with `дневник`, `рассказ`, `календарь`, `задача`, `напоминание`, `идея`, or `запомни`, then continue normally. `дневник` sends the remaining text through Codex and appends it to one Apple Notes note per month, grouped by date and time. Use `/story <cycle name>` once to select a cycle; subsequent messages beginning with `рассказ` use the same editorial flow and the end of the previous draft as continuity context. Calendar, task, reminder, inbox, and memory labels route the remaining content to the corresponding local workflow.
 
