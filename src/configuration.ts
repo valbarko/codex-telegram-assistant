@@ -16,6 +16,7 @@ export interface AppConfiguration {
   allowedUsers: ReadonlySet<number>;
   homeDirectory: string;
   dataDirectory: string;
+  writingArchiveDirectory: string;
   memsearchExecutable: string;
   defaultWorkspace: string;
   projectAliases: Readonly<Record<string, string>>;
@@ -43,6 +44,7 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     allowedUsers,
     homeDirectory,
     dataDirectory,
+    writingArchiveDirectory: path.resolve(env.WRITING_ARCHIVE_DIR?.trim() || path.join(homeDirectory, "Documents", "Codex Writer")),
     memsearchExecutable: path.resolve(env.MEMSEARCH_BIN?.trim() || path.join(homeDirectory, ".local", "bin", "memsearch")),
     defaultWorkspace,
     projectAliases: parseAliases(env.PROJECT_ALIASES_JSON || env.WORKSPACE_LABELS_JSON),

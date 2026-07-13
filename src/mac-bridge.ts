@@ -9,6 +9,14 @@ const RECORD = "~~~CTA_RECORD~~~";
 
 export interface CalendarEntry { title: string; start: string; calendar: string; }
 
+export interface AppleNoteAppend {
+  folder: string;
+  title: string;
+  html: string;
+  sectionMarker?: string;
+  continuationHtml?: string;
+}
+
 export async function upcomingCalendar(days = 7, maximum = 12): Promise<CalendarEntry[]> {
   const names = (await appleScript(`tell application "Calendar"
 set AppleScript's text item delimiters to "${RECORD}"
@@ -64,6 +72,41 @@ activate
 end tell
 end run`;
   await appleScript(script, [address, subject, body]);
+}
+
+export async function appendAppleNote(input: AppleNoteAppend): Promise<string> {
+  const script = `on run argv
+set folderName to item 1 of argv
+set noteTitle to item 2 of argv
+set fullHtml to item 3 of argv
+set sectionMarker to item 4 of argv
+set continuationHtml to item 5 of argv
+tell application "Notes"
+set targetAccount to first account
+repeat with candidate in accounts
+if (name of candidate as text) contains "iCloud" then
+set targetAccount to candidate
+exit repeat
+end if
+end repeat
+try
+set targetFolder to folder folderName of targetAccount
+on error
+set targetFolder to make new folder at targetAccount with properties {name:folderName}
+end try
+set matches to every note of targetFolder whose name is noteTitle
+if (count of matches) is 0 then
+make new note at targetFolder with properties {name:noteTitle, body:fullHtml}
+else
+set targetNote to item 1 of matches
+set addition to fullHtml
+if sectionMarker is not "" and (body of targetNote as text) contains sectionMarker then set addition to continuationHtml
+set body of targetNote to ((body of targetNote as text) & "<br><br>" & addition)
+end if
+return name of targetAccount as text
+end tell
+end run`;
+  return appleScript(script, [input.folder, input.title, input.html, input.sectionMarker ?? "", input.continuationHtml ?? input.html]);
 }
 
 export async function addSystemAlarm(start: number): Promise<void> {

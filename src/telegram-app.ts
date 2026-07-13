@@ -10,15 +10,18 @@ import type { AppConfiguration } from "./configuration.js";
 import { structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
-import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
+import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, appendAppleNote, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
 import { MemoryService, type RecallHit } from "./memory-service.js";
-import { normalizeCalendarTitle, understandAlarm } from "./reminder-language.js";
+import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
-import { AssistantDatabase, type CapturedItem, type WorkItem } from "./storage.js";
+import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
+import { renderTelegramMarkdown, sendTelegramMarkdown } from "./telegram-markdown.js";
+import { parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
+  type EditedVoiceEntry, type SpokenVoiceCommand } from "./voice-writing.js";
 
 const TELEGRAM_LIMIT = 4000;
 
-type PendingInput = "task" | "capture" | "memory" | "search" | "reminder" | "recall" | "forget";
+type PendingInput = "task" | "capture" | "memory" | "search" | "reminder" | "recall" | "forget" | "story";
 
 interface ApprovalWaiter {
   context: string;
@@ -46,6 +49,8 @@ export class TelegramApplication {
   private readonly calendarEvents = new Map<string, PendingCalendarEvent>();
   private readonly userQuestions = new Map<string, UserQuestionWaiter>();
   private readonly userQuestionByContext = new Map<string, string>();
+  private readonly voiceEditor: VoiceWritingEditor;
+  private readonly voiceArchive: VoiceWritingArchive;
 
   constructor(
     private readonly configuration: AppConfiguration,
@@ -53,6 +58,8 @@ export class TelegramApplication {
     private readonly database: AssistantDatabase,
     private readonly memory: MemoryService,
   ) {
+    this.voiceEditor = new VoiceWritingEditor(configuration, hub);
+    this.voiceArchive = new VoiceWritingArchive(configuration.writingArchiveDirectory);
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
     this.install();
@@ -82,6 +89,8 @@ export class TelegramApplication {
       { command: "memory_status", description: "Состояние долговременной памяти" },
       { command: "memory_pause", description: "Приостановить или включить память" },
       { command: "memory_export", description: "Экспорт долговременной памяти" },
+      { command: "voice", description: "Метки-команды для голосовых" },
+      { command: "story", description: "Выбрать цикл рассказов" },
       { command: "search", description: "Поиск по рабочей памяти" },
       { command: "launch_profiles", description: "Профиль разрешений" },
       { command: "mail", description: "Последние письма через Gmail" },
@@ -138,10 +147,11 @@ export class TelegramApplication {
         "<b>Основное</b>", "/home · /task · /tasks · /inbox", "",
         "<b>Codex</b>", "/chat · /new · /sessions · /session · /rename · /fork · /archive · /abort", "",
         "<b>Ассистент</b>", "/remind · /reminders · /remember · /memory · /recall · /about_me", "",
+        "<b>Голосовые тексты</b>", "/voice · /story", "",
         "<b>Память</b>", "/memory_status · /memory_pause · /memory_export · /forget", "",
         "<b>Mac</b>", "/calendar · /event · /draft · /mac", "",
         "<b>Автоматизация</b>", "/schedule · /digest", "",
-        "Голосовые расшифровываются отдельно и не запускают Codex.",
+        "Начните голосовое с метки «дневник», «календарь», «задача» и т. п. Без метки бот просто пришлёт расшифровку.",
       ].join("\n"), { parse_mode: "HTML", reply_markup: persistentKeyboard() });
     });
 
@@ -160,6 +170,8 @@ export class TelegramApplication {
     this.bot.command("memory_status", async (ctx) => ctx.reply(this.memory.status(ownerId(ctx))));
     this.bot.command("memory_pause", async (ctx) => this.toggleMemory(ctx));
     this.bot.command("memory_export", async (ctx) => this.exportMemory(ctx));
+    this.bot.command("voice", async (ctx) => this.voiceCommand(ctx));
+    this.bot.command("story", async (ctx) => this.storyCommand(ctx));
 
     this.bot.command("chat", async (ctx) => {
       const conversation = await this.conversation(ctx);
@@ -265,7 +277,6 @@ export class TelegramApplication {
       const deleted = await this.memory.forget(ownerId(ctx), ctx.match![1]) || this.database.forget(ctx.match![1]);
       await ctx.answerCallbackQuery({ text: deleted ? "Удалено" : "Не найдено" });
     });
-
     this.bot.on(["message:voice", "message:audio"], async (ctx) => this.audioMessage(ctx));
     this.bot.on(["message:document", "message:photo", "message:video"], async (ctx) => this.attachmentMessage(ctx));
     this.bot.on("message:text", async (ctx) => this.textMessage(ctx));
@@ -294,10 +305,12 @@ export class TelegramApplication {
       const raw = await transcribeAudio(target);
       const forwarded = forwardedSource(ctx);
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
-      const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : undefined);
+      const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : Date.now());
       await this.memory.record({ owner: ownerId(ctx), body: raw, role: "user", kind: "voice", project: this.memoryProject(ctx), source: sender ? `telegram-voice:${sender}` : "telegram-voice" });
+      const command = parseSpokenVoiceCommand(raw);
+      if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id)) return;
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-      for (const part of htmlChunks(structureTranscript(raw, { sender, sentAt }), TELEGRAM_LIMIT)) {
+      for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
         await ctx.reply(part, { parse_mode: "HTML" });
       }
     } catch (error) {
@@ -306,6 +319,104 @@ export class TelegramApplication {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  }
+
+  private async handleLabeledCommand(ctx: Context, command: SpokenVoiceCommand, raw: string, sentAt: number,
+    sender?: string, existingProgressId?: number): Promise<boolean> {
+    if (!command.label) return false;
+    const clearProgress = async (): Promise<void> => {
+      if (existingProgressId !== undefined) {
+        await ctx.api.deleteMessage(ctx.chat!.id, existingProgressId).catch(() => undefined);
+      }
+    };
+    if (!command.content && command.kind === "diary") {
+      await clearProgress();
+      await this.showTodayDiary(ctx, sentAt);
+      return true;
+    }
+    if (!command.content) {
+      await clearProgress();
+      await ctx.reply(`После метки «${escape(command.label)}» нужен текст или поручение.`);
+      return true;
+    }
+    if (command.kind === "transcript") {
+      await clearProgress();
+      for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
+        await ctx.reply(part, { parse_mode: "HTML" });
+      }
+      return true;
+    }
+    if (command.kind === "task" || command.kind === "reminder" || command.kind === "inbox" || command.kind === "memory" || command.kind === "calendar") {
+      await clearProgress();
+      if (command.kind === "task") {
+        const task = this.database.createTask({ owner: ownerId(ctx), title: oneLine(command.content, 140), prompt: command.content });
+        await ctx.reply(taskCard(task), { parse_mode: "HTML", reply_markup: taskKeyboard(task) });
+      } else if (command.kind === "reminder") {
+        await this.acceptPending(ctx, "reminder", command.content);
+      } else if (command.kind === "inbox") {
+        await this.acceptPending(ctx, "capture", command.content);
+      } else if (command.kind === "memory") {
+        await this.acceptPending(ctx, "memory", command.content);
+      } else {
+        const calendarRequest = `календарь ${command.content}`;
+        if (localIntent(calendarRequest) === "calendar-list") await this.showCalendar(ctx);
+        else await this.offerCalendarEvent(ctx, `создай событие в календаре ${command.content}`);
+      }
+      return true;
+    }
+    if (command.kind !== "diary" && command.kind !== "story") return false;
+
+    const writingMode = command.kind;
+    const stored = this.database.voiceWritingSettings(contextId(ctx), ownerId(ctx));
+    const settings: VoiceWritingSettings = {
+      context: contextId(ctx), owner: ownerId(ctx), mode: writingMode,
+      storyTitle: writingMode === "story" ? stored.storyTitle : undefined, changedAt: Date.now(),
+    };
+    if (settings.mode === "story" && !settings.storyTitle) {
+      await clearProgress();
+      await ctx.reply("Сначала задайте название цикла: /story Название цикла. Затем начинайте сообщение со слова «рассказ».");
+      return true;
+    }
+    let progressId = existingProgressId;
+    if (progressId === undefined) progressId = (await ctx.reply(`✍️ Codex редактирует · ${voiceModeLabel(settings)}…`)).message_id;
+    else await ctx.api.editMessageText(ctx.chat!.id, progressId, `✍️ Codex редактирует · ${voiceModeLabel(settings)}…`).catch(() => undefined);
+    const previous = settings.mode === "story" && settings.storyTitle
+      ? await this.voiceArchive.previousStoryExcerpt(settings.storyTitle) : undefined;
+    let edited: EditedVoiceEntry;
+    try {
+      edited = await this.voiceEditor.edit(contextId(ctx), writingMode, command.content, settings.storyTitle, previous);
+    } catch (error) {
+      const rawPath = await this.voiceArchive.saveRaw(writingMode, raw, sentAt, settings.storyTitle);
+      await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
+      await ctx.reply(["<b>⚠️ Исходный текст сохранён, но Codex не смог его отредактировать.</b>", escape(errorMessage(error)),
+        `Исходник: <code>${escape(rawPath)}</code>`].join("\n"), { parse_mode: "HTML" });
+      for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
+        await ctx.reply(part, { parse_mode: "HTML" });
+      }
+      return true;
+    }
+    const saved = await this.voiceArchive.save(writingMode, edited.markdown, raw, sentAt, settings.storyTitle);
+    let noteResult = "Apple Notes обновлены";
+    try {
+      await appendAppleNote({
+        folder: saved.notesFolder, title: saved.notesTitle, html: saved.notesHtml,
+        sectionMarker: saved.notesSectionMarker, continuationHtml: saved.notesContinuationHtml,
+      });
+    } catch (error) {
+      noteResult = `Apple Notes не обновлены: ${errorMessage(error)}`;
+    }
+    await this.memory.record({ owner: ownerId(ctx), body: edited.markdown, role: "assistant", kind: "response",
+      project: this.memoryProject(ctx), source: `tagged-${writingMode}-edited` });
+    await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
+    const confirmation = [
+      `<b>✅ ${escape(voiceModeLabel(settings))}: сохранено</b>`,
+      `Заметка: <b>${escape(saved.notesTitle)}</b>`,
+      escape(noteResult),
+      `Резервная копия: <code>${escape(saved.polishedPath)}</code>`,
+    ].join("\n");
+    await ctx.reply(confirmation, { parse_mode: "HTML" });
+    await sendTelegramMarkdown(ctx.api, ctx.chat!.id, edited.markdown, TELEGRAM_LIMIT - 100);
+    return true;
   }
 
   private async attachmentMessage(ctx: Context): Promise<void> {
@@ -317,6 +428,18 @@ export class TelegramApplication {
     const captured = this.database.capture({ owner: ownerId(ctx), kind: message.photo ? "photo" : message.video ? "video" : "document", body, sender: source.sender, sourceTime: source.time });
     await this.memory.record({ owner: ownerId(ctx), body, role: "action", kind: "action", project: this.memoryProject(ctx), source: "telegram-attachment" });
     await ctx.reply(`${captureCard(captured)}\n\n<i>Codex-тред не запускался.</i>`, { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
+  }
+
+  private async showTodayDiary(ctx: Context, value = Date.now()): Promise<void> {
+    const day = await this.voiceArchive.diaryDay(value);
+    if (!day) {
+      await ctx.reply("За сегодня в дневнике пока нет записей. Начните сообщение со слова «дневник» или «заметки» и продолжайте текст.");
+      return;
+    }
+    await sendTelegramMarkdown(ctx.api, ctx.chat!.id, day.markdown, TELEGRAM_LIMIT - 100);
+    await ctx.replyWithDocument(new InputFile(Buffer.from(day.markdown, "utf8"), day.fileName), {
+      caption: "Markdown дневника за сегодня",
+    });
   }
 
   private async textMessage(ctx: Context): Promise<void> {
@@ -349,6 +472,15 @@ export class TelegramApplication {
       await ctx.reply(captureCard(captured), { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
       return;
     }
+    const labeled = parseSpokenVoiceCommand(text);
+    if (labeled.label) {
+      const action = labeled.kind === "calendar" || labeled.kind === "task" || labeled.kind === "reminder"
+        || labeled.kind === "inbox" || labeled.kind === "memory";
+      await this.rememberIncoming(ctx, text, action ? "action" : "message");
+      const sender = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
+      const sentAt = ctx.message?.date ? ctx.message.date * 1000 : Date.now();
+      if (await this.handleLabeledCommand(ctx, labeled, text, sentAt, sender)) return;
+    }
     const intent = localIntent(text);
     let localFallback = false;
     if (intent) {
@@ -380,10 +512,14 @@ export class TelegramApplication {
       return true;
     }
     if (intent === "calendar-create") {
-      return this.offerCalendarEvent(ctx, text, false);
+      await this.offerCalendarEvent(ctx, text);
+      return true;
     }
-    const parsed = understandAlarm(text);
-    if (!parsed) return false;
+    const parsed = understandAlarm(text) ?? await this.parseTemporalWithCodex(ctx, text, "reminder");
+    if (!parsed) {
+      await ctx.reply("Не удалось надёжно определить дату и время. Уточните, например: «напоминание завтра в 10:00 позвонить Анне».");
+      return true;
+    }
     const label = parsed.label === "Напоминание" && /будильник/i.test(text) ? "Будильник" : parsed.label;
     let systemAlarm = true;
     try {
@@ -521,6 +657,7 @@ export class TelegramApplication {
     const alarms = this.database.alarms(owner).slice(0, 3);
     const text = ["<b>🏠 Рабочий центр</b>", "", `▶️ В работе: <b>${counts.running}</b>`, `❓ Нужен ответ: <b>${counts.waiting}</b>`,
       `⏳ В очереди: <b>${counts.queued}</b>`, `📋 Запланировано: <b>${counts.todo}</b>`, `📥 Инбокс: <b>${inbox}</b>`,
+      "🎙 Голосовые: <b>метка в начале сообщения</b>",
       ...(alarms.length ? ["", "<b>Напоминания</b>", ...alarms.map((alarm) => `⏰ ${escape(alarm.label)} · ${formatDate(alarm.nextAt)}`)] : [])].join("\n");
     await ctx.reply(text, { parse_mode: "HTML", reply_markup: homeKeyboard() });
   }
@@ -532,6 +669,7 @@ export class TelegramApplication {
     const prompts: Record<PendingInput, string> = {
       task: "Напишите новую задачу.", capture: "Что добавить в инбокс?", memory: "Что запомнить?",
       search: "Что найти?", reminder: "Когда и о чём напомнить?", recall: "Что вспомнить?", forget: "Пришлите ID записи, которую нужно забыть.",
+      story: "Напишите название цикла рассказов.",
     };
     await ctx.reply(prompts[kind]);
   }
@@ -556,12 +694,26 @@ export class TelegramApplication {
       await ctx.reply(recallResults(value, hits), { parse_mode: "HTML" });
     } else if (kind === "forget") {
       await ctx.reply(await this.memory.forget(owner, value.trim()) ? "🗑 Запись удалена из памяти и будет удалена из индекса." : "Запись не найдена.");
+    } else if (kind === "story") {
+      const settings = this.database.setVoiceWritingSettings({ context: contextId(ctx), owner, mode: "story", storyTitle: value });
+      await ctx.reply(`Цикл рассказов сохранён: <b>${escape(settings.storyTitle ?? value)}</b>\nТеперь начинайте нужные голосовые со слова «рассказ».`, { parse_mode: "HTML" });
     } else {
-      const parsed = understandAlarm(value);
+      const parsed = understandAlarm(value) ?? await this.parseTemporalWithCodex(ctx, value, "reminder");
       if (!parsed) return void await ctx.reply("Не понял время. Например: завтра в 10 позвонить Анне.");
       const alarm = this.database.createAlarm({ owner, label: parsed.label, nextAt: parsed.at, cadence: parsed.cadence });
       await ctx.reply(`⏰ <b>${escape(alarm.label)}</b>\n${formatDate(alarm.nextAt)}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить", `alarm:delete:${alarm.id}`) });
     }
+  }
+
+  private async voiceCommand(ctx: Context): Promise<void> {
+    await ctx.reply(spokenVoiceHelp(), { parse_mode: "HTML" });
+  }
+
+  private async storyCommand(ctx: Context): Promise<void> {
+    const title = commandArgument(ctx);
+    if (!title) return this.captureCommand(ctx, "story");
+    const settings = this.database.setVoiceWritingSettings({ context: contextId(ctx), owner: ownerId(ctx), mode: "story", storyTitle: title });
+    await ctx.reply(`Цикл рассказов сохранён: <b>${escape(settings.storyTitle ?? title)}</b>\nТеперь начинайте нужные голосовые со слова «рассказ».`, { parse_mode: "HTML" });
   }
 
   private async showTasks(ctx: Context): Promise<void> {
@@ -622,9 +774,9 @@ export class TelegramApplication {
   }
 
   private async offerCalendarEvent(ctx: Context, input: string, replyOnFailure = true): Promise<boolean> {
-    const parsed = understandAlarm(input);
+    const parsed = understandAlarm(input) ?? await this.parseTemporalWithCodex(ctx, input, "calendar");
     if (!parsed) {
-      if (replyOnFailure) await ctx.reply("Не понял дату и время события.");
+      if (replyOnFailure) await ctx.reply("Не удалось надёжно определить событие. Уточните дату, время и название, например: «календарь в четверг в 19:00 Концерт».");
       return false;
     }
     const title = normalizeCalendarTitle(parsed.label);
@@ -633,6 +785,31 @@ export class TelegramApplication {
     const keyboard = new InlineKeyboard().text("✅ Создать", `event:confirm:${token}`).text("Отмена", `event:cancel:${token}`);
     await ctx.reply(`Создать событие?\n<b>${escape(title)}</b>\n${formatDate(parsed.at)}`, { parse_mode: "HTML", reply_markup: keyboard });
     return true;
+  }
+
+  private async parseTemporalWithCodex(ctx: Context, input: string, purpose: "calendar" | "reminder"): Promise<ParsedAlarm | null> {
+    const profileId = this.configuration.profiles.find((profile) => profile.id === "readonly")?.id
+      ?? this.configuration.defaultProfile;
+    const conversation = await this.hub.conversation(`temporal-parser:${contextId(ctx)}`, {
+      workspace: this.configuration.dataDirectory, model: this.configuration.defaultModel, profileId,
+    });
+    const observer = new TextOnlyObserver();
+    const prompt = [
+      "Ты — строгий парсер русскоязычной команды. Не выполняй действие и не используй инструменты.",
+      `Назначение: ${purpose === "calendar" ? "событие календаря" : "напоминание"}.`,
+      `Текущее локальное время Europe/Moscow: ${moscowIso(new Date())}.`,
+      "Извлеки ближайшие будущие дату и время, короткое название без командных слов и повторяемость.",
+      "Если назван день недели без даты, выбери ближайший будущий такой день. Если данных недостаточно или есть неоднозначность, верни ровно {\"error\":\"clarification_needed\"}.",
+      "Иначе верни только JSON без Markdown: {\"dateTime\":\"ISO-8601 с явным +03:00\",\"title\":\"название\",\"cadence\":\"once|daily|weekdays|weekly\"}.",
+      `Команда: ${JSON.stringify(input)}`,
+    ].join("\n\n");
+    try {
+      await conversation.run(prompt, observer);
+      return parseTemporalCodexResponse(observer.content());
+    } catch (error) {
+      console.error("Codex temporal parsing failed", error);
+      return null;
+    }
   }
 
   private async confirmCalendarEvent(ctx: Context): Promise<void> {
@@ -699,10 +876,10 @@ export class TelegramApplication {
     if (input !== "on" && input !== "вкл") return void await ctx.reply("Используйте <code>/digest on</code>, <code>/digest off</code> или <code>/digest status</code>.", { parse_mode: "HTML" });
     existing.forEach((alarm) => this.database.deleteAlarm(alarm.id));
     const morning = nextLocalTime(9, 0);
-    const evening = nextLocalTime(20, 0);
+    const evening = nextLocalTime(21, 0);
     this.database.createAlarm({ owner, label: "Утренний дайджест", nextAt: morning, cadence: "daily", mode: "digest-morning" });
-    this.database.createAlarm({ owner, label: "Вечерний дайджест", nextAt: evening, cadence: "daily", mode: "digest-evening" });
-    await ctx.reply("✅ Дайджесты включены: ежедневно в 09:00 и 20:00.");
+    this.database.createAlarm({ owner, label: "Итог дня", nextAt: evening, cadence: "daily", mode: "digest-evening" });
+    await ctx.reply("✅ Дайджесты включены: утром в 09:00 и общий итог дня в 21:00.");
   }
 
   private async openOnMac(ctx: Context): Promise<void> {
@@ -862,6 +1039,17 @@ export class TelegramApplication {
   }
 }
 
+class TextOnlyObserver implements TurnObserver {
+  private value = "";
+  text(delta: string): void { this.value += delta; }
+  toolStarted(): void {}
+  toolProgress(): void {}
+  toolFinished(): void {}
+  approval(): Promise<ApprovalChoice> { return Promise.resolve("decline"); }
+  userInput(): Promise<UserInputAnswers> { return Promise.resolve({}); }
+  content(): string { return this.value.trim(); }
+}
+
 export class TelegramTurnView implements TurnObserver {
   private answer = "";
   private messageId?: number;
@@ -933,12 +1121,17 @@ export class TelegramTurnView implements TurnObserver {
 
   private async write(final: boolean): Promise<void> {
     const source = `${this.answer.trim() || (final ? "Готово" : "…")}${final && this.showUsage && this.lastUsage ? `\n\n${this.lastUsage}` : ""}`;
-    const text = source.slice(0, TELEGRAM_LIMIT - 50);
+    const rendered = renderTelegramMarkdown(source, TELEGRAM_LIMIT - 50);
+    const { html: text, plain } = rendered;
     if (!this.messageId) {
-      const message = await this.ctx.reply(text);
+      const message = await this.ctx.reply(text, { parse_mode: "HTML" }).catch(() => this.ctx.reply(plain));
       this.messageId = message.message_id;
     } else {
-      await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, text).catch(() => undefined);
+      try {
+        await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, text, { parse_mode: "HTML" });
+      } catch {
+        await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, plain).catch(() => undefined);
+      }
     }
     this.lastEdit = Date.now();
   }
@@ -958,6 +1151,23 @@ function taskKeyboard(task: WorkItem): InlineKeyboard { return new InlineKeyboar
 function captureKeyboard(id: string): InlineKeyboard { return new InlineKeyboard().text("✅ Задача", `capture:task:${id}`).row().text("📚 В память", `capture:memory:${id}`).text("🗑", `capture:drop:${id}`); }
 function taskCard(task: WorkItem): string { return `<b>${taskIcon(task.status)} ${escape(task.title)}</b>\nСтатус: ${escape(task.status)}${task.projectLabel ? `\nПроект: ${escape(task.projectLabel)}` : ""}`; }
 function captureCard(item: CapturedItem): string { return `<b>📥 Добавлено в инбокс</b>${item.sender ? `\nОт: ${escape(item.sender)}` : ""}\n\n${escape(oneLine(item.body, 700))}`; }
+function voiceModeLabel(settings: VoiceWritingSettings): string {
+  if (settings.mode === "diary") return "Дневник";
+  if (settings.mode === "story") return `Рассказы · ${settings.storyTitle ?? "без названия"}`;
+  return "Обычная расшифровка";
+}
+function spokenVoiceHelp(): string {
+  return ["<b>🎙 Голосовые метки-команды</b>", "Произнесите метку первым словом и сразу продолжайте:", "",
+    "<b>Дневник / Заметки</b> — с текстом добавить запись; без текста показать сегодняшний день",
+    "<b>Рассказ</b> — продолжить выбранный через /story цикл",
+    "<b>Календарь</b> — подготовить событие для подтверждения",
+    "<b>Задача</b> — создать задачу",
+    "<b>Напоминание</b> — создать напоминание",
+    "<b>Идея</b> — положить в инбокс",
+    "<b>Запомни</b> — сохранить в долговременную память",
+    "",
+    "Без метки бот просто пришлёт расшифровку."].join("\n");
+}
 function taskIcon(status: WorkItem["status"]): string { return ({ todo: "⚪", queued: "⏳", running: "▶️", waiting: "❓", done: "✅", cancelled: "🚫" })[status]; }
 function approvalCard(prompt: ApprovalPrompt): string { return [`<b>⚠️ Требуется подтверждение: ${escape(prompt.category)}</b>`, prompt.command ? `<code>${escape(prompt.command)}</code>` : "", prompt.directory ? `Папка: <code>${escape(prompt.directory)}</code>` : "", prompt.root ? `Доступ: <code>${escape(prompt.root)}</code>` : "", prompt.reason ? `Причина: ${escape(prompt.reason)}` : ""].filter(Boolean).join("\n\n"); }
 function approvalResult(choice: ApprovalChoice): string { return ({ accept: "Разрешено один раз", acceptForSession: "Разрешено на сессию", decline: "Отклонено", cancel: "Ход отменён" })[choice]; }
@@ -987,6 +1197,13 @@ function forwardedSource(ctx: Context): { sender?: string; time?: number } { con
 function commandArgument(ctx: Context): string { return ctx.message?.text?.replace(/^\/\w+(?:@\w+)?\s*/i, "").trim() || ""; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function nextLocalTime(hours: number, minutes: number): number { const date = new Date(); date.setHours(hours, minutes, 0, 0); if (date.getTime() <= Date.now()) date.setDate(date.getDate() + 1); return date.getTime(); }
+function moscowIso(value: Date): string {
+  const local = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Moscow", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).format(value).replace(" ", "T");
+  return `${local}+03:00`;
+}
 function generatedWorkspace(value: string): boolean {
   const normalized = value.replaceAll("\\", "/");
   const base = path.basename(normalized).toLocaleLowerCase("ru-RU");

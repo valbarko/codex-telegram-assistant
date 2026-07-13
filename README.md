@@ -4,17 +4,20 @@ A private-by-default Telegram client for a local Codex installation, plus a smal
 
 This repository is an independent implementation with its own source structure, protocol transport, database schema, Telegram interface, tests, and deployment scripts.
 
-## Highlights
+## Features
 
-- Create, resume, steer, interrupt, and hand off Codex threads from Telegram.
-- Separate contexts for Telegram chats and forum topics.
-- Streaming answers and interactive command, file, and permission approvals.
-- Project aliases and recently active thread selection.
-- Tasks, inbox, FIFO Codex queue, reminders, scheduled runs, long-term semantic memory, search, and daily digests.
-- Voice transcription with local MLX Whisper. Voice messages never start a Codex thread.
-- Gmail reading through the connected Codex app; Apple Mail only for visible drafts.
-- Local Apple Calendar listing and event creation.
-- Persistent macOS LaunchAgent, independent of the Codex desktop app lifecycle.
+- **Codex from Telegram:** create, resume, steer, interrupt, and hand off threads with separate contexts for chats and forum topics.
+- **Live agent interaction:** stream answers and handle command, file, user-input, and permission approvals without returning to the Mac.
+- **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
+- **Apple Notes publishing:** append diary entries to one monthly note grouped by date, keep story continuity, and retain readable Markdown plus untouched transcript backups.
+- **Spoken and text commands:** route one-shot labels such as `Дневник`, `Рассказ`, `Календарь`, `Задача`, and `Напоминание` to the correct workflow.
+- **Safe calendar automation:** parse common dates locally, fall back to validated Codex extraction for ambiguous phrasing, and require confirmation before creating Apple Calendar events.
+- **Personal productivity:** manage tasks, inbox captures, a FIFO Codex queue, reminders, scheduled runs, project aliases, and recently active threads.
+- **Long-term memory:** store and recall project or global context with explicit pause, export, and deletion controls.
+- **Daily reporting:** generate cross-project evening summaries with completed work, blockers, first and last interaction times, estimated active time, and long breaks.
+- **Telegram-native formatting:** safely render Codex Markdown as headings, emphasis, code, quotes, links, and lists with plain-text fallback.
+- **Mail integrations:** read Gmail through the connected Codex app and use Apple Mail only for visible drafts.
+- **Always-on local runtime:** run through a macOS LaunchAgent without exposing an inbound network port or depending on the Codex desktop app lifecycle.
 
 ## Requirements
 
@@ -47,10 +50,11 @@ The `.env` file, SQLite state, logs, model caches, and local paths are ignored b
 - `/sessions` — recent Codex threads, sorted by activity
 - `/abort` — interrupt the current turn
 - `/remind` and `/schedule` — notification or Codex run at a later time
-- `/digest on` — daily task summaries at 09:00 and 20:00
+- `/digest on` — morning task plan at 09:00 and a cross-project work summary at 21:00
 - `/calendar`, `/event`, `/draft`, `/mac` — local Mac integrations
 - `/recall`, `/forget`, `/about_me` — recall, delete, and inspect personal memory
 - `/memory_status`, `/memory_pause`, `/memory_export` — control and export long-term memory
+- `/voice` — list spoken command labels; `/story` selects the current story cycle
 
 The persistent Telegram keyboard keeps common actions one tap away. A text sent while Codex is working steers the active turn; after it finishes, the next text starts a new turn in the same thread.
 
@@ -64,7 +68,15 @@ Passwords, API tokens, bearer credentials, JWTs, Telegram bot tokens, and OTP-li
 
 Install the local transcription dependency in a dedicated Python environment and set `WHISPER_PYTHON` to its interpreter. The default model is `mlx-community/whisper-large-v3-turbo`.
 
-The bot returns sender/date metadata when Telegram provides it, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward. It is not sent into Codex and does not create a project conversation.
+An unlabelled voice message is a plain transcription. The bot returns sender/date metadata, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward.
+
+Destinations are one-shot labels for both voice and text, not persistent modes. Start the message with `дневник`, `рассказ`, `календарь`, `задача`, `напоминание`, `идея`, or `запомни`, then continue normally. `дневник` sends the remaining text through Codex and appends it to one Apple Notes note per month, grouped by date and time. Use `/story <cycle name>` once to select a cycle; subsequent messages beginning with `рассказ` use the same editorial flow and the end of the previous draft as continuity context. Calendar, task, reminder, inbox, and memory labels route the remaining content to the corresponding local workflow.
+
+Send `Дневник` or `Заметки` without additional text to receive all entries for the current day. Add text after either label to create a new entry. Telegram renders the structured entry and also sends the same content as a downloadable Markdown file.
+
+Calendar and reminder language uses a safe parsing cascade: deterministic local rules first, then a read-only Codex structured-extraction turn when the local parser cannot understand the date or time. Codex may only return validated JSON; the application still asks for confirmation before writing a calendar event. Ambiguous or invalid results produce a clarification request instead of an action.
+
+Every edited entry is also stored as readable Markdown under `WRITING_ARCHIVE_DIR` (default: `~/Documents/Codex Writer`). Untouched transcripts are kept separately under `Исходные расшифровки`. If Apple Notes automation fails, the Markdown copy still succeeds and Telegram reports the Notes error. The first Notes write may require permission in **System Settings → Privacy & Security → Automation**.
 
 ## System alarms on macOS
 

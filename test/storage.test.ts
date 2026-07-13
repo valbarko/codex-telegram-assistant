@@ -34,6 +34,15 @@ describe("AssistantDatabase", () => {
     expect(database.conversation("1:42")).toMatchObject({ threadId: "thr", workspace: "/work", profileId: "review" });
   });
 
+  it("persists the voice-writing mode per Telegram context", () => {
+    expect(database.voiceWritingSettings("1:42", "1")).toMatchObject({ mode: "transcript" });
+    database.setVoiceWritingSettings({ context: "1:42", owner: "1", mode: "diary" });
+    expect(database.voiceWritingSettings("1:42", "1")).toMatchObject({ mode: "diary" });
+    database.setVoiceWritingSettings({ context: "1:42", owner: "1", mode: "story", storyTitle: "Город у моря" });
+    expect(database.voiceWritingSettings("1:42", "1")).toMatchObject({ mode: "story", storyTitle: "Город у моря" });
+    expect(() => database.setVoiceWritingSettings({ context: "1:42", owner: "1", mode: "story" })).toThrow("Story title");
+  });
+
   it("stores scoped memory events and supports pause and soft deletion", () => {
     const global = database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "message", body: "Люблю короткие ответы" });
     database.recordMemoryEvent({ owner: "1", namespace: "project", project: "/work/trainer", role: "assistant", kind: "response", body: "Добавили отчёт" });
@@ -41,5 +50,16 @@ describe("AssistantDatabase", () => {
     expect(database.forgetMemoryEvent("1", global.id)?.deletedAt).toBeTypeOf("number");
     database.setMemoryPaused("1", true);
     expect(database.memoryStatus("1")).toMatchObject({ active: 1, deleted: 1, paused: true });
+  });
+
+  it("finds today's task activity and upgrades legacy evening digests", () => {
+    const since = Date.now() - 1_000;
+    const task = database.createTask({ owner: "1", title: "Подготовить отчёт" });
+    database.updateTask(task.id, { status: "done", finishedAt: Date.now() });
+    expect(database.tasksChangedSince("1", since).map((item) => item.id)).toContain(task.id);
+
+    database.createAlarm({ owner: "1", label: "Вечерний дайджест", nextAt: 100, cadence: "daily", mode: "digest-evening" });
+    expect(database.upgradeEveningDigests(21_000)).toBe(1);
+    expect(database.alarms("1")[0]).toMatchObject({ label: "Итог дня", nextAt: 21_000 });
   });
 });

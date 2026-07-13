@@ -29,6 +29,15 @@ describe("TelegramTurnView", () => {
 
     expect(reply).toHaveBeenCalledTimes(1);
     expect(editMessageText).toHaveBeenCalledTimes(1);
-    expect(editMessageText).toHaveBeenLastCalledWith(7, 42, "Разрешение получено. Повторно подключаюсь.");
+    expect(editMessageText).toHaveBeenLastCalledWith(7, 42, "Разрешение получено. Повторно подключаюсь.", { parse_mode: "HTML" });
+  });
+
+  it("renders Codex Markdown as Telegram HTML", async () => {
+    const reply = vi.fn(async () => ({ message_id: 9 }));
+    const ctx = { chat: { id: 7 }, reply, api: { editMessageText: vi.fn(async () => true) } };
+    const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false);
+    view.text("1. **Важный итог**: запустите `rsync`.");
+    await view.finish();
+    expect(reply).toHaveBeenCalledWith("1. <b>Важный итог</b>: запустите <code>rsync</code>.", { parse_mode: "HTML" });
   });
 });
