@@ -4,18 +4,20 @@ A private-by-default Telegram client for a local Codex installation, plus a smal
 
 This repository is an independent implementation with its own source structure, protocol transport, database schema, Telegram interface, tests, and deployment scripts.
 
-## Highlights
+## Features
 
-- Create, resume, steer, interrupt, and hand off Codex threads from Telegram.
-- Separate contexts for Telegram chats and forum topics.
-- Streaming answers and interactive command, file, and permission approvals.
-- Safe Telegram rendering for Codex Markdown: headings, bold, italics, inline and fenced code, quotes, links, and lists.
-- Project aliases and recently active thread selection.
-- Tasks, inbox, FIFO Codex queue, reminders, scheduled runs, long-term semantic memory, search, and daily digests.
-- Voice transcription with local MLX Whisper plus opt-in Codex editing for a diary and story cycles.
-- Gmail reading through the connected Codex app; Apple Mail only for visible drafts.
-- Local Apple Calendar listing and event creation.
-- Persistent macOS LaunchAgent, independent of the Codex desktop app lifecycle.
+- **Codex from Telegram:** create, resume, steer, interrupt, and hand off threads with separate contexts for chats and forum topics.
+- **Live agent interaction:** stream answers and handle command, file, user-input, and permission approvals without returning to the Mac.
+- **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
+- **Apple Notes publishing:** append diary entries to one monthly note grouped by date, keep story continuity, and retain readable Markdown plus untouched transcript backups.
+- **Spoken and text commands:** route one-shot labels such as `Дневник`, `Рассказ`, `Календарь`, `Задача`, and `Напоминание` to the correct workflow.
+- **Safe calendar automation:** parse common dates locally, fall back to validated Codex extraction for ambiguous phrasing, and require confirmation before creating Apple Calendar events.
+- **Personal productivity:** manage tasks, inbox captures, a FIFO Codex queue, reminders, scheduled runs, project aliases, and recently active threads.
+- **Long-term memory:** store and recall project or global context with explicit pause, export, and deletion controls.
+- **Daily reporting:** generate cross-project evening summaries with completed work, blockers, first and last interaction times, estimated active time, and long breaks.
+- **Telegram-native formatting:** safely render Codex Markdown as headings, emphasis, code, quotes, links, and lists with plain-text fallback.
+- **Mail integrations:** read Gmail through the connected Codex app and use Apple Mail only for visible drafts.
+- **Always-on local runtime:** run through a macOS LaunchAgent without exposing an inbound network port or depending on the Codex desktop app lifecycle.
 
 ## Requirements
 
