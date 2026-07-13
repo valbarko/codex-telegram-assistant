@@ -9,9 +9,10 @@ This repository is an independent implementation with its own source structure, 
 - **Codex from Telegram:** create, resume, steer, interrupt, and hand off threads with separate contexts for chats and forum topics.
 - **Live agent interaction:** stream answers and handle command, file, user-input, and permission approvals without returning to the Mac.
 - **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
+- **Style-aware drafts:** turn a text or voice note beginning with `Пост`, `Анонс`, or `Ответ` into a ready Telegram draft using a private, locally indexed corpus of the owner's accepted writing.
 - **Forwarded voice packages:** collect rapidly forwarded voice messages from the same original sender, preserve their order, and use Codex to merge one topic or split genuine topic changes.
 - **Apple Notes publishing:** append diary entries to one monthly note grouped by date, keep story continuity, and retain readable Markdown plus untouched transcript backups.
-- **Spoken and text commands:** route one-shot labels such as `Дневник`, `Рассказ`, `Календарь`, `Задача`, and `Напоминание` to the correct workflow.
+- **Spoken and text commands:** route one-shot labels such as `Пост`, `Анонс`, `Ответ`, `Дневник`, `Рассказ`, `Календарь`, `Задача`, and `Напоминание` to the correct workflow.
 - **Safe calendar automation:** parse common dates locally, fall back to validated Codex extraction for ambiguous phrasing, and require confirmation before creating Apple Calendar events.
 - **Personal productivity:** manage tasks, inbox captures, a FIFO Codex queue, reminders, scheduled runs, project aliases, and recently active threads.
 - **Long-term memory:** store and recall project or global context with explicit pause, export, and deletion controls.
@@ -73,13 +74,17 @@ An unlabelled voice message is a plain transcription. The bot returns sender/dat
 
 Forwarded voice and audio messages use package processing. After each forwarded item, the bot waits 45 seconds for more messages from the same original sender. Original messages join the same package while consecutive source timestamps are no more than 10 minutes apart. Every file is transcribed separately and ordered by its Telegram source time; Codex then creates one coherent transcript or separates real topic changes with short headings. A different sender or a larger source-time gap starts a new package. Forwarded speech is always treated as content and can never trigger calendar, task, reminder, or other spoken commands.
 
-Destinations are one-shot labels for both voice and text, not persistent modes. Start the message with `дневник`, `рассказ`, `календарь`, `задача`, `напоминание`, `идея`, or `запомни`, then continue normally. `дневник` sends the remaining text through Codex and appends it to one Apple Notes note per month, grouped by date and time. Use `/story <cycle name>` once to select a cycle; subsequent messages beginning with `рассказ` use the same editorial flow and the end of the previous draft as continuity context. Calendar, task, reminder, inbox, and memory labels route the remaining content to the corresponding local workflow.
+Destinations are one-shot labels for both voice and text, not persistent modes. Start the message with `пост`, `анонс`, `ответ`, `дневник`, `рассказ`, `календарь`, `задача`, `напоминание`, `идея`, or `запомни`, then continue normally. `Пост`, `Анонс`, and `Ответ` select relevant examples from the private writing corpus and ask a read-only Codex thread for a finished Telegram draft without inventing facts or copying source passages. If the local semantic index is unavailable, the assistant falls back to local lexical retrieval from the same private corpus.
+
+`дневник` sends the remaining text through Codex and appends it to one Apple Notes note per month, grouped by date and time. Use `/story <cycle name>` once to select a cycle; subsequent messages beginning with `рассказ` use the same editorial flow and the end of the previous draft as continuity context. Calendar, task, reminder, inbox, and memory labels route the remaining content to the corresponding local workflow.
 
 Send `Дневник` or `Заметки` without additional text to receive all entries for the current day. Add text after either label to create a new entry. Telegram renders the structured entry and also sends the same content as a downloadable Markdown file.
 
 Calendar and reminder language uses a safe parsing cascade: deterministic local rules first, then a read-only Codex structured-extraction turn when the local parser cannot understand the date or time. Codex may only return validated JSON; the application still asks for confirmation before writing a calendar event. Ambiguous or invalid results produce a clarification request instead of an action.
 
 Every edited entry is also stored as readable Markdown under `WRITING_ARCHIVE_DIR` (default: `~/Documents/Codex Writer`). Untouched transcripts are kept separately under `Исходные расшифровки`. If Apple Notes automation fails, the Markdown copy still succeeds and Telegram reports the Notes error. The first Notes write may require permission in **System Settings → Privacy & Security → Automation**.
+
+The authorial profile is versioned in `writing/VALENTIN_STYLE.md`. Raw Telegram exports, filtered posts, and search indexes live under ignored `.private/`; use `npm run style:build` and `npm run style:index` to refresh them. See `writing/README.md` for the private corpus workflow.
 
 ## System alarms on macOS
 

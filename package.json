@@ -13,7 +13,12 @@
     "dev": "tsx src/main.ts",
     "start": "node dist/main.js",
     "test": "vitest run",
-    "migrate": "tsx src/migrate-user-data.ts"
+    "migrate": "tsx src/migrate-user-data.ts",
+    "style:build": "node scripts/build-style-corpus.mjs",
+    "style:index": "memsearch index .private/style-corpus/posts --collection cta_style_valentin --provider onnx --description 'Private writing corpus for Valentin Barko' --force",
+    "style:search": "memsearch search --top-k 8 --collection cta_style_valentin --provider onnx",
+    "style:search:personal": "memsearch search --top-k 8 --collection cta_style_valentin --provider onnx --source-prefix \"$PWD/.private/style-corpus/posts/barko-pro-zhizn\"",
+    "style:search:expert": "memsearch search --top-k 8 --collection cta_style_valentin --provider onnx --source-prefix \"$PWD/.private/style-corpus/posts/v-svoem-tele\""
   },
   "dependencies": {
     "@grammyjs/auto-retry": "2.0.2",

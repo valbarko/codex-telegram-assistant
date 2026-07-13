@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AppConfiguration } from "./configuration.js";
 import { CodexHub, type ApprovalChoice, type TurnObserver, type UserInputAnswers } from "./codex-engine.js";
 import type { VoiceWritingMode } from "./storage.js";
+import { StyleReferenceLibrary, styleWritingPrompt, type StyleWritingKind } from "./style-writing.js";
 
 export interface EditedVoiceEntry {
   markdown: string;
@@ -26,7 +27,8 @@ export interface DiaryDay {
   sourcePath: string;
 }
 
-export type SpokenVoiceCommandKind = "transcript" | "diary" | "story" | "calendar" | "task" | "reminder" | "inbox" | "memory";
+export type SpokenVoiceCommandKind = "transcript" | "diary" | "story" | "post" | "announcement" | "reply"
+  | "calendar" | "task" | "reminder" | "inbox" | "memory";
 
 export interface SpokenVoiceCommand {
   kind: SpokenVoiceCommandKind;
@@ -40,6 +42,9 @@ const SPOKEN_LABELS: Readonly<Record<string, SpokenVoiceCommandKind>> = {
   "заметки": "diary",
   "рассказ": "story",
   "рассказы": "story",
+  "пост": "post",
+  "анонс": "announcement",
+  "ответ": "reply",
   "календарь": "calendar",
   "задача": "task",
   "напоминание": "reminder",
@@ -60,8 +65,16 @@ export function parseSpokenVoiceCommand(raw: string): SpokenVoiceCommand {
   return { kind, content: (match[2] ?? "").trim(), label };
 }
 
+export function isStyleWritingKind(kind: SpokenVoiceCommandKind): kind is StyleWritingKind {
+  return kind === "post" || kind === "announcement" || kind === "reply";
+}
+
 export class VoiceWritingEditor {
-  constructor(private readonly configuration: AppConfiguration, private readonly hub: CodexHub) {}
+  private readonly styleReferences: StyleReferenceLibrary;
+
+  constructor(private readonly configuration: AppConfiguration, private readonly hub: CodexHub) {
+    this.styleReferences = new StyleReferenceLibrary(configuration);
+  }
 
   async edit(scope: string, mode: Exclude<VoiceWritingMode, "transcript">, raw: string, storyTitle?: string,
     previousExcerpt?: string): Promise<EditedVoiceEntry> {
@@ -76,6 +89,22 @@ export class VoiceWritingEditor {
     await conversation.run(editorPrompt(mode, raw, storyTitle, previousExcerpt), observer);
     const markdown = cleanModelMarkdown(observer.content());
     if (!markdown) throw new Error("Codex вернул пустой отредактированный текст");
+    return { markdown };
+  }
+
+  async compose(scope: string, kind: StyleWritingKind, raw: string): Promise<EditedVoiceEntry> {
+    const profileId = this.configuration.profiles.find((profile) => profile.id === "readonly")?.id
+      ?? this.configuration.defaultProfile;
+    const conversation = await this.hub.conversation(`style-writer:${scope}:${kind}`, {
+      workspace: this.configuration.defaultWorkspace,
+      model: this.configuration.defaultModel,
+      profileId,
+    });
+    const observer = new TextObserver();
+    const context = await this.styleReferences.context(kind, raw);
+    await conversation.run(styleWritingPrompt(kind, raw, context), observer);
+    const markdown = cleanModelMarkdown(observer.content());
+    if (!markdown) throw new Error("Codex вернул пустой текст");
     return { markdown };
   }
 }

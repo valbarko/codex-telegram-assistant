@@ -66,6 +66,15 @@ describe("voice writing", () => {
       kind: "calendar", content: "19:00 четверг Концерт", label: "календарь",
     });
     expect(parseSpokenVoiceCommand("Задача подготовить отчёт")).toMatchObject({ kind: "task", content: "подготовить отчёт" });
+    expect(parseSpokenVoiceCommand("Пост мой первый день в новом зале")).toEqual({
+      kind: "post", content: "мой первый день в новом зале", label: "пост",
+    });
+    expect(parseSpokenVoiceCommand("Анонс — в четверг открытая тренировка")).toEqual({
+      kind: "announcement", content: "в четверг открытая тренировка", label: "анонс",
+    });
+    expect(parseSpokenVoiceCommand("Ответ: да, можно начать с двух тренировок")).toEqual({
+      kind: "reply", content: "да, можно начать с двух тренировок", label: "ответ",
+    });
     expect(parseSpokenVoiceCommand("Заметки")).toEqual({ kind: "diary", content: "", label: "заметки" });
     expect(parseSpokenVoiceCommand("Просто обычная речь")).toEqual({ kind: "transcript", content: "Просто обычная речь" });
   });
