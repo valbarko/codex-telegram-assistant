@@ -32,16 +32,21 @@ The application is a private-by-default Telegram client for a local Codex instal
 - Provide a home dashboard, quick task capture, project assignment, task completion, snoozing, and a serial Codex queue.
 - Deliver notifications for task start, completion, failure, and required user action.
 - Parse Russian reminder expressions for relative time, today, tomorrow, dates, daily schedules, and weekdays.
-- Support scheduled Codex tasks and morning/evening digests.
+- Support scheduled Codex tasks, a morning digest, and a 21:00 cross-project summary built from tasks and long-term memory.
 - Search tasks, inbox, memories, voice transcripts, and Codex threads.
 
 ### Inputs and artifacts
 
-- Voice and audio are transcription-only: they must not start or modify a Codex thread.
+- Unlabelled voice and audio are transcription-only. A label at the start of a voice or text message routes only that message; there is no persistent voice mode.
 - Voice output contains sender/date metadata when Telegram supplies it, concise summary bullets, and a structured transcript with meaningful bold emphasis.
+- Supported spoken labels include diary, story, calendar, task, reminder, inbox/idea, and memory. Diary and story labels use a dedicated read-only Codex editorial thread without modifying the user's active project conversation.
+- Diary entries append to one Apple Notes note per month, grouped by date and time. Story entries append to the selected cycle. Both keep untouched transcripts and readable Markdown backups.
+- A bare `Diary` or `Notes` label returns the current day's structured entries in Telegram plus a Markdown file. When content follows either label, it is treated as a new diary entry.
+- Date/time commands use deterministic parsing first and a validated, read-only Codex JSON extraction fallback second. Calendar writes still require explicit confirmation; ambiguous fallback results ask for clarification.
 - Photos may be sent as Codex image inputs.
 - Documents may be staged for Codex, with explicit instructions describing their paths.
 - Generated artifacts are returned to Telegram when safe and within Telegram limits.
+- Codex Markdown is converted to escaped Telegram HTML for both streaming and final messages, with a plain-text fallback when Telegram rejects formatted output.
 
 ### Mail and calendar
 

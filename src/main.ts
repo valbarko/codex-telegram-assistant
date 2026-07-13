@@ -9,6 +9,7 @@ import { TelegramApplication } from "./telegram-app.js";
 
 const configuration = readConfiguration();
 const database = new AssistantDatabase(path.join(configuration.dataDirectory, "assistant.sqlite"));
+database.upgradeEveningDigests(nextLocalTime(21, 0));
 const hub = new CodexHub(configuration);
 const memory = new MemoryService(configuration.dataDirectory, configuration.memsearchExecutable, database);
 const telegram = new TelegramApplication(configuration, hub, database, memory);
@@ -33,3 +34,10 @@ console.log("Codex Telegram Assistant starting");
 console.log(`Data: ${configuration.dataDirectory}`);
 scheduler.start();
 await telegram.start();
+
+function nextLocalTime(hours: number, minutes: number): number {
+  const date = new Date();
+  date.setHours(hours, minutes, 0, 0);
+  if (date.getTime() <= Date.now()) date.setDate(date.getDate() + 1);
+  return date.getTime();
+}

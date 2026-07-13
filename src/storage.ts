@@ -79,6 +79,16 @@ export interface MemoryStatus {
   project: number;
 }
 
+export type VoiceWritingMode = "transcript" | "diary" | "story";
+
+export interface VoiceWritingSettings {
+  context: string;
+  owner: string;
+  mode: VoiceWritingMode;
+  storyTitle?: string;
+  changedAt: number;
+}
+
 export interface SavedConversation {
   context: string;
   threadId?: string;
@@ -149,6 +159,11 @@ export class AssistantDatabase {
       COALESCE(due_at, 9223372036854775807), changed_at DESC LIMIT ?`)
       .all(owner, ...(statuses ?? []), limit);
     return rows.map(mapTask).filter(present);
+  }
+
+  tasksChangedSince(owner: string, since: number, limit = 100): WorkItem[] {
+    return this.sql.prepare(`SELECT * FROM tasks WHERE owner=? AND (created_at>=? OR changed_at>=? OR COALESCE(finished_at,0)>=?)
+      ORDER BY changed_at ASC LIMIT ?`).all(owner, since, since, since, limit).map(mapTask).filter(present);
   }
 
   updateTask(id: string, changes: Partial<Pick<WorkItem, "status" | "project" | "projectLabel" | "threadId" | "dueAt" | "error" | "finishedAt">>): WorkItem | undefined {
@@ -258,6 +273,28 @@ export class AssistantDatabase {
       .run(owner, paused ? 1 : 0, Date.now());
   }
 
+  voiceWritingSettings(context: string, owner: string): VoiceWritingSettings {
+    const row = this.sql.prepare("SELECT * FROM voice_writing_settings WHERE context=? AND owner=?").get(context, owner);
+    return mapVoiceWritingSettings(row) ?? { context, owner, mode: "transcript", changedAt: 0 };
+  }
+
+  setVoiceWritingSettings(input: Pick<VoiceWritingSettings, "context" | "owner" | "mode"> &
+    Partial<Pick<VoiceWritingSettings, "storyTitle">>): VoiceWritingSettings {
+    const value: VoiceWritingSettings = {
+      context: input.context,
+      owner: input.owner,
+      mode: input.mode,
+      storyTitle: input.mode === "story" ? input.storyTitle?.trim() : undefined,
+      changedAt: Date.now(),
+    };
+    if (value.mode === "story" && !value.storyTitle) throw new Error("Story title is required");
+    this.sql.prepare(`INSERT INTO voice_writing_settings(context,owner,mode,story_title,changed_at)
+      VALUES(@context,@owner,@mode,@storyTitle,@changedAt)
+      ON CONFLICT(context) DO UPDATE SET owner=excluded.owner,mode=excluded.mode,
+      story_title=excluded.story_title,changed_at=excluded.changed_at`).run(nullable(value));
+    return value;
+  }
+
   memoryStatus(owner: string): MemoryStatus {
     const rows = this.sql.prepare(`SELECT namespace, deleted_at IS NOT NULL AS deleted, COUNT(*) AS count
       FROM memory_events WHERE owner=? GROUP BY namespace, deleted`).all(owner) as Array<{ namespace: "global" | "project"; deleted: number; count: number }>;
@@ -304,6 +341,11 @@ export class AssistantDatabase {
     return this.sql.prepare("DELETE FROM alarms WHERE id=?").run(id).changes > 0;
   }
 
+  upgradeEveningDigests(nextAt: number): number {
+    return this.sql.prepare(`UPDATE alarms SET label='Итог дня',next_at=?
+      WHERE enabled=1 AND mode='digest-evening' AND label='Вечерний дайджест'`).run(nextAt).changes;
+  }
+
   search(owner: string, query: string, limit = 30): SearchHit[] {
     const needle = query.trim().toLocaleLowerCase("ru-RU");
     if (!needle) return [];
@@ -327,6 +369,7 @@ export class AssistantDatabase {
       CREATE TABLE IF NOT EXISTS memory_events(id TEXT PRIMARY KEY, owner TEXT NOT NULL, namespace TEXT NOT NULL, project TEXT, role TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, source TEXT, created_at INTEGER NOT NULL, deleted_at INTEGER);
       CREATE INDEX IF NOT EXISTS memory_event_owner_scope ON memory_events(owner,namespace,project,created_at);
       CREATE TABLE IF NOT EXISTS memory_settings(owner TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0, changed_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS voice_writing_settings(context TEXT PRIMARY KEY, owner TEXT NOT NULL, mode TEXT NOT NULL, story_title TEXT, changed_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS alarms(id TEXT PRIMARY KEY, owner TEXT NOT NULL, label TEXT NOT NULL, next_at INTEGER NOT NULL, cadence TEXT NOT NULL, mode TEXT NOT NULL, prompt TEXT, project TEXT, enabled INTEGER NOT NULL);
     `);
   }
@@ -358,6 +401,13 @@ function mapCapture(row: unknown): CapturedItem | undefined {
   const r = object(row); if (!r) return undefined;
   return { id: str(r.id), owner: str(r.owner), kind: str(r.kind), body: str(r.body), sender: maybe(r.sender),
     sourceTime: num(r.source_time), state: str(r.state) as CapturedItem["state"], createdAt: Number(r.created_at) };
+}
+
+function mapVoiceWritingSettings(row: unknown): VoiceWritingSettings | undefined {
+  const r = object(row); if (!r) return undefined;
+  const mode = str(r.mode);
+  if (mode !== "transcript" && mode !== "diary" && mode !== "story") return undefined;
+  return { context: str(r.context), owner: str(r.owner), mode, storyTitle: maybe(r.story_title), changedAt: Number(r.changed_at) };
 }
 
 function mapMemory(row: unknown): MemoryNote | undefined {

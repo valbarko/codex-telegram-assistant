@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeCalendarTitle, understandAlarm } from "../src/reminder-language.js";
+import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm } from "../src/reminder-language.js";
 
 describe("understandAlarm", () => {
   const now = new Date(2026, 6, 12, 10, 0, 0);
@@ -30,5 +30,24 @@ describe("understandAlarm", () => {
       label: "встреча", at: new Date(2026, 6, 12, 18, 0, 0).getTime(), cadence: "once",
     });
     expect(normalizeCalendarTitle(parsed!.label)).toBe("Встреча");
+  });
+  it("understands a weekday before or after the time", () => {
+    const expected = { label: "Концерт", at: new Date(2026, 6, 16, 19, 0, 0).getTime(), cadence: "once" as const };
+    expect(understandAlarm("создай событие в календаре 19:00 четверг Концерт", now)).toEqual(expected);
+    expect(understandAlarm("создай событие в календаре четверг 19:00 Концерт", now)).toEqual(expected);
+    expect(understandAlarm("создай событие в календаре в четверг в 19:00 Концерт", now)).toEqual(expected);
+  });
+});
+
+describe("parseTemporalCodexResponse", () => {
+  const now = new Date("2026-07-12T19:00:00+03:00");
+  it("accepts a fenced structured response with an explicit timezone", () => {
+    expect(parseTemporalCodexResponse('```json\n{"dateTime":"2026-07-16T19:00:00+03:00","title":"Концерт","cadence":"once"}\n```', now))
+      .toEqual({ label: "Концерт", at: Date.parse("2026-07-16T19:00:00+03:00"), cadence: "once" });
+  });
+  it("rejects malformed, timezone-free and past responses", () => {
+    expect(parseTemporalCodexResponse("не знаю", now)).toBeNull();
+    expect(parseTemporalCodexResponse('{"dateTime":"2026-07-16T19:00:00","title":"Концерт"}', now)).toBeNull();
+    expect(parseTemporalCodexResponse('{"dateTime":"2026-07-10T19:00:00+03:00","title":"Концерт"}', now)).toBeNull();
   });
 });

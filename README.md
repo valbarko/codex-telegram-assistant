@@ -9,9 +9,10 @@ This repository is an independent implementation with its own source structure, 
 - Create, resume, steer, interrupt, and hand off Codex threads from Telegram.
 - Separate contexts for Telegram chats and forum topics.
 - Streaming answers and interactive command, file, and permission approvals.
+- Safe Telegram rendering for Codex Markdown: headings, bold, italics, inline and fenced code, quotes, links, and lists.
 - Project aliases and recently active thread selection.
 - Tasks, inbox, FIFO Codex queue, reminders, scheduled runs, long-term semantic memory, search, and daily digests.
-- Voice transcription with local MLX Whisper. Voice messages never start a Codex thread.
+- Voice transcription with local MLX Whisper plus opt-in Codex editing for a diary and story cycles.
 - Gmail reading through the connected Codex app; Apple Mail only for visible drafts.
 - Local Apple Calendar listing and event creation.
 - Persistent macOS LaunchAgent, independent of the Codex desktop app lifecycle.
@@ -47,10 +48,11 @@ The `.env` file, SQLite state, logs, model caches, and local paths are ignored b
 - `/sessions` — recent Codex threads, sorted by activity
 - `/abort` — interrupt the current turn
 - `/remind` and `/schedule` — notification or Codex run at a later time
-- `/digest on` — daily task summaries at 09:00 and 20:00
+- `/digest on` — morning task plan at 09:00 and a cross-project work summary at 21:00
 - `/calendar`, `/event`, `/draft`, `/mac` — local Mac integrations
 - `/recall`, `/forget`, `/about_me` — recall, delete, and inspect personal memory
 - `/memory_status`, `/memory_pause`, `/memory_export` — control and export long-term memory
+- `/voice` — list spoken command labels; `/story` selects the current story cycle
 
 The persistent Telegram keyboard keeps common actions one tap away. A text sent while Codex is working steers the active turn; after it finishes, the next text starts a new turn in the same thread.
 
@@ -64,7 +66,15 @@ Passwords, API tokens, bearer credentials, JWTs, Telegram bot tokens, and OTP-li
 
 Install the local transcription dependency in a dedicated Python environment and set `WHISPER_PYTHON` to its interpreter. The default model is `mlx-community/whisper-large-v3-turbo`.
 
-The bot returns sender/date metadata when Telegram provides it, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward. It is not sent into Codex and does not create a project conversation.
+An unlabelled voice message is a plain transcription. The bot returns sender/date metadata, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward.
+
+Destinations are one-shot labels for both voice and text, not persistent modes. Start the message with `дневник`, `рассказ`, `календарь`, `задача`, `напоминание`, `идея`, or `запомни`, then continue normally. `дневник` sends the remaining text through Codex and appends it to one Apple Notes note per month, grouped by date and time. Use `/story <cycle name>` once to select a cycle; subsequent messages beginning with `рассказ` use the same editorial flow and the end of the previous draft as continuity context. Calendar, task, reminder, inbox, and memory labels route the remaining content to the corresponding local workflow.
+
+Send `Дневник` or `Заметки` without additional text to receive all entries for the current day. Add text after either label to create a new entry. Telegram renders the structured entry and also sends the same content as a downloadable Markdown file.
+
+Calendar and reminder language uses a safe parsing cascade: deterministic local rules first, then a read-only Codex structured-extraction turn when the local parser cannot understand the date or time. Codex may only return validated JSON; the application still asks for confirmation before writing a calendar event. Ambiguous or invalid results produce a clarification request instead of an action.
+
+Every edited entry is also stored as readable Markdown under `WRITING_ARCHIVE_DIR` (default: `~/Documents/Codex Writer`). Untouched transcripts are kept separately under `Исходные расшифровки`. If Apple Notes automation fails, the Markdown copy still succeeds and Telegram reports the Notes error. The first Notes write may require permission in **System Settings → Privacy & Security → Automation**.
 
 ## System alarms on macOS
 
