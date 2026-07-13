@@ -18,7 +18,7 @@ import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, ty
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
 import { renderTelegramMarkdown, sendTelegramMarkdown, telegramMarkdownChunks } from "./telegram-markdown.js";
-import { parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
+import { isStyleWritingKind, parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
   type EditedVoiceEntry, type SpokenVoiceCommand } from "./voice-writing.js";
 
 const TELEGRAM_LIMIT = 4000;
@@ -98,7 +98,7 @@ export class TelegramApplication {
       { command: "memory_status", description: "Состояние долговременной памяти" },
       { command: "memory_pause", description: "Приостановить или включить память" },
       { command: "memory_export", description: "Экспорт долговременной памяти" },
-      { command: "voice", description: "Метки-команды для голосовых" },
+      { command: "voice", description: "Метки для текста и голосовых" },
       { command: "story", description: "Выбрать цикл рассказов" },
       { command: "search", description: "Поиск по рабочей памяти" },
       { command: "launch_profiles", description: "Профиль разрешений" },
@@ -161,7 +161,7 @@ export class TelegramApplication {
         "<b>Память</b>", "/memory_status · /memory_pause · /memory_export · /forget", "",
         "<b>Mac</b>", "/calendar · /event · /draft · /mac", "",
         "<b>Автоматизация</b>", "/schedule · /digest", "",
-        "Начните голосовое с метки «дневник», «календарь», «задача» и т. п. Без метки бот просто пришлёт расшифровку.",
+        "Начните текст или голосовое с метки «пост», «анонс», «ответ», «дневник», «календарь» и т. п. Без метки голосовое просто расшифруется.",
       ].join("\n"), { parse_mode: "HTML", reply_markup: persistentKeyboard() });
     });
 
@@ -449,6 +449,33 @@ export class TelegramApplication {
         if (localIntent(calendarRequest) === "calendar-list") await this.showCalendar(ctx);
         else await this.offerCalendarEvent(ctx, `создай событие в календаре ${command.content}`);
       }
+      return true;
+    }
+    if (isStyleWritingKind(command.kind)) {
+      const label = styleWritingLabel(command.kind);
+      let progressId = existingProgressId;
+      if (progressId === undefined) progressId = (await ctx.reply(`✍️ Codex пишет · ${label}…`)).message_id;
+      else await ctx.api.editMessageText(ctx.chat!.id, progressId, `✍️ Codex пишет · ${label}…`).catch(() => undefined);
+      let edited: EditedVoiceEntry;
+      try {
+        edited = await this.voiceEditor.compose(contextId(ctx), command.kind, command.content);
+      } catch (error) {
+        await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
+        await ctx.reply(`<b>⚠️ Не удалось подготовить ${escape(label.toLocaleLowerCase("ru-RU"))}.</b>\n${escape(errorMessage(error))}`, {
+          parse_mode: "HTML",
+        });
+        if (existingProgressId !== undefined) {
+          for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
+            await ctx.reply(part, { parse_mode: "HTML" });
+          }
+        }
+        return true;
+      }
+      await this.memory.record({ owner: ownerId(ctx), body: edited.markdown, role: "assistant", kind: "response",
+        project: this.memoryProject(ctx), source: `tagged-${command.kind}-draft` });
+      await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
+      await ctx.reply(`<b>✅ ${escape(label)} готов</b>`, { parse_mode: "HTML" });
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, edited.markdown, TELEGRAM_LIMIT - 100);
       return true;
     }
     if (command.kind !== "diary" && command.kind !== "story") return false;
@@ -1243,8 +1270,14 @@ function voiceModeLabel(settings: VoiceWritingSettings): string {
   if (settings.mode === "story") return `Рассказы · ${settings.storyTitle ?? "без названия"}`;
   return "Обычная расшифровка";
 }
+function styleWritingLabel(kind: "post" | "announcement" | "reply"): string {
+  return ({ post: "Пост", announcement: "Анонс", reply: "Ответ" })[kind];
+}
 function spokenVoiceHelp(): string {
-  return ["<b>🎙 Голосовые метки-команды</b>", "Произнесите метку первым словом и сразу продолжайте:", "",
+  return ["<b>🎙 Метки-команды для текста и голоса</b>", "Напишите или произнесите метку первым словом и сразу продолжайте:", "",
+    "<b>Пост</b> — оформить публикацию в вашем стиле",
+    "<b>Анонс</b> — сделать короткий анонс в вашем стиле",
+    "<b>Ответ</b> — подготовить короткий ответ в вашем стиле",
     "<b>Дневник / Заметки</b> — с текстом добавить запись; без текста показать сегодняшний день",
     "<b>Рассказ</b> — продолжить выбранный через /story цикл",
     "<b>Календарь</b> — подготовить событие для подтверждения",
@@ -1253,7 +1286,7 @@ function spokenVoiceHelp(): string {
     "<b>Идея</b> — положить в инбокс",
     "<b>Запомни</b> — сохранить в долговременную память",
     "",
-    "Без метки бот просто пришлёт расшифровку."].join("\n");
+    "Без метки голосовое просто расшифруется, а обычный текст уйдёт в Codex как прежде."].join("\n");
 }
 function taskIcon(status: WorkItem["status"]): string { return ({ todo: "⚪", queued: "⏳", running: "▶️", waiting: "❓", done: "✅", cancelled: "🚫" })[status]; }
 function approvalCard(prompt: ApprovalPrompt): string { return [`<b>⚠️ Требуется подтверждение: ${escape(prompt.category)}</b>`, prompt.command ? `<code>${escape(prompt.command)}</code>` : "", prompt.directory ? `Папка: <code>${escape(prompt.directory)}</code>` : "", prompt.root ? `Доступ: <code>${escape(prompt.root)}</code>` : "", prompt.reason ? `Причина: ${escape(prompt.reason)}` : ""].filter(Boolean).join("\n\n"); }
