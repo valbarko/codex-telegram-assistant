@@ -10,12 +10,14 @@ import type { AppConfiguration } from "./configuration.js";
 import { structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
+import { ForwardedVoiceBatcher, ForwardedVoiceEditor, forwardedVoiceHeading,
+  type ForwardedVoiceBatch, type ForwardedVoiceFragment } from "./forwarded-voice.js";
 import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, appendAppleNote, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
 import { MemoryService, type RecallHit } from "./memory-service.js";
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
-import { renderTelegramMarkdown, sendTelegramMarkdown } from "./telegram-markdown.js";
+import { renderTelegramMarkdown, sendTelegramMarkdown, telegramMarkdownChunks } from "./telegram-markdown.js";
 import { parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
   type EditedVoiceEntry, type SpokenVoiceCommand } from "./voice-writing.js";
 
@@ -30,6 +32,8 @@ interface ApprovalWaiter {
 }
 
 interface PendingCalendarEvent { title: string; start: number; }
+
+interface ForwardedSourceInfo { sender?: string; time?: number; key?: string; }
 
 interface UserQuestionWaiter {
   context: string;
@@ -51,6 +55,9 @@ export class TelegramApplication {
   private readonly userQuestionByContext = new Map<string, string>();
   private readonly voiceEditor: VoiceWritingEditor;
   private readonly voiceArchive: VoiceWritingArchive;
+  private readonly forwardedVoiceEditor: ForwardedVoiceEditor;
+  private readonly forwardedVoiceBatcher: ForwardedVoiceBatcher;
+  private readonly forwardedVoiceFlushes = new Map<string, Promise<void>>();
 
   constructor(
     private readonly configuration: AppConfiguration,
@@ -60,6 +67,8 @@ export class TelegramApplication {
   ) {
     this.voiceEditor = new VoiceWritingEditor(configuration, hub);
     this.voiceArchive = new VoiceWritingArchive(configuration.writingArchiveDirectory);
+    this.forwardedVoiceEditor = new ForwardedVoiceEditor(configuration, hub);
+    this.forwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueForwardedVoiceBatch(batch));
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
     this.install();
@@ -111,6 +120,7 @@ export class TelegramApplication {
   }
 
   stop(): void {
+    this.forwardedVoiceBatcher.stop();
     this.bot.stop();
   }
 
@@ -307,6 +317,24 @@ export class TelegramApplication {
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : Date.now());
       await this.memory.record({ owner: ownerId(ctx), body: raw, role: "user", kind: "voice", project: this.memoryProject(ctx), source: sender ? `telegram-voice:${sender}` : "telegram-voice" });
+      if (forwarded.key) {
+        const batchKey = `${contextId(ctx)}:${forwarded.key}`;
+        const fragment: ForwardedVoiceFragment = {
+          id: String(ctx.message?.message_id ?? randomUUID()),
+          sender: sender || "Неизвестный отправитель",
+          senderKey: forwarded.key,
+          sentAt,
+          durationSeconds: media.duration ?? 0,
+          transcript: raw,
+          progressMessageId: progress.message_id,
+          chatId: ctx.chat!.id,
+          messageThreadId: ctx.message?.message_thread_id,
+        };
+        const count = this.forwardedVoiceBatcher.add(batchKey, fragment);
+        await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
+          `🎙 Фрагмент ${count} принят · собираю пересылки ещё 45 секунд…`).catch(() => undefined);
+        return;
+      }
       const command = parseSpokenVoiceCommand(raw);
       if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id)) return;
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
@@ -318,6 +346,65 @@ export class TelegramApplication {
       await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, `Не удалось расшифровать: ${message}`).catch(() => undefined);
     } finally {
       await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  private enqueueForwardedVoiceBatch(batch: ForwardedVoiceBatch): void {
+    const previous = this.forwardedVoiceFlushes.get(batch.key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => this.flushForwardedVoiceBatch(batch))
+      .catch((error) => console.error("Forwarded voice batch failed", error));
+    this.forwardedVoiceFlushes.set(batch.key, next);
+    void next.finally(() => {
+      if (this.forwardedVoiceFlushes.get(batch.key) === next) this.forwardedVoiceFlushes.delete(batch.key);
+    });
+  }
+
+  private async flushForwardedVoiceBatch(batch: ForwardedVoiceBatch): Promise<void> {
+    const fragments = batch.fragments;
+    const target = fragments.at(-1);
+    if (!target) return;
+    const progressIds = [...new Set(fragments.map((fragment) => fragment.progressMessageId))];
+    for (const messageId of progressIds.slice(0, -1)) {
+      await this.bot.api.deleteMessage(target.chatId, messageId).catch(() => undefined);
+    }
+    const activeProgressId = progressIds.at(-1);
+    if (activeProgressId !== undefined) {
+      await this.bot.api.editMessageText(target.chatId, activeProgressId,
+        fragments.length > 1 ? `🧠 Объединяю ${fragments.length} голосовых по смыслу…` : "📝 Оформляю расшифровку…").catch(() => undefined);
+    }
+    try {
+      if (fragments.length === 1) {
+        if (activeProgressId !== undefined) await this.bot.api.deleteMessage(target.chatId, activeProgressId).catch(() => undefined);
+        for (const part of htmlChunks(structureTranscript(target.transcript, { sender: target.sender, sentAt: target.sentAt }), TELEGRAM_LIMIT)) {
+          await this.bot.api.sendMessage(target.chatId, part, telegramHtmlOptions(target.messageThreadId));
+        }
+        return;
+      }
+      let body: string;
+      try {
+        body = await this.forwardedVoiceEditor.edit(batch.key, fragments);
+      } catch (error) {
+        console.error("Forwarded voice editing failed", error);
+        body = fragments.map((fragment) => fragment.transcript).join("\n\n");
+      }
+      const markdown = `${forwardedVoiceHeading(fragments)}\n\n${body}`;
+      await this.memory.record({ owner: String(target.chatId), body: markdown, role: "assistant", kind: "response",
+        source: "forwarded-voice-batch" });
+      if (activeProgressId !== undefined) await this.bot.api.deleteMessage(target.chatId, activeProgressId).catch(() => undefined);
+      for (const chunk of telegramMarkdownChunks(markdown, TELEGRAM_LIMIT - 100)) {
+        try {
+          await this.bot.api.sendMessage(target.chatId, chunk.html, telegramHtmlOptions(target.messageThreadId));
+        } catch {
+          await this.bot.api.sendMessage(target.chatId, chunk.plain, telegramPlainOptions(target.messageThreadId));
+        }
+      }
+    } catch (error) {
+      const message = `Не удалось собрать пересланные голосовые: ${errorMessage(error)}`;
+      if (activeProgressId !== undefined) {
+        await this.bot.api.editMessageText(target.chatId, activeProgressId, message).catch(() => undefined);
+      } else {
+        await this.bot.api.sendMessage(target.chatId, message, telegramPlainOptions(target.messageThreadId)).catch(() => undefined);
+      }
     }
   }
 
@@ -1193,7 +1280,36 @@ function recallResults(query: string, hits: RecallHit[]): string {
   if (!hits.length) return `<b>🧠 ${escape(query)}</b>\nНичего релевантного не найдено.`;
   return [`<b>🧠 ${escape(query)}</b>`, ...hits.map((hit) => `\n• ${escape(oneLine(hit.body, 450))}\n<code>${hit.id}</code> · ${hit.namespace === "global" ? "глобальная" : "проектная"}`)].join("\n");
 }
-function forwardedSource(ctx: Context): { sender?: string; time?: number } { const origin = ctx.message?.forward_origin; if (!origin) return {}; if (origin.type === "user") return { sender: [origin.sender_user.first_name, origin.sender_user.last_name].filter(Boolean).join(" "), time: origin.date * 1000 }; if (origin.type === "hidden_user") return { sender: origin.sender_user_name, time: origin.date * 1000 }; if (origin.type === "channel") return { sender: origin.chat.title, time: origin.date * 1000 }; return { time: origin.date * 1000 }; }
+function forwardedSource(ctx: Context): ForwardedSourceInfo {
+  const origin = ctx.message?.forward_origin;
+  if (!origin) return {};
+  if (origin.type === "user") return {
+    sender: [origin.sender_user.first_name, origin.sender_user.last_name].filter(Boolean).join(" "),
+    time: origin.date * 1000,
+    key: `user:${origin.sender_user.id}`,
+  };
+  if (origin.type === "hidden_user") return {
+    sender: origin.sender_user_name,
+    time: origin.date * 1000,
+    key: `hidden:${origin.sender_user_name.toLocaleLowerCase("ru-RU")}`,
+  };
+  if (origin.type === "channel") return {
+    sender: origin.chat.title,
+    time: origin.date * 1000,
+    key: `channel:${origin.chat.id}`,
+  };
+  return {
+    sender: origin.sender_chat.title,
+    time: origin.date * 1000,
+    key: `chat:${origin.sender_chat.id}`,
+  };
+}
+function telegramHtmlOptions(messageThreadId?: number): { parse_mode: "HTML"; message_thread_id?: number } {
+  return { parse_mode: "HTML", ...(messageThreadId ? { message_thread_id: messageThreadId } : {}) };
+}
+function telegramPlainOptions(messageThreadId?: number): { message_thread_id?: number } {
+  return messageThreadId ? { message_thread_id: messageThreadId } : {};
+}
 function commandArgument(ctx: Context): string { return ctx.message?.text?.replace(/^\/\w+(?:@\w+)?\s*/i, "").trim() || ""; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function nextLocalTime(hours: number, minutes: number): number { const date = new Date(); date.setHours(hours, minutes, 0, 0); if (date.getTime() <= Date.now()) date.setDate(date.getDate() + 1); return date.getTime(); }
