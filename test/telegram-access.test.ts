@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { isTranscriptionMedia, telegramAccessMode } from "../src/telegram-access.js";
+import { isTranscriptionMedia, isTranscriptionText, telegramAccessMode } from "../src/telegram-access.js";
 
 const configuration = {
   allowedUsers: new Set([1]),
@@ -22,5 +22,12 @@ describe("telegram access", () => {
     expect(isTranscriptionMedia({ message: {} })).toBe(false);
     expect(isTranscriptionMedia({ message: { voice: undefined, audio: undefined } })).toBe(false);
     expect(isTranscriptionMedia({})).toBe(false);
+  });
+
+  it("accepts non-empty text as a formatting input", () => {
+    expect(isTranscriptionText({ message: { text: "Оформить меня" } })).toBe(true);
+    expect(isTranscriptionText({ message: { text: "   " } })).toBe(false);
+    expect(isTranscriptionText({ message: { voice: {} } })).toBe(false);
+    expect(isTranscriptionText({})).toBe(false);
   });
 });

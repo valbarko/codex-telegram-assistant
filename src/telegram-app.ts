@@ -10,6 +10,7 @@ import type { AppConfiguration } from "./configuration.js";
 import { formatPlainTranscript, structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
+import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
 import { ForwardedVoiceBatcher, ForwardedVoiceEditor, forwardedVoiceHeading,
   type ForwardedVoiceBatch, type ForwardedVoiceFragment } from "./forwarded-voice.js";
 import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, appendAppleNote, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
@@ -17,7 +18,7 @@ import { MemoryService, type RecallHit } from "./memory-service.js";
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
-import { isTranscriptionMedia, telegramAccessMode } from "./telegram-access.js";
+import { isTranscriptionMedia, isTranscriptionText, telegramAccessMode } from "./telegram-access.js";
 import { transcriptionCopyPresentation } from "./telegram-copy.js";
 import { renderTelegramMarkdown, sendTelegramMarkdown, telegramMarkdownChunks } from "./telegram-markdown.js";
 import { isStyleWritingKind, parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
@@ -59,6 +60,8 @@ export class TelegramApplication {
   private readonly voiceArchive: VoiceWritingArchive;
   private readonly forwardedVoiceEditor: ForwardedVoiceEditor;
   private readonly forwardedVoiceBatcher: ForwardedVoiceBatcher;
+  private readonly restrictedForwardedVoiceBatcher: ForwardedVoiceBatcher;
+  private readonly restrictedTextEditor: EphemeralTextEditor;
   private readonly forwardedVoiceFlushes = new Map<string, Promise<void>>();
 
   constructor(
@@ -71,6 +74,8 @@ export class TelegramApplication {
     this.voiceArchive = new VoiceWritingArchive(configuration.writingArchiveDirectory);
     this.forwardedVoiceEditor = new ForwardedVoiceEditor(configuration, hub);
     this.forwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueForwardedVoiceBatch(batch));
+    this.restrictedForwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueRestrictedForwardedVoiceBatch(batch));
+    this.restrictedTextEditor = new EphemeralTextEditor(configuration);
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
     this.install();
@@ -123,6 +128,7 @@ export class TelegramApplication {
 
   stop(): void {
     this.forwardedVoiceBatcher.stop();
+    this.restrictedForwardedVoiceBatcher.stop();
     this.bot.stop();
   }
 
@@ -131,11 +137,13 @@ export class TelegramApplication {
       const access = telegramAccessMode(this.configuration, ctx.from?.id);
       if (access === "full" || (access === "transcription-only" && isTranscriptionMedia(ctx))) {
         await next();
+      } else if (access === "transcription-only" && isTranscriptionText(ctx)) {
+        await this.restrictedTextMessage(ctx);
       } else if (ctx.callbackQuery) {
         await ctx.answerCallbackQuery({ text: "Нет доступа" }).catch(() => undefined);
       } else if (ctx.chat) {
         const message = access === "transcription-only"
-          ? "Доступна только расшифровка голосовых сообщений и аудиофайлов."
+          ? "Доступны голосовые сообщения, аудиофайлы и оформление текста."
           : "Нет доступа";
         await ctx.reply(message).catch(() => undefined);
       }
@@ -324,14 +332,26 @@ export class TelegramApplication {
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : Date.now());
       if (telegramAccessMode(this.configuration, ctx.from?.id) === "transcription-only") {
-        await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-        for (const part of textChunks(formatPlainTranscript(raw), TELEGRAM_LIMIT)) {
-          const presentation = transcriptionCopyPresentation(part);
-          await ctx.reply(presentation.body, {
-            ...(presentation.parseMode ? { parse_mode: presentation.parseMode } : {}),
-            ...(presentation.keyboard ? { reply_markup: presentation.keyboard } : {}),
-          });
+        if (forwarded.key) {
+          const batchKey = `restricted:${contextId(ctx)}:${forwarded.key}`;
+          const fragment: ForwardedVoiceFragment = {
+            id: String(ctx.message?.message_id ?? randomUUID()),
+            sender: sender || "Неизвестный отправитель",
+            senderKey: forwarded.key,
+            sentAt,
+            durationSeconds: media.duration ?? 0,
+            transcript: raw,
+            progressMessageId: progress.message_id,
+            chatId: ctx.chat!.id,
+            messageThreadId: ctx.message?.message_thread_id,
+          };
+          const count = this.restrictedForwardedVoiceBatcher.add(batchKey, fragment);
+          await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
+            `🎙 Фрагмент ${count} принят · собираю пересылки ещё 45 секунд…`).catch(() => undefined);
+          return;
         }
+        await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
+        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, formatPlainTranscript(raw));
         return;
       }
       await this.memory.record({ owner: ownerId(ctx), body: raw, role: "user", kind: "voice", project: this.memoryProject(ctx), source: sender ? `telegram-voice:${sender}` : "telegram-voice" });
@@ -377,6 +397,16 @@ export class TelegramApplication {
     });
   }
 
+  private enqueueRestrictedForwardedVoiceBatch(batch: ForwardedVoiceBatch): void {
+    const previous = this.forwardedVoiceFlushes.get(batch.key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => this.flushRestrictedForwardedVoiceBatch(batch))
+      .catch((error) => console.error("Restricted forwarded voice batch failed", error));
+    this.forwardedVoiceFlushes.set(batch.key, next);
+    void next.finally(() => {
+      if (this.forwardedVoiceFlushes.get(batch.key) === next) this.forwardedVoiceFlushes.delete(batch.key);
+    });
+  }
+
   private async flushForwardedVoiceBatch(batch: ForwardedVoiceBatch): Promise<void> {
     const fragments = batch.fragments;
     const target = fragments.at(-1);
@@ -416,6 +446,41 @@ export class TelegramApplication {
           await this.bot.api.sendMessage(target.chatId, chunk.plain, telegramPlainOptions(target.messageThreadId));
         }
       }
+    } catch (error) {
+      const message = `Не удалось собрать пересланные голосовые: ${errorMessage(error)}`;
+      if (activeProgressId !== undefined) {
+        await this.bot.api.editMessageText(target.chatId, activeProgressId, message).catch(() => undefined);
+      } else {
+        await this.bot.api.sendMessage(target.chatId, message, telegramPlainOptions(target.messageThreadId)).catch(() => undefined);
+      }
+    }
+  }
+
+  private async flushRestrictedForwardedVoiceBatch(batch: ForwardedVoiceBatch): Promise<void> {
+    const fragments = batch.fragments;
+    const target = fragments.at(-1);
+    if (!target) return;
+    const progressIds = [...new Set(fragments.map((fragment) => fragment.progressMessageId))];
+    for (const messageId of progressIds.slice(0, -1)) {
+      await this.bot.api.deleteMessage(target.chatId, messageId).catch(() => undefined);
+    }
+    const activeProgressId = progressIds.at(-1);
+    if (activeProgressId !== undefined) {
+      await this.bot.api.editMessageText(target.chatId, activeProgressId,
+        fragments.length > 1 ? `🧠 Объединяю ${fragments.length} голосовых и делаю саммари…` : "🧠 Делаю саммари и оформляю текст…")
+        .catch(() => undefined);
+    }
+    try {
+      let body: string;
+      try {
+        body = await this.restrictedTextEditor.formatForwardedVoices(fragments);
+      } catch (error) {
+        console.error("Restricted forwarded voice editing failed", error);
+        body = `Расшифровка\n\n${formatPlainTranscript(fragments.map((fragment) => fragment.transcript).join("\n\n"))}`;
+      }
+      const heading = forwardedVoiceHeading(fragments).replace(/^##\s+/, "");
+      if (activeProgressId !== undefined) await this.bot.api.deleteMessage(target.chatId, activeProgressId).catch(() => undefined);
+      await this.sendRestrictedResult(target.chatId, target.messageThreadId, `${heading}\n\n${body}`);
     } catch (error) {
       const message = `Не удалось собрать пересланные голосовые: ${errorMessage(error)}`;
       if (activeProgressId !== undefined) {
@@ -572,6 +637,36 @@ export class TelegramApplication {
     await ctx.replyWithDocument(new InputFile(Buffer.from(day.markdown, "utf8"), day.fileName), {
       caption: "Markdown дневника за сегодня",
     });
+  }
+
+  private async restrictedTextMessage(ctx: Context): Promise<void> {
+    const source = ctx.message?.text?.trim();
+    if (!source || !ctx.chat) return;
+    const progress = await ctx.reply("✍️ Оформляю текст…");
+    try {
+      let result: string;
+      try {
+        result = await this.restrictedTextEditor.formatText(source);
+      } catch (error) {
+        console.error("Restricted text editing failed", error);
+        result = formatPlainTranscript(source);
+      }
+      await ctx.api.deleteMessage(ctx.chat.id, progress.message_id).catch(() => undefined);
+      await this.sendRestrictedResult(ctx.chat.id, ctx.message?.message_thread_id, result);
+    } catch (error) {
+      await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `Не удалось оформить текст: ${errorMessage(error)}`).catch(() => undefined);
+    }
+  }
+
+  private async sendRestrictedResult(chatId: string | number, messageThreadId: number | undefined, text: string): Promise<void> {
+    for (const part of textChunks(text, TELEGRAM_LIMIT)) {
+      const presentation = transcriptionCopyPresentation(part);
+      await this.bot.api.sendMessage(chatId, presentation.body, {
+        ...telegramPlainOptions(messageThreadId),
+        ...(presentation.parseMode ? { parse_mode: presentation.parseMode } : {}),
+        ...(presentation.keyboard ? { reply_markup: presentation.keyboard } : {}),
+      });
+    }
   }
 
   private async textMessage(ctx: Context): Promise<void> {

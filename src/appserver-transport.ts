@@ -149,7 +149,7 @@ export class AppServerTransport {
   }
 }
 
-function codexExecutable(): string {
+export function codexExecutable(): string {
   const configured = process.env.CODEX_CLI_PATH?.trim();
   if (configured) return configured;
   const home = process.env.HOME || "";
