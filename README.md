@@ -11,6 +11,7 @@ This repository is an independent implementation with its own source structure, 
 - **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
 - **Style-aware drafts:** turn a text or voice note beginning with `Пост`, `Анонс`, or `Ответ` into a ready Telegram draft using a private, locally indexed corpus of the owner's accepted writing.
 - **Forwarded voice packages:** collect rapidly forwarded voice messages from the same original sender, preserve their order, and use Codex to merge one topic or split genuine topic changes.
+- **Content-only accounts:** grant selected Telegram users three isolated tools—clean direct-voice transcription, summarized forwarded-voice packages, and text proofreading—without exposing commands, memory, or assistant workflows.
 - **Apple Notes publishing:** append diary entries to one monthly note grouped by date, keep story continuity, and retain readable Markdown plus untouched transcript backups.
 - **Spoken and text commands:** route one-shot labels such as `Пост`, `Анонс`, `Ответ`, `Дневник`, `Рассказ`, `Календарь`, `Задача`, and `Напоминание` to the correct workflow.
 - **Safe calendar automation:** parse common dates locally, fall back to validated Codex extraction for ambiguous phrasing, and require confirmation before creating Apple Calendar events.
@@ -36,7 +37,7 @@ This repository is an independent implementation with its own source structure, 
 npm install
 cp .env.example .env
 # Fill TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_IDS.
-# Optionally fill TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS for voice-only accounts.
+# Optionally fill TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS for content-only accounts.
 npm test
 npm run build
 npm start
@@ -44,10 +45,13 @@ npm start
 
 The `.env` file, SQLite state, logs, model caches, and local paths are ignored by Git.
 
-IDs in `TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS` can send only voice messages and audio files. The bot returns only clean prose
-with normalized punctuation, capitalization, and paragraphs—without metadata, summaries, headings, or topic splitting—deletes its temporary audio file, and does not route the content to commands, Codex threads,
-the assistant database, long-term memory, diary, or story archives.
-Short transcripts include a native `Copy` button; longer transcripts use Telegram's copyable text block.
+IDs in `TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS` have three content-only modes:
+
+- a directly recorded voice or audio file returns clean prose with normalized punctuation, capitalization, and paragraphs, without metadata, summaries, headings, or topic splitting;
+- forwarded voice messages are collected for 45 seconds per Telegram chat and original sender, ordered by source time, and returned with a short summary, topic-aware sections, and a complete edited transcript;
+- a text message is proofread for spelling, punctuation, capitalization, and natural paragraph breaks without changing its meaning.
+
+These inputs never route to commands or the owner's assistant workflows. Audio is deleted after local Whisper transcription, and neither source text nor edited output is written to persistent Codex threads, the assistant database, long-term memory, diary, or story archives. Text proofreading and forwarded-voice editing use a one-shot `codex exec --ephemeral` process in an empty temporary directory with a read-only sandbox; the directory is removed after every result. Short results include a native `Copy` button; longer results use Telegram's copyable text block.
 
 ## Telegram flow
 
