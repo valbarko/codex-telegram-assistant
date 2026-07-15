@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { structureTranscript } from "../src/audio.js";
+import { formatPlainTranscript, structureTranscript } from "../src/audio.js";
 
 describe("structureTranscript", () => {
   it("adds origin, a compact summary and semantic emphasis", () => {
@@ -19,5 +19,23 @@ describe("structureTranscript", () => {
 
   it("escapes Telegram HTML", () => {
     expect(structureTranscript("Нужно выбрать A < B & C.")).toContain("A &lt; B &amp; C");
+  });
+});
+
+describe("formatPlainTranscript", () => {
+  it("returns only polished prose split into balanced paragraphs", () => {
+    const result = formatPlainTranscript(
+      "арина,привет. я проверила первый вариант . там всё хорошо! завтра отправлю финальную версию",
+    );
+
+    expect(result).toBe([
+      "Арина, привет. Я проверила первый вариант.",
+      "Там всё хорошо! Завтра отправлю финальную версию.",
+    ].join("\n\n"));
+    expect(result).not.toMatch(/Структурированная расшифровка|Общая длительность|^\d+\s+голосов|<b>|\*\*/imu);
+  });
+
+  it("preserves existing paragraph boundaries", () => {
+    expect(formatPlainTranscript("первый абзац\n\nвторой абзац")).toBe("Первый абзац.\n\nВторой абзац.");
   });
 });

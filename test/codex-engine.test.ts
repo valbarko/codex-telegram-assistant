@@ -31,7 +31,8 @@ class FakeTransport {
 }
 
 const config: AppConfiguration = {
-  telegramToken: "x", allowedUsers: new Set([1]), homeDirectory: "/home", dataDirectory: "/data", defaultWorkspace: "/work",
+  telegramToken: "x", allowedUsers: new Set([1]), transcriptionOnlyUsers: new Set(),
+  homeDirectory: "/home", dataDirectory: "/data", defaultWorkspace: "/work",
   projectAliases: {}, weatherLocation: "Москва", weatherLatitude: 55.7558, weatherLongitude: 37.6173,
   defaultModel: "gpt", defaultProfile: "review", maxUploadBytes: 1, showUsage: false,
   profiles: [{ id: "review", title: "Review", sandbox: "workspace-write", approvals: "on-request" }],

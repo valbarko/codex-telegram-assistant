@@ -14,6 +14,7 @@ export interface ExecutionProfile {
 export interface AppConfiguration {
   telegramToken: string;
   allowedUsers: ReadonlySet<number>;
+  transcriptionOnlyUsers: ReadonlySet<number>;
   homeDirectory: string;
   dataDirectory: string;
   writingArchiveDirectory: string;
@@ -33,7 +34,14 @@ export interface AppConfiguration {
 export function readConfiguration(cwd = process.cwd(), environment: NodeJS.ProcessEnv = process.env): AppConfiguration {
   const env = { ...readDotEnv(path.join(cwd, ".env")), ...environment };
   const telegramToken = required(env, "TELEGRAM_BOT_TOKEN");
-  const allowedUsers = new Set(parsePositiveIntegers(required(env, "TELEGRAM_ALLOWED_USER_IDS")));
+  const allowedUsers = new Set(parsePositiveIntegers(required(env, "TELEGRAM_ALLOWED_USER_IDS"), "TELEGRAM_ALLOWED_USER_IDS"));
+  const transcriptionOnlyUsers = new Set(parseOptionalPositiveIntegers(
+    env.TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS, "TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS",
+  ));
+  const overlappingUser = [...transcriptionOnlyUsers].find((userId) => allowedUsers.has(userId));
+  if (overlappingUser !== undefined) {
+    throw new Error(`Telegram user ${overlappingUser} cannot have both full and transcription-only access`);
+  }
   const homeDirectory = env.HOME?.trim() || cwd;
   const defaultWorkspace = path.resolve(env.ASSISTANT_WORKSPACE?.trim() || cwd);
   const dataDirectory = path.resolve(env.ASSISTANT_DATA_DIR?.trim() || path.join(homeDirectory, ".local", "share", "codex-telegram-assistant"));
@@ -45,6 +53,7 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
   return {
     telegramToken,
     allowedUsers,
+    transcriptionOnlyUsers,
     homeDirectory,
     dataDirectory,
     writingArchiveDirectory: path.resolve(env.WRITING_ARCHIVE_DIR?.trim() || path.join(homeDirectory, "Documents", "Codex Writer")),
@@ -92,10 +101,15 @@ function optional(value: string | undefined): string | undefined {
   return trimmed || undefined;
 }
 
-function parsePositiveIntegers(value: string): number[] {
+function parsePositiveIntegers(value: string, key: string): number[] {
   const result = value.split(",").map((item) => Number(item.trim())).filter((item) => Number.isInteger(item) && item > 0);
-  if (!result.length) throw new Error("TELEGRAM_ALLOWED_USER_IDS must contain a positive integer");
+  if (!result.length) throw new Error(`${key} must contain a positive integer`);
   return result;
+}
+
+function parseOptionalPositiveIntegers(value: string | undefined, key: string): number[] {
+  const normalized = optional(value);
+  return normalized ? parsePositiveIntegers(normalized, key) : [];
 }
 
 function parseAliases(value: string | undefined): Readonly<Record<string, string>> {

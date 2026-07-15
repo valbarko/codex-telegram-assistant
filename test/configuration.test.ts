@@ -14,6 +14,7 @@ describe("readConfiguration", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
     const config = readConfiguration(cwd, { TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12,34", HOME: "/home/person" });
     expect(config.allowedUsers).toEqual(new Set([12, 34]));
+    expect(config.transcriptionOnlyUsers).toEqual(new Set());
     expect(config.dataDirectory).toBe("/home/person/.local/share/codex-telegram-assistant");
     expect(config.memsearchExecutable).toBe("/home/person/.local/bin/memsearch");
     expect(config.profiles.map((profile) => profile.id)).toEqual(["default", "review", "readonly"]);
@@ -27,6 +28,23 @@ describe("readConfiguration", () => {
       WEATHER_LATITUDE: "43.5855", WEATHER_LONGITUDE: "39.7231",
     });
     expect(config).toMatchObject({ weatherLocation: "Сочи", weatherLatitude: 43.5855, weatherLongitude: 39.7231 });
+  });
+
+  it("loads isolated transcription-only users", () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
+    const config = readConfiguration(cwd, {
+      TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12",
+      TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS: "42, 43",
+    });
+    expect(config.allowedUsers).toEqual(new Set([12]));
+    expect(config.transcriptionOnlyUsers).toEqual(new Set([42, 43]));
+  });
+
+  it("rejects overlapping full and transcription-only access", () => {
+    expect(() => readConfiguration("/tmp", {
+      TELEGRAM_BOT_TOKEN: "x", TELEGRAM_ALLOWED_USER_IDS: "12",
+      TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS: "12",
+    })).toThrow("cannot have both full and transcription-only access");
   });
 
   it("rejects missing secrets and unknown profiles", () => {
