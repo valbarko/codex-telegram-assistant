@@ -177,7 +177,7 @@ export class Conversation {
     this.effort = effort;
   }
 
-  async start(workspace = this.workspace): Promise<ConversationSnapshot> {
+  async start(workspace = this.workspace, name?: string): Promise<ConversationSnapshot> {
     this.ensureIdle();
     const profile = this.profile();
     const result = await this.transport.call<ThreadOpenResult>("thread/start", {
@@ -187,12 +187,19 @@ export class Conversation {
       approvalPolicy: profile.approvals,
       approvalsReviewer: "user",
       ephemeral: false,
-      threadSource: "codexTelegramAssistant",
     });
     this.threadId = result.thread.id;
     this.workspace = result.cwd || workspace;
     this.model = result.model || this.model;
     this.effort = result.reasoningEffort || this.effort;
+    const threadName = name?.trim();
+    if (threadName) {
+      try {
+        await this.transport.call("thread/name/set", { threadId: this.threadId, name: threadName });
+      } catch (error) {
+        console.error(`Failed to name Codex thread ${this.threadId}`, error);
+      }
+    }
     return this.snapshot();
   }
 

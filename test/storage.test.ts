@@ -52,14 +52,35 @@ describe("AssistantDatabase", () => {
     expect(database.memoryStatus("1")).toMatchObject({ active: 1, deleted: 1, paused: true });
   });
 
-  it("finds today's task activity and upgrades legacy evening digests", () => {
+  it("finds voice transcripts and generated daily summaries that must not remain in memory", () => {
+    database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "voice", body: "Чужая речь", source: "telegram-voice:Анна" });
+    database.recordMemoryEvent({ owner: "1", namespace: "global", role: "assistant", kind: "response", body: "Ошибочная сводка", source: "daily-summary" });
+    database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "message", body: "Рабочая задача", source: "telegram-text" });
+
+    expect(database.reportExcludedMemoryEvents().map((event) => event.source)).toEqual(["telegram-voice:Анна", "daily-summary"]);
+  });
+
+  it("finds task activity in a bounded day and aligns daily digests to fixed times", () => {
     const since = Date.now() - 1_000;
     const task = database.createTask({ owner: "1", title: "Подготовить отчёт" });
     database.updateTask(task.id, { status: "done", finishedAt: Date.now() });
     expect(database.tasksChangedSince("1", since).map((item) => item.id)).toContain(task.id);
+    expect(database.tasksChangedBetween("1", since, Date.now() + 1_000).map((item) => item.id)).toContain(task.id);
 
-    database.createAlarm({ owner: "1", label: "Вечерний дайджест", nextAt: 100, cadence: "daily", mode: "digest-evening" });
-    expect(database.upgradeEveningDigests(21_000)).toBe(1);
-    expect(database.alarms("1")[0]).toMatchObject({ label: "Итог дня", nextAt: 21_000 });
+    database.createAlarm({ owner: "1", label: "Вечерний дайджест", nextAt: 10_000, cadence: "daily", mode: "digest-evening" });
+    database.createAlarm({ owner: "1", label: "Утро", nextAt: 11_000, cadence: "daily", mode: "digest-morning" });
+    expect(database.alignDailyDigests(6_000, 9_000, 1_000)).toBe(2);
+    expect(database.alarms("1").map((alarm) => [alarm.label, alarm.nextAt])).toEqual([
+      ["Итог за вчера", 6_000], ["Утренний дайджест", 9_000],
+    ]);
+  });
+
+  it("keeps a fixed daily wall-clock time after a delayed delivery", () => {
+    const scheduled = Date.parse("2026-07-15T06:00:00+03:00");
+    const alarm = database.createAlarm({ owner: "1", label: "Итог за вчера", nextAt: scheduled, cadence: "daily", mode: "digest-evening" });
+
+    database.advanceAlarm(alarm.id, Date.parse("2026-07-15T06:33:36+03:00"));
+
+    expect(database.alarms("1")[0]?.nextAt).toBe(Date.parse("2026-07-16T06:00:00+03:00"));
   });
 });

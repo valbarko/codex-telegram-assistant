@@ -17,6 +17,16 @@ describe("readConfiguration", () => {
     expect(config.dataDirectory).toBe("/home/person/.local/share/codex-telegram-assistant");
     expect(config.memsearchExecutable).toBe("/home/person/.local/bin/memsearch");
     expect(config.profiles.map((profile) => profile.id)).toEqual(["default", "review", "readonly"]);
+    expect(config).toMatchObject({ weatherLocation: "Москва", weatherLatitude: 55.7558, weatherLongitude: 37.6173 });
+  });
+
+  it("loads a configurable weather location", () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
+    const config = readConfiguration(cwd, {
+      TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12", WEATHER_LOCATION: "Сочи",
+      WEATHER_LATITUDE: "43.5855", WEATHER_LONGITUDE: "39.7231",
+    });
+    expect(config).toMatchObject({ weatherLocation: "Сочи", weatherLatitude: 43.5855, weatherLongitude: 39.7231 });
   });
 
   it("rejects missing secrets and unknown profiles", () => {

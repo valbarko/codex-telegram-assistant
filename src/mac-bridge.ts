@@ -5,9 +5,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
-const RECORD = "~~~CTA_RECORD~~~";
 
-export interface CalendarEntry { title: string; start: string; calendar: string; }
+export interface CalendarEntry { title: string; start: string; calendar: string; startOrder?: number; }
 
 export interface AppleNoteAppend {
   folder: string;
@@ -18,28 +17,64 @@ export interface AppleNoteAppend {
 }
 
 export async function upcomingCalendar(days = 7, maximum = 12): Promise<CalendarEntry[]> {
-  const names = (await appleScript(`tell application "Calendar"
-set AppleScript's text item delimiters to "${RECORD}"
-return name of every calendar as text
-end tell`)).split(RECORD).filter(Boolean);
-  const script = `on run argv
-tell application "Calendar"
-set fromDate to current date
-set untilDate to fromDate + (${Math.max(1, days)} * days)
-set rows to {}
-try
-set cal to calendar (item 1 of argv)
-set found to every event of cal whose start date ≥ fromDate and start date ≤ untilDate
-repeat with entry in found
-set end of rows to ((summary of entry as text) & "|||" & (start date of entry as text) & "|||" & (name of cal as text))
-end repeat
-end try
-set AppleScript's text item delimiters to "${RECORD}"
-return rows as text
-end tell
-end run`;
-  const rows = await Promise.all(names.map((name) => appleScript(script, [name], 8_000).catch(() => "")));
-  return rows.flatMap((result) => result.split(RECORD).map(parseCalendar).filter(present)).slice(0, maximum);
+  const from = Date.now();
+  return eventKitCalendar(from, from + Math.max(1, days) * 24 * 60 * 60_000, maximum, true);
+}
+
+export async function todayCalendar(maximum = 12): Promise<CalendarEntry[]> {
+  const fromDate = new Date();
+  fromDate.setHours(0, 0, 0, 0);
+  const untilDate = new Date(fromDate);
+  untilDate.setDate(untilDate.getDate() + 1);
+  return eventKitCalendar(fromDate.getTime(), untilDate.getTime(), maximum, false);
+}
+
+async function eventKitCalendar(from: number, until: number, maximum: number, includeDate: boolean): Promise<CalendarEntry[]> {
+  const script = `ObjC.import('EventKit')
+var authorization = Number($.EKEventStore.authorizationStatusForEntityType($.EKEntityTypeEvent))
+if (authorization !== 3) throw new Error('Apple Calendar access is not granted')
+var store = $.EKEventStore.alloc.init
+var calendars = store.calendarsForEntityType($.EKEntityTypeEvent)
+if (Number(calendars.count) === 0) throw new Error('Apple Calendar has no readable calendars')
+var fromDate = $.NSDate.dateWithTimeIntervalSince1970(${Math.floor(from / 1000)})
+var untilDate = $.NSDate.dateWithTimeIntervalSince1970(${Math.ceil(until / 1000)})
+var predicate = store.predicateForEventsWithStartDateEndDateCalendars(fromDate, untilDate, calendars)
+var events = store.eventsMatchingPredicate(predicate)
+var rows = []
+for (var index = 0; index < Number(events.count); index++) {
+  var event = events.objectAtIndex(index)
+  rows.push({
+    title: ObjC.unwrap(event.title) || '',
+    start: Number(event.startDate.timeIntervalSince1970) * 1000,
+    allDay: Boolean(event.allDay),
+    calendar: ObjC.unwrap(event.calendar.title) || ''
+  })
+}
+JSON.stringify(rows)`;
+  const content = await javaScript(script, 8_000);
+  return parseEventKitCalendar(content, includeDate).slice(0, Math.max(0, maximum));
+}
+
+export function parseEventKitCalendar(content: string, includeDate: boolean): CalendarEntry[] {
+  const parsed = JSON.parse(content) as unknown;
+  if (!Array.isArray(parsed)) throw new Error("Apple Calendar returned invalid data");
+  return parsed.flatMap((value) => {
+    if (!value || typeof value !== "object") return [];
+    const row = value as Record<string, unknown>;
+    const title = typeof row.title === "string" ? row.title.trim() : "";
+    const calendar = typeof row.calendar === "string" ? row.calendar.trim() : "";
+    const startOrder = Number(row.start);
+    if (!title || !calendar || !Number.isFinite(startOrder)) return [];
+    return [{ title, calendar, startOrder, start: formatCalendarStart(startOrder, row.allDay === true, includeDate) }];
+  }).sort((left, right) => (left.startOrder ?? Number.MAX_SAFE_INTEGER) - (right.startOrder ?? Number.MAX_SAFE_INTEGER));
+}
+
+function formatCalendarStart(value: number, allDay: boolean, includeDate: boolean): string {
+  const date = new Date(value);
+  const day = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long", timeZone: "Europe/Moscow" }).format(date);
+  if (allDay) return includeDate ? `${day} · весь день` : "Весь день";
+  const time = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Moscow" }).format(date);
+  return includeDate ? `${day}, ${time}` : time;
 }
 
 export async function addCalendarEvent(title: string, start: number, minutes = 60): Promise<void> {
@@ -145,6 +180,8 @@ async function appleScript(script: string, args: string[] = [], timeout = 30_000
   const { stdout } = await execute("/usr/bin/osascript", ["-e", script, ...args], { timeout, maxBuffer: 1024 * 1024 });
   return stdout.trim();
 }
-function parseCalendar(row: string): CalendarEntry | null { const [title, start, calendar] = row.split("|||"); return title && start && calendar ? { title, start, calendar } : null; }
+async function javaScript(script: string, timeout = 30_000): Promise<string> {
+  const { stdout } = await execute("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeout, maxBuffer: 1024 * 1024 });
+  return stdout.trim();
+}
 function quote(value: string): string { return `'${value.replaceAll("'", `'\\''`)}'`; }
-function present<T>(value: T | null): value is T { return value !== null; }
