@@ -36,12 +36,18 @@ This repository is an independent implementation with its own source structure, 
 npm install
 cp .env.example .env
 # Fill TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_IDS.
+# Optionally fill TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS for voice-only accounts.
 npm test
 npm run build
 npm start
 ```
 
 The `.env` file, SQLite state, logs, model caches, and local paths are ignored by Git.
+
+IDs in `TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS` can send only voice messages and audio files. The bot returns only clean prose
+with normalized punctuation, capitalization, and paragraphs—without metadata, summaries, headings, or topic splitting—deletes its temporary audio file, and does not route the content to commands, Codex threads,
+the assistant database, long-term memory, diary, or story archives.
+Short transcripts include a native `Copy` button; longer transcripts use Telegram's copyable text block.
 
 ## Telegram flow
 

@@ -7,7 +7,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, InlineKeyboard, InputFile, Keyboard, type Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
-import { structureTranscript, transcribeAudio } from "./audio.js";
+import { formatPlainTranscript, structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
 import { ForwardedVoiceBatcher, ForwardedVoiceEditor, forwardedVoiceHeading,
@@ -17,6 +17,8 @@ import { MemoryService, type RecallHit } from "./memory-service.js";
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
+import { isTranscriptionMedia, telegramAccessMode } from "./telegram-access.js";
+import { transcriptionCopyPresentation } from "./telegram-copy.js";
 import { renderTelegramMarkdown, sendTelegramMarkdown, telegramMarkdownChunks } from "./telegram-markdown.js";
 import { isStyleWritingKind, parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
   type EditedVoiceEntry, type SpokenVoiceCommand } from "./voice-writing.js";
@@ -126,12 +128,17 @@ export class TelegramApplication {
 
   private install(): void {
     this.bot.use(async (ctx, next) => {
-      if (!ctx.from || !this.configuration.allowedUsers.has(ctx.from.id)) {
-        if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Нет доступа" }).catch(() => undefined);
-        else if (ctx.chat) await ctx.reply("Нет доступа").catch(() => undefined);
-        return;
+      const access = telegramAccessMode(this.configuration, ctx.from?.id);
+      if (access === "full" || (access === "transcription-only" && isTranscriptionMedia(ctx))) {
+        await next();
+      } else if (ctx.callbackQuery) {
+        await ctx.answerCallbackQuery({ text: "Нет доступа" }).catch(() => undefined);
+      } else if (ctx.chat) {
+        const message = access === "transcription-only"
+          ? "Доступна только расшифровка голосовых сообщений и аудиофайлов."
+          : "Нет доступа";
+        await ctx.reply(message).catch(() => undefined);
       }
-      await next();
     });
 
     this.bot.use(async (ctx, next) => {
@@ -316,6 +323,17 @@ export class TelegramApplication {
       const forwarded = forwardedSource(ctx);
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : Date.now());
+      if (telegramAccessMode(this.configuration, ctx.from?.id) === "transcription-only") {
+        await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
+        for (const part of textChunks(formatPlainTranscript(raw), TELEGRAM_LIMIT)) {
+          const presentation = transcriptionCopyPresentation(part);
+          await ctx.reply(presentation.body, {
+            ...(presentation.parseMode ? { parse_mode: presentation.parseMode } : {}),
+            ...(presentation.keyboard ? { reply_markup: presentation.keyboard } : {}),
+          });
+        }
+        return;
+      }
       await this.memory.record({ owner: ownerId(ctx), body: raw, role: "user", kind: "voice", project: this.memoryProject(ctx), source: sender ? `telegram-voice:${sender}` : "telegram-voice" });
       if (forwarded.key) {
         const batchKey = `${contextId(ctx)}:${forwarded.key}`;
@@ -1369,6 +1387,21 @@ function htmlChunks(value: string, limit: number): string[] {
     if (paragraph.length <= limit) { current = paragraph; continue; }
     const plain = paragraph.replaceAll("<b>", "").replaceAll("</b>", "").replaceAll("<i>", "").replaceAll("</i>", "");
     for (let index = 0; index < plain.length; index += limit) result.push(plain.slice(index, index + limit));
+    current = "";
+  }
+  if (current) result.push(current);
+  return result;
+}
+
+function textChunks(value: string, limit: number): string[] {
+  const result: string[] = [];
+  let current = "";
+  for (const paragraph of value.split("\n\n")) {
+    const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
+    if (candidate.length <= limit) { current = candidate; continue; }
+    if (current) result.push(current);
+    if (paragraph.length <= limit) { current = paragraph; continue; }
+    for (let index = 0; index < paragraph.length; index += limit) result.push(paragraph.slice(index, index + limit));
     current = "";
   }
   if (current) result.push(current);

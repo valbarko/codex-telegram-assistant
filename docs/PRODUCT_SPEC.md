@@ -60,6 +60,8 @@ The application is a private-by-default Telegram client for a local Codex instal
 ## Safety and privacy
 
 - Only configured Telegram user IDs may interact with the bot.
+- Transcription-only user IDs may submit voice or audio and receive only clean prose with normalized punctuation, capitalization, and paragraphs, without metadata, summaries, headings, or topic splitting. They cannot use commands or other inputs. Their audio is temporary and their transcripts are not written to Codex threads, databases, long-term memory, or writing archives.
+- Transcription-only replies expose Telegram's native copy action: a `CopyTextButton` for text up to 256 characters and a copyable text block for longer output.
 - Secrets are loaded from an ignored environment file or process environment and never logged.
 - The default execution profile is least privilege.
 - Background jobs never auto-approve permission requests.
