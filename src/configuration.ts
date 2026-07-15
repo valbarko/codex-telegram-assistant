@@ -20,6 +20,9 @@ export interface AppConfiguration {
   memsearchExecutable: string;
   defaultWorkspace: string;
   projectAliases: Readonly<Record<string, string>>;
+  weatherLocation: string;
+  weatherLatitude: number;
+  weatherLongitude: number;
   defaultModel?: string;
   defaultProfile: string;
   profiles: readonly ExecutionProfile[];
@@ -48,6 +51,9 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     memsearchExecutable: path.resolve(env.MEMSEARCH_BIN?.trim() || path.join(homeDirectory, ".local", "bin", "memsearch")),
     defaultWorkspace,
     projectAliases: parseAliases(env.PROJECT_ALIASES_JSON || env.WORKSPACE_LABELS_JSON),
+    weatherLocation: optional(env.WEATHER_LOCATION) || "Москва",
+    weatherLatitude: parseCoordinate(env.WEATHER_LATITUDE, 55.7558, -90, 90, "WEATHER_LATITUDE"),
+    weatherLongitude: parseCoordinate(env.WEATHER_LONGITUDE, 37.6173, -180, 180, "WEATHER_LONGITUDE"),
     defaultModel: optional(env.CODEX_MODEL),
     defaultProfile,
     profiles,
@@ -137,4 +143,11 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (["1", "true", "yes"].includes(value.toLowerCase())) return true;
   if (["0", "false", "no"].includes(value.toLowerCase())) return false;
   throw new Error(`Invalid boolean: ${value}`);
+}
+
+function parseCoordinate(value: string | undefined, fallback: number, minimum: number, maximum: number, key: string): number {
+  if (!optional(value)) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) throw new Error(`Invalid ${key}`);
+  return parsed;
 }

@@ -9,9 +9,10 @@ import { TelegramApplication } from "./telegram-app.js";
 
 const configuration = readConfiguration();
 const database = new AssistantDatabase(path.join(configuration.dataDirectory, "assistant.sqlite"));
-database.upgradeEveningDigests(nextLocalTime(21, 0));
+database.alignDailyDigests(nextLocalTime(6, 0), nextLocalTime(9, 0));
 const hub = new CodexHub(configuration);
 const memory = new MemoryService(configuration.dataDirectory, configuration.memsearchExecutable, database);
+for (const event of database.reportExcludedMemoryEvents()) await memory.forget(event.owner, event.id);
 const telegram = new TelegramApplication(configuration, hub, database, memory);
 const scheduler = new BackgroundScheduler(configuration, database, hub, telegram.bot, memory);
 

@@ -32,11 +32,38 @@ class FakeTransport {
 
 const config: AppConfiguration = {
   telegramToken: "x", allowedUsers: new Set([1]), homeDirectory: "/home", dataDirectory: "/data", defaultWorkspace: "/work",
-  projectAliases: {}, defaultModel: "gpt", defaultProfile: "review", maxUploadBytes: 1, showUsage: false,
+  projectAliases: {}, weatherLocation: "Москва", weatherLatitude: 55.7558, weatherLongitude: 37.6173,
+  defaultModel: "gpt", defaultProfile: "review", maxUploadBytes: 1, showUsage: false,
   profiles: [{ id: "review", title: "Review", sandbox: "workspace-write", approvals: "on-request" }],
 };
 
 describe("CodexHub", () => {
+  it("creates named Telegram threads with the standard interactive source", async () => {
+    const transport = new FakeTransport();
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1");
+
+    await conversation.start("/work", "  Убрать нижние кнопки  ");
+
+    expect(transport.calls).toEqual([
+      {
+        name: "thread/start",
+        payload: {
+          cwd: "/work",
+          model: "gpt",
+          sandbox: "workspace-write",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user",
+          ephemeral: false,
+        },
+      },
+      {
+        name: "thread/name/set",
+        payload: { threadId: "thread-1", name: "Убрать нижние кнопки" },
+      },
+    ]);
+  });
+
   it("streams a turn through the independent app-server abstraction", async () => {
     const transport = new FakeTransport();
     const hub = new CodexHub(config, transport as never);

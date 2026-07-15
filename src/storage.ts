@@ -166,6 +166,12 @@ export class AssistantDatabase {
       ORDER BY changed_at ASC LIMIT ?`).all(owner, since, since, since, limit).map(mapTask).filter(present);
   }
 
+  tasksChangedBetween(owner: string, since: number, until: number, limit = 100): WorkItem[] {
+    return this.sql.prepare(`SELECT * FROM tasks WHERE owner=?
+      AND ((created_at>=? AND created_at<?) OR (changed_at>=? AND changed_at<?) OR (COALESCE(finished_at,0)>=? AND COALESCE(finished_at,0)<?))
+      ORDER BY changed_at ASC LIMIT ?`).all(owner, since, until, since, until, since, until, limit).map(mapTask).filter(present);
+  }
+
   updateTask(id: string, changes: Partial<Pick<WorkItem, "status" | "project" | "projectLabel" | "threadId" | "dueAt" | "error" | "finishedAt">>): WorkItem | undefined {
     const columns: Record<string, string> = {
       status: "status", project: "project", projectLabel: "project_label", threadId: "thread_id",
@@ -255,6 +261,12 @@ export class AssistantDatabase {
       .all(owner, options.limit ?? 5000).map(mapMemoryEvent).filter(present);
   }
 
+  reportExcludedMemoryEvents(): MemoryEvent[] {
+    return this.sql.prepare(`SELECT * FROM memory_events WHERE deleted_at IS NULL AND
+      (source='telegram-voice' OR source LIKE 'telegram-voice:%' OR source='forwarded-voice-batch' OR source='daily-summary')
+      ORDER BY created_at`).all().map(mapMemoryEvent).filter(present);
+  }
+
   forgetMemoryEvent(owner: string, id: string): MemoryEvent | undefined {
     const event = this.memoryEvent(id);
     if (!event || event.owner !== owner || event.deletedAt) return undefined;
@@ -341,9 +353,14 @@ export class AssistantDatabase {
     return this.sql.prepare("DELETE FROM alarms WHERE id=?").run(id).changes > 0;
   }
 
-  upgradeEveningDigests(nextAt: number): number {
-    return this.sql.prepare(`UPDATE alarms SET label='Итог дня',next_at=?
-      WHERE enabled=1 AND mode='digest-evening' AND label='Вечерний дайджест'`).run(nextAt).changes;
+  alignDailyDigests(summaryAt: number, morningAt: number, now = Date.now()): number {
+    const summary = this.sql.prepare(`UPDATE alarms SET label='Итог за вчера',
+      next_at=CASE WHEN next_at<=? THEN next_at ELSE ? END
+      WHERE enabled=1 AND cadence='daily' AND mode='digest-evening'`).run(now, summaryAt).changes;
+    const morning = this.sql.prepare(`UPDATE alarms SET label='Утренний дайджест',
+      next_at=CASE WHEN next_at<=? THEN next_at ELSE ? END
+      WHERE enabled=1 AND cadence='daily' AND mode='digest-morning'`).run(now, morningAt).changes;
+    return summary + morning;
   }
 
   search(owner: string, query: string, limit = 30): SearchHit[] {
@@ -377,12 +394,14 @@ export class AssistantDatabase {
 
 function following(previous: number, cadence: Alarm["cadence"], now: number): number | undefined {
   if (cadence === "once") return undefined;
-  const next = new Date(Math.max(previous, now));
-  if (cadence === "daily") next.setDate(next.getDate() + 1);
-  if (cadence === "weekly") next.setDate(next.getDate() + 7);
-  if (cadence === "weekdays") {
-    do next.setDate(next.getDate() + 1); while ([0, 6].includes(next.getDay()));
-  }
+  const next = new Date(previous);
+  do {
+    if (cadence === "daily") next.setDate(next.getDate() + 1);
+    if (cadence === "weekly") next.setDate(next.getDate() + 7);
+    if (cadence === "weekdays") {
+      do next.setDate(next.getDate() + 1); while ([0, 6].includes(next.getDay()));
+    }
+  } while (next.getTime() <= now);
   return next.getTime();
 }
 
