@@ -8,6 +8,7 @@ import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex
 import { todayCalendar, type CalendarEntry } from "./mac-bridge.js";
 import type { MemoryService } from "./memory-service.js";
 import { quietCodexPrompt } from "./prompt-policy.js";
+import { logInternalError, publicErrorMessage } from "./public-errors.js";
 import type { Alarm, AssistantDatabase, MemoryEvent, WorkItem } from "./storage.js";
 import { sendTelegramMarkdown } from "./telegram-markdown.js";
 import { countActiveWork, groupActiveWork, internalAssistantWorkspace, internalWorkThread, mergeActiveWork, type UnifiedWorkGroup } from "./work-dashboard.js";
@@ -103,7 +104,8 @@ export class BackgroundScheduler {
       if (response.trim()) await this.memory.record({ owner: task.owner, body: response.trim(), role: "assistant", kind: "response", project: workspace, source: "scheduler-final" });
       await this.send(task.owner, `✅ ${task.title}${response.trim() ? `\n\n${response.trim()}` : ""}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      logInternalError(`Scheduled task ${task.id} failed`, error);
+      const message = publicErrorMessage("scheduled-task");
       this.database.updateTask(task.id, { status: "waiting", error: message });
       await this.send(task.owner, `❌ ${task.title}\n\n${message}`);
     }

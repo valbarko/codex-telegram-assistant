@@ -1,3 +1,5 @@
+import type { Transformer } from "grammy";
+
 export interface TelegramMarkdownChunk {
   html: string;
   plain: string;
@@ -64,10 +66,53 @@ export async function sendTelegramMarkdown(api: TelegramSendApi, chatId: string 
   for (const chunk of telegramMarkdownChunks(markdown, limit)) {
     try {
       await api.sendMessage(chatId, chunk.html, { parse_mode: "HTML" });
-    } catch {
-      await api.sendMessage(chatId, chunk.plain);
+    } catch (error) {
+      console.error("Telegram Markdown delivery failed; using safe plain text", error);
+      await api.sendMessage(chatId, markdownToPlainText(chunk.plain));
     }
   }
+}
+
+const TEXT_METHODS = new Set(["sendMessage", "editMessageText"]);
+const CAPTION_METHODS = new Set([
+  "sendAnimation", "sendAudio", "sendDocument", "sendPhoto", "sendVideo", "sendVoice", "editMessageCaption",
+]);
+
+export const markdownTelegramTransformer: Transformer = async (prev, method, payload, signal) => {
+  const source = payload as unknown as Record<string, unknown>;
+  const field = TEXT_METHODS.has(method) ? "text" : CAPTION_METHODS.has(method) ? "caption" : undefined;
+  if (!field || typeof source[field] !== "string") return prev(method, payload, signal);
+
+  const parseField = field === "text" ? "parse_mode" : "parse_mode";
+  const original = source[field] as string;
+  const alreadyHtml = source[parseField] === "HTML";
+  const formatted = alreadyHtml ? original : markdownToTelegramHtml(original);
+  const formattedPayload = {
+    ...source,
+    [field]: formatted,
+    [parseField]: "HTML",
+  } as unknown as typeof payload;
+  const response = await prev(method, formattedPayload, signal);
+
+  if (!response.ok && method === "editMessageText" && /message is not modified/i.test(response.description ?? "")) {
+    return { ok: true, result: true } as unknown as Awaited<ReturnType<typeof prev>>;
+  }
+  if (response.ok || !/parse entities|can't parse|unsupported start tag/i.test(response.description ?? "")) return response;
+
+  console.error("Telegram rejected formatted message; using safe plain text", {
+    method,
+    description: response.description,
+  });
+  const plainPayload = {
+    ...source,
+    [field]: alreadyHtml ? telegramHtmlToPlainText(original) : markdownToPlainText(original),
+    [parseField]: undefined,
+  } as unknown as typeof payload;
+  return prev(method, plainPayload, signal);
+};
+
+export function markdownToPlainText(markdown: string): string {
+  return telegramHtmlToPlainText(markdownToTelegramHtml(markdown));
 }
 
 export function truncateTelegramHtml(value: string, limit: number): string {
@@ -119,6 +164,12 @@ function inlineHtml(value: string): string {
 
 function escapeHtml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+}
+
+function telegramHtmlToPlainText(value: string): string {
+  return value.replace(/<br\s*\/?>/gi, "\n").replace(/<\/p\s*>/gi, "\n").replace(/<[^>]+>/g, "")
+    .replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'").replaceAll("&amp;", "&");
 }
 
 function splitLongText(value: string, limit: number): string[] {

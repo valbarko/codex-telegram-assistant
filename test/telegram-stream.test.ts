@@ -40,4 +40,32 @@ describe("TelegramTurnView", () => {
     await view.finish();
     expect(reply).toHaveBeenCalledWith("1. <b>Важный итог</b>: запустите <code>rsync</code>.", { parse_mode: "HTML" });
   });
+
+  it("does not rewrite an already formatted final answer as raw Markdown", async () => {
+    vi.useFakeTimers();
+    const reply = vi.fn(async () => ({ message_id: 9 }));
+    const editMessageText = vi.fn(async () => true);
+    const ctx = { chat: { id: 7 }, reply, api: { editMessageText } };
+    const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false);
+
+    view.text("Сегодня **+20…+23 °C**. [Источник](https://example.com/)");
+    await vi.advanceTimersByTimeAsync(0);
+    await view.finish();
+
+    expect(reply).toHaveBeenCalledWith(
+      "Сегодня <b>+20…+23 °C</b>. <a href=\"https://example.com/\">Источник</a>",
+      { parse_mode: "HTML" },
+    );
+    expect(editMessageText).not.toHaveBeenCalled();
+  });
+
+  it("never exposes a system exception in a failed streamed answer", async () => {
+    const reply = vi.fn(async () => ({ message_id: 9 }));
+    const ctx = { chat: { id: 7 }, reply, api: { editMessageText: vi.fn(async () => true) } };
+    const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false);
+
+    await view.fail();
+
+    expect(reply).toHaveBeenCalledWith("Не удалось выполнить запрос. Попробуйте ещё раз.", { parse_mode: "HTML" });
+  });
 });

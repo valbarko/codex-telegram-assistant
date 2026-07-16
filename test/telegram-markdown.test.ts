@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  markdownTelegramTransformer,
+  markdownToPlainText,
   markdownToTelegramHtml,
   sendTelegramMarkdown,
   telegramMarkdownChunks,
@@ -40,7 +42,8 @@ describe("Telegram Markdown", () => {
     );
   });
 
-  it("falls back to plain Markdown when Telegram rejects formatted HTML", async () => {
+  it("falls back to clean plain text when Telegram rejects formatted HTML", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const sendMessage = vi.fn()
       .mockRejectedValueOnce(new Error("bad html"))
       .mockResolvedValueOnce({});
@@ -48,7 +51,9 @@ describe("Telegram Markdown", () => {
     await sendTelegramMarkdown({ sendMessage }, "owner", "**важно**");
 
     expect(sendMessage).toHaveBeenNthCalledWith(1, "owner", "<b>важно</b>", { parse_mode: "HTML" });
-    expect(sendMessage).toHaveBeenNthCalledWith(2, "owner", "**важно**");
+    expect(sendMessage).toHaveBeenNthCalledWith(2, "owner", "важно");
+    expect(errors).toHaveBeenCalled();
+    errors.mockRestore();
   });
 
   it("splits long Markdown into Telegram-safe chunks", () => {
@@ -57,5 +62,38 @@ describe("Telegram Markdown", () => {
     expect(chunks.length).toBeGreaterThan(1);
     expect(chunks.every((chunk) => chunk.html.length <= 500)).toBe(true);
     expect(chunks.every((chunk) => !chunk.html.includes("**"))).toBe(true);
+  });
+
+  it("turns every plain Telegram message into formatted HTML at the API boundary", async () => {
+    const prev = vi.fn().mockResolvedValue({ ok: true, result: { message_id: 1 } });
+    const transform = markdownTelegramTransformer as any;
+
+    await transform(prev, "sendMessage", {
+      chat_id: 7,
+      text: "Сегодня **+20…+23 °C**. [Источник](https://example.com/)",
+    });
+
+    expect(prev).toHaveBeenCalledWith("sendMessage", {
+      chat_id: 7,
+      text: "Сегодня <b>+20…+23 °C</b>. <a href=\"https://example.com/\">Источник</a>",
+      parse_mode: "HTML",
+    }, undefined);
+  });
+
+  it("treats an identical final edit as success without replacing HTML with raw Markdown", async () => {
+    const prev = vi.fn().mockResolvedValue({
+      ok: false, error_code: 400, description: "Bad Request: message is not modified",
+    });
+    const transform = markdownTelegramTransformer as any;
+
+    const result = await transform(prev, "editMessageText", { chat_id: 7, message_id: 9, text: "**Готово**" });
+
+    expect(result).toEqual({ ok: true, result: true });
+    expect(prev).toHaveBeenCalledOnce();
+  });
+
+  it("removes Markdown markers from the last-resort plain-text fallback", () => {
+    expect(markdownToPlainText("## Главное\n\n**Готово** · [Источник](https://example.com/) · `код`"))
+      .toBe("Главное\n\nГотово · Источник · код");
   });
 });
