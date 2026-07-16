@@ -8,6 +8,10 @@ export interface TelegramCopyPresentation {
   keyboard?: InlineKeyboard;
 }
 
+export function publicTranscriptionErrorMessage(_error: unknown): string {
+  return "Не удалось расшифровать голосовое. Попробуйте отправить его ещё раз.";
+}
+
 export function transcriptionCopyPresentation(text: string): TelegramCopyPresentation {
   if (text.length <= TELEGRAM_COPY_TEXT_LIMIT) {
     return { body: text, keyboard: new InlineKeyboard().copyText("📋 Скопировать", text) };

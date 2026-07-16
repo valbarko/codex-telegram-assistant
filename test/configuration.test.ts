@@ -46,6 +46,16 @@ describe("readConfiguration", () => {
     });
   });
 
+  it("loads the dedicated Whisper runtime from dotenv values", () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
+    const config = readConfiguration(cwd, {
+      TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12",
+      WHISPER_PYTHON: "/opt/whisper/bin/python", WHISPER_MODEL: "local/whisper-model",
+    });
+
+    expect(config).toMatchObject({ whisperPython: "/opt/whisper/bin/python", whisperModel: "local/whisper-model" });
+  });
+
   it("rejects two media cookie sources", () => {
     expect(() => readConfiguration("/tmp", {
       TELEGRAM_BOT_TOKEN: "x", TELEGRAM_ALLOWED_USER_IDS: "12",

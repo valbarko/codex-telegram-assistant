@@ -42,7 +42,7 @@ interface MediaInfo {
 
 type MediaSummaryConfiguration = Pick<AppConfiguration,
   "defaultModel" | "mediaDownloaderExecutable" | "ffmpegExecutable" | "mediaSummaryMaxDurationSeconds"
-  | "mediaCookiesFromBrowser" | "mediaCookiesFile">;
+  | "mediaCookiesFromBrowser" | "mediaCookiesFile" | "whisperPython" | "whisperModel">;
 
 type ProgressCallback = (progress: MediaSummaryProgress) => void | Promise<void>;
 
@@ -70,7 +70,11 @@ export class MediaSummaryService {
       const transcriptParts: string[] = [];
       for (let index = 0; index < chunks.length; index += 1) {
         await progress({ stage: "transcribe", current: index + 1, total: chunks.length });
-        const result = await transcribeAudioDetailed(chunks[index]!, { language: null });
+        const result = await transcribeAudioDetailed(chunks[index]!, {
+          language: null,
+          python: this.configuration.whisperPython,
+          model: this.configuration.whisperModel,
+        });
         transcriptParts.push(formatTimestampedTranscript(result, index * CHUNK_SECONDS));
       }
       const transcript = transcriptParts.filter(Boolean).join("\n");
