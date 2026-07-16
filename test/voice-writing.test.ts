@@ -47,9 +47,13 @@ describe("voice writing", () => {
   });
 
   it("instructs Codex to edit without inventing content", () => {
-    const diary = editorPrompt("diary", "ну я сегодня решил", undefined, undefined);
+    const diary = editorPrompt("diary", "ну я сегодня решил", undefined, undefined, {
+      profile: "Живой разговорный ритм.", examples: ["Сегодня я опять всё усложнил."],
+    });
     expect(diary.toLocaleLowerCase("ru-RU")).toContain("не добавляй психологических интерпретаций");
     expect(diary.toLocaleLowerCase("ru-RU")).toContain("верни только готовый markdown");
+    expect(diary).toContain("ПРОФИЛЬ АВТОРСКОГО СТИЛЯ");
+    expect(diary).toContain("Сегодня я опять всё усложнил.");
     const story = editorPrompt("story", "он вошел", "Город у моря", "Предыдущая сцена");
     expect(story.toLocaleLowerCase("ru-RU")).toContain("не придумывай новых событий");
     expect(story).toContain("Предыдущая сцена");

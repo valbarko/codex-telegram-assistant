@@ -18,6 +18,8 @@ describe("quiet Codex policy", () => {
   it("suppresses internal implementation narration", () => {
     const prompt = quietCodexPrompt("проверь проект");
     expect(prompt).toContain("Не описывай внутренние skills, MCP, RTK, PATH");
+    expect(prompt).toContain("Пиши по-русски в стиле Валентина");
+    expect(prompt).toContain("не придумывай личный опыт");
     expect(prompt).toContain("проверь проект");
   });
 
