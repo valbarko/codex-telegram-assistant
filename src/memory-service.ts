@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { AssistantDatabase, type MemoryEvent, type MemoryKind, type MemoryRole } from "./storage.js";
+import { logInternalError } from "./public-errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,7 +35,7 @@ export class MemoryService {
   private readonly root: string;
   private readonly queues = new Map<string, Promise<void>>();
   private readonly dirty = new Set<string>();
-  private readonly errors = new Map<string, string>();
+  private readonly errors = new Set<string>();
 
   constructor(
     dataDirectory: string,
@@ -75,7 +76,8 @@ export class MemoryService {
       return candidates.filter((hit) => !hit.project || hit.project === normalizedProject)
         .sort((left, right) => right.score - left.score || right.createdAt - left.createdAt).slice(0, limit);
     } catch (error) {
-      this.errors.set(owner, errorMessage(error));
+      logInternalError(`Memory search failed for owner ${owner}`, error);
+      this.errors.add(owner);
       return this.lexicalRecall(owner, query, normalizedProject, limit);
     }
   }
@@ -112,7 +114,7 @@ export class MemoryService {
 
   status(owner: string): string {
     const status = this.database.memoryStatus(owner);
-    const index = this.errors.get(owner) ? `ошибка: ${this.errors.get(owner)}` : this.queues.has(owner) ? "обновляется" : "готов";
+    const index = this.errors.has(owner) ? "временно недоступен" : this.queues.has(owner) ? "обновляется" : "готов";
     return [
       `Память: ${status.paused ? "приостановлена" : "включена"}`,
       `Активных записей: ${status.active} (глобальных ${status.global}, проектных ${status.project})`,
@@ -152,7 +154,8 @@ export class MemoryService {
       await this.runCommand(this.executable, ["index", this.ownerDirectory(owner), "--collection", collection(owner), "--provider", "onnx"]);
       this.errors.delete(owner);
     } catch (error) {
-      this.errors.set(owner, errorMessage(error));
+      logInternalError(`Memory indexing failed for owner ${owner}`, error);
+      this.errors.add(owner);
       throw error;
     }
   }
@@ -227,8 +230,6 @@ function normalizeProject(value: string | undefined): string | undefined {
 
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex").slice(0, 20); }
 function collection(owner: string): string { return `cta_memory_${hash(owner)}`; }
-function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
-
 async function run(executable: string, args: readonly string[]): Promise<string> {
   const result = await execFileAsync(executable, [...args], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
   return result.stdout;

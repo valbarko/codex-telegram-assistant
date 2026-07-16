@@ -18,10 +18,12 @@ import { MediaSummaryService, parseSupportedMediaUrl, type MediaSummaryProgress 
 import { MemoryService, type RecallHit } from "./memory-service.js";
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
+import { logInternalError, publicErrorMessage } from "./public-errors.js";
 import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
 import { isTranscriptionMedia, isTranscriptionText, telegramAccessMode } from "./telegram-access.js";
 import { publicTranscriptionErrorMessage, transcriptionCopyPresentation } from "./telegram-copy.js";
-import { renderTelegramMarkdown, sendTelegramMarkdown, telegramMarkdownChunks } from "./telegram-markdown.js";
+import { markdownTelegramTransformer, markdownToPlainText, renderTelegramMarkdown, sendTelegramMarkdown,
+  telegramMarkdownChunks } from "./telegram-markdown.js";
 import { isStyleWritingKind, parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
   type EditedVoiceEntry, type SpokenVoiceCommand } from "./voice-writing.js";
 
@@ -81,6 +83,7 @@ export class TelegramApplication {
     this.mediaSummary = new MediaSummaryService(configuration, this.restrictedTextEditor);
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
+    this.bot.api.config.use(markdownTelegramTransformer);
     this.install();
   }
 
@@ -458,12 +461,14 @@ export class TelegramApplication {
       for (const chunk of telegramMarkdownChunks(markdown, TELEGRAM_LIMIT - 100)) {
         try {
           await this.bot.api.sendMessage(target.chatId, chunk.html, telegramHtmlOptions(target.messageThreadId));
-        } catch {
-          await this.bot.api.sendMessage(target.chatId, chunk.plain, telegramPlainOptions(target.messageThreadId));
+        } catch (error) {
+          logInternalError("Forwarded voice Markdown delivery failed", error);
+          await this.bot.api.sendMessage(target.chatId, markdownToPlainText(chunk.plain), telegramPlainOptions(target.messageThreadId));
         }
       }
     } catch (error) {
-      const message = `Не удалось собрать пересланные голосовые: ${errorMessage(error)}`;
+      logInternalError("Forwarded voice batch failed", error);
+      const message = publicErrorMessage("forwarded-voice");
       if (activeProgressId !== undefined) {
         await this.bot.api.editMessageText(target.chatId, activeProgressId, message).catch(() => undefined);
       } else {
@@ -498,7 +503,8 @@ export class TelegramApplication {
       if (activeProgressId !== undefined) await this.bot.api.deleteMessage(target.chatId, activeProgressId).catch(() => undefined);
       await this.sendRestrictedResult(target.chatId, target.messageThreadId, `${heading}\n\n${body}`);
     } catch (error) {
-      const message = `Не удалось собрать пересланные голосовые: ${errorMessage(error)}`;
+      logInternalError("Restricted forwarded voice batch failed", error);
+      const message = publicErrorMessage("forwarded-voice");
       if (activeProgressId !== undefined) {
         await this.bot.api.editMessageText(target.chatId, activeProgressId, message).catch(() => undefined);
       } else {
@@ -559,10 +565,9 @@ export class TelegramApplication {
       try {
         edited = await this.voiceEditor.compose(contextId(ctx), command.kind, command.content);
       } catch (error) {
+        logInternalError(`Voice ${command.kind} composition failed`, error);
         await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
-        await ctx.reply(`<b>⚠️ Не удалось подготовить ${escape(label.toLocaleLowerCase("ru-RU"))}.</b>\n${escape(errorMessage(error))}`, {
-          parse_mode: "HTML",
-        });
+        await ctx.reply(`⚠️ ${publicErrorMessage("writing")}`);
         if (existingProgressId !== undefined) {
           for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
             await ctx.reply(part, { parse_mode: "HTML" });
@@ -599,10 +604,10 @@ export class TelegramApplication {
     try {
       edited = await this.voiceEditor.edit(contextId(ctx), writingMode, command.content, settings.storyTitle, previous);
     } catch (error) {
-      const rawPath = await this.voiceArchive.saveRaw(writingMode, raw, sentAt, settings.storyTitle);
+      logInternalError(`Voice ${writingMode} editing failed`, error);
+      await this.voiceArchive.saveRaw(writingMode, raw, sentAt, settings.storyTitle);
       await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
-      await ctx.reply(["<b>⚠️ Исходный текст сохранён, но Codex не смог его отредактировать.</b>", escape(errorMessage(error)),
-        `Исходник: <code>${escape(rawPath)}</code>`].join("\n"), { parse_mode: "HTML" });
+      await ctx.reply(`⚠️ ${publicErrorMessage("writing")}`);
       for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
         await ctx.reply(part, { parse_mode: "HTML" });
       }
@@ -616,7 +621,8 @@ export class TelegramApplication {
         sectionMarker: saved.notesSectionMarker, continuationHtml: saved.notesContinuationHtml,
       });
     } catch (error) {
-      noteResult = `Apple Notes не обновлены: ${errorMessage(error)}`;
+      logInternalError("Apple Notes update failed", error);
+      noteResult = "Apple Notes не обновлены.";
     }
     await this.memory.record({ owner: ownerId(ctx), body: edited.markdown, role: "assistant", kind: "response",
       project: this.memoryProject(ctx), source: `tagged-${writingMode}-edited` });
@@ -625,7 +631,7 @@ export class TelegramApplication {
       `<b>✅ ${escape(voiceModeLabel(settings))}: сохранено</b>`,
       `Заметка: <b>${escape(saved.notesTitle)}</b>`,
       escape(noteResult),
-      `Резервная копия: <code>${escape(saved.polishedPath)}</code>`,
+      "Резервная копия сохранена.",
     ].join("\n");
     await ctx.reply(confirmation, { parse_mode: "HTML" });
     await sendTelegramMarkdown(ctx.api, ctx.chat!.id, edited.markdown, TELEGRAM_LIMIT - 100);
@@ -670,7 +676,8 @@ export class TelegramApplication {
       await ctx.api.deleteMessage(ctx.chat.id, progress.message_id).catch(() => undefined);
       await this.sendRestrictedResult(ctx.chat.id, ctx.message?.message_thread_id, result);
     } catch (error) {
-      await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `Не удалось оформить текст: ${errorMessage(error)}`).catch(() => undefined);
+      logInternalError("Restricted text formatting failed", error);
+      await ctx.api.editMessageText(ctx.chat.id, progress.message_id, publicErrorMessage("text-formatting")).catch(() => undefined);
     }
   }
 
@@ -772,8 +779,9 @@ export class TelegramApplication {
         project: this.memoryProject(ctx), source: "media-summary",
       });
     } catch (error) {
+      logInternalError("Media summary failed", error);
       await ctx.api.editMessageText(ctx.chat.id, progress.message_id,
-        `Не удалось подготовить конспект: ${errorMessage(error)}`).catch(() => undefined);
+        publicErrorMessage("media-summary")).catch(() => undefined);
     }
   }
 
@@ -821,7 +829,8 @@ export class TelegramApplication {
       const answer = view.content();
       if (answer) await this.memory.record({ owner: ownerId(ctx), body: answer, role: "assistant", kind: "response", project: conversation.snapshot().workspace, source: "codex-final" });
     } catch (error) {
-      await view.fail(error instanceof Error ? error.message : String(error));
+      logInternalError("Codex request failed", error);
+      await view.fail();
     }
   }
 
@@ -1036,7 +1045,8 @@ export class TelegramApplication {
       const lines = ["<b>🗓 Ближайшие события</b>", "", ...entries.map((entry) => `• <b>${escape(entry.title)}</b>\n${escape(entry.start)} · ${escape(entry.calendar)}`)];
       await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
     } catch (error) {
-      await ctx.reply(`Не удалось прочитать Apple Calendar: ${errorMessage(error)}`);
+      logInternalError("Apple Calendar read failed", error);
+      await ctx.reply(publicErrorMessage("calendar-read"));
     }
   }
 
@@ -1101,8 +1111,9 @@ export class TelegramApplication {
       await ctx.answerCallbackQuery({ text: "Событие создано" });
       if (ctx.callbackQuery?.message) await ctx.editMessageText(`✅ Событие создано\n<b>${escape(event.title)}</b>\n${formatDate(event.start)}`, { parse_mode: "HTML" });
     } catch (error) {
+      logInternalError("Apple Calendar event creation failed", error);
       await ctx.answerCallbackQuery({ text: "Ошибка" });
-      await ctx.reply(`Не удалось создать событие: ${errorMessage(error)}`);
+      await ctx.reply(publicErrorMessage("calendar-create"));
     }
   }
 
@@ -1116,7 +1127,8 @@ export class TelegramApplication {
       await makeMailDraft(address, subject, body.join("|").trim());
       await ctx.reply(`✉️ Черновик создан в Apple Mail\nКому: <code>${escape(address)}</code>\nТема: <b>${escape(subject)}</b>`, { parse_mode: "HTML" });
     } catch (error) {
-      await ctx.reply(`Не удалось создать черновик: ${errorMessage(error)}`);
+      logInternalError("Apple Mail draft creation failed", error);
+      await ctx.reply(publicErrorMessage("mail-draft"));
     }
   }
 
@@ -1162,7 +1174,8 @@ export class TelegramApplication {
       const command = await activateCodexWithResume(snapshot.workspace, snapshot.threadId);
       await ctx.reply(`💻 Codex открыт на Mac. Команда продолжения скопирована:\n<code>${escape(command)}</code>`, { parse_mode: "HTML" });
     } catch (error) {
-      await ctx.reply(`Не удалось открыть Codex: ${errorMessage(error)}`);
+      logInternalError("Opening Codex on Mac failed", error);
+      await ctx.reply(publicErrorMessage("codex-open"));
     }
   }
 
@@ -1259,7 +1272,8 @@ export class TelegramApplication {
       await this.hub.threads(1);
       await ctx.reply(`✅ Telegram: работает\n✅ Codex app-server: работает\n⏱ ${Date.now() - started} мс`);
     } catch (error) {
-      await ctx.reply(`⚠️ Telegram: работает\n❌ Codex app-server: ${errorMessage(error)}`);
+      logInternalError("Health check failed", error);
+      await ctx.reply(`⚠️ Telegram: работает\n❌ ${publicErrorMessage("health")}`);
     }
   }
 
@@ -1332,6 +1346,7 @@ export class TelegramTurnView implements TurnObserver {
   private drain?: Promise<void>;
   private needsFlush = false;
   private finalRequested = false;
+  private lastRenderedHtml?: string;
 
   constructor(
     private readonly ctx: Context,
@@ -1359,9 +1374,10 @@ export class TelegramTurnView implements TurnObserver {
     await this.requestFlush(true);
   }
 
-  async fail(message: string): Promise<void> {
+  async fail(): Promise<void> {
     this.cancelTimer();
-    this.answer = this.answer ? `${this.answer}\n\nОшибка: ${message}` : `Ошибка: ${message}`;
+    const message = publicErrorMessage("request");
+    this.answer = this.answer ? `${this.answer}\n\n${message}` : message;
     await this.requestFlush(true);
   }
 
@@ -1397,13 +1413,23 @@ export class TelegramTurnView implements TurnObserver {
     const rendered = renderTelegramMarkdown(source, TELEGRAM_LIMIT - 50);
     const { html: text, plain } = rendered;
     if (!this.messageId) {
-      const message = await this.ctx.reply(text, { parse_mode: "HTML" }).catch(() => this.ctx.reply(plain));
+      const message = await this.ctx.reply(text, { parse_mode: "HTML" }).catch(async (error) => {
+        logInternalError("Telegram formatted reply failed", error);
+        return this.ctx.reply(markdownToPlainText(plain));
+      });
       this.messageId = message.message_id;
+      this.lastRenderedHtml = text;
     } else {
+      if (this.lastRenderedHtml === text) return;
       try {
         await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, text, { parse_mode: "HTML" });
-      } catch {
-        await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, plain).catch(() => undefined);
+        this.lastRenderedHtml = text;
+      } catch (error) {
+        if (!/message is not modified/i.test(errorMessage(error))) logInternalError("Telegram formatted edit failed", error);
+        await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, markdownToPlainText(plain)).catch((fallbackError) => {
+          if (!/message is not modified/i.test(errorMessage(fallbackError))) logInternalError("Telegram safe text edit failed", fallbackError);
+          return undefined;
+        });
       }
     }
     this.lastEdit = Date.now();
