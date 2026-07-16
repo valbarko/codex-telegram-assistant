@@ -11,6 +11,8 @@ export interface TranscriptOrigin {
   sentAt?: number;
 }
 
+export type VoiceTranscriptSource = "direct" | "forwarded";
+
 export interface TranscriptSegment {
   start: number;
   end: number;
@@ -85,6 +87,10 @@ export function formatPlainTranscript(raw: string): string {
     return balancedParagraphs(sentences, 3).map((part) => part.join(" "));
   });
   return paragraphs.join("\n\n");
+}
+
+export function formatVoiceTranscript(raw: string, source: VoiceTranscriptSource, origin: TranscriptOrigin = {}): string {
+  return source === "forwarded" ? structureTranscript(raw, origin) : formatPlainTranscript(raw);
 }
 
 function normalize(value: string): string { return value.replace(/\s+/g, " ").trim(); }

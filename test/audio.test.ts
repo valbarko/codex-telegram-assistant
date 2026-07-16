@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatPlainTranscript, structureTranscript } from "../src/audio.js";
+import { formatPlainTranscript, formatVoiceTranscript, structureTranscript } from "../src/audio.js";
 
 describe("structureTranscript", () => {
   it("adds origin, a compact summary and semantic emphasis", () => {
@@ -37,5 +37,21 @@ describe("formatPlainTranscript", () => {
 
   it("preserves existing paragraph boundaries", () => {
     expect(formatPlainTranscript("первый абзац\n\nвторой абзац")).toBe("Первый абзац.\n\nВторой абзац.");
+  });
+});
+
+describe("formatVoiceTranscript", () => {
+  it("keeps summaries and sender metadata exclusive to forwarded voice messages", () => {
+    const raw = "спасибо за лекарство. вчера очень сильно помогло";
+    const origin = { sender: "Валентин Барко", sentAt: Date.UTC(2026, 6, 16, 8, 43) };
+
+    const direct = formatVoiceTranscript(raw, "direct", origin);
+    expect(direct).toBe("Спасибо за лекарство. Вчера очень сильно помогло.");
+    expect(direct).not.toMatch(/От:|Структурированная расшифровка|^•/mu);
+
+    const forwarded = formatVoiceTranscript(raw, "forwarded", origin);
+    expect(forwarded).toContain("От: <b>Валентин Барко</b>");
+    expect(forwarded).toContain("<b>Структурированная расшифровка</b>");
+    expect(forwarded).toMatch(/^•/mu);
   });
 });

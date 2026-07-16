@@ -7,7 +7,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, InlineKeyboard, InputFile, Keyboard, type Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
-import { formatPlainTranscript, structureTranscript, transcribeAudio } from "./audio.js";
+import { formatPlainTranscript, formatVoiceTranscript, structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
 import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
@@ -391,8 +391,8 @@ export class TelegramApplication {
       const command = parseSpokenVoiceCommand(raw);
       if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id)) return;
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-      for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
-        await ctx.reply(part, { parse_mode: "HTML" });
+      for (const part of htmlChunks(formatVoiceTranscript(command.content, "direct"), TELEGRAM_LIMIT)) {
+        await ctx.reply(part);
       }
     } catch (error) {
       console.error("Voice transcription failed", error);
@@ -438,7 +438,8 @@ export class TelegramApplication {
     try {
       if (fragments.length === 1) {
         if (activeProgressId !== undefined) await this.bot.api.deleteMessage(target.chatId, activeProgressId).catch(() => undefined);
-        for (const part of htmlChunks(structureTranscript(target.transcript, { sender: target.sender, sentAt: target.sentAt }), TELEGRAM_LIMIT)) {
+        for (const part of htmlChunks(formatVoiceTranscript(target.transcript, "forwarded",
+          { sender: target.sender, sentAt: target.sentAt }), TELEGRAM_LIMIT)) {
           await this.bot.api.sendMessage(target.chatId, part, telegramHtmlOptions(target.messageThreadId));
         }
         return;
