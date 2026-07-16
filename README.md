@@ -9,6 +9,7 @@ This repository is an independent implementation with its own source structure, 
 - **Codex from Telegram:** create, resume, steer, interrupt, and hand off threads with separate contexts for chats and forum topics.
 - **Live agent interaction:** stream answers and handle command, file, user-input, and permission approvals without returning to the Mac.
 - **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
+- **Video-link summaries:** turn a standalone YouTube, RuTube, or VK Video link into a personal Russian-language summary with key ideas, useful takeaways, actions, and selected source timestamps.
 - **Style-aware drafts:** turn a text or voice note beginning with `Пост`, `Анонс`, or `Ответ` into a ready Telegram draft using a private, locally indexed corpus of the owner's accepted writing.
 - **Forwarded voice packages:** collect rapidly forwarded voice messages from the same original sender, preserve their order, and use Codex to merge one topic or split genuine topic changes.
 - **Content-only accounts:** grant selected Telegram users three isolated tools—clean direct-voice transcription, summarized forwarded-voice packages, and text proofreading—without exposing commands, memory, or assistant workflows.
@@ -30,6 +31,7 @@ This repository is an independent implementation with its own source structure, 
 - A Telegram bot token from BotFather
 - MemSearch with local ONNX embeddings (`uv tool install "memsearch[onnx]"`)
 - Optional voice support: Python with `mlx-whisper`
+- Optional video-link summaries: `yt-dlp` and `ffmpeg` (`brew install yt-dlp ffmpeg`)
 
 ## Local setup
 
@@ -67,6 +69,7 @@ These inputs never route to commands or the owner's assistant workflows. Audio i
 - `/recall`, `/forget`, `/about_me` — recall, delete, and inspect personal memory
 - `/memory_status`, `/memory_pause`, `/memory_export` — control and export long-term memory
 - `/voice` — list spoken command labels; `/story` selects the current story cycle
+- `/summary <url>` — summarize a YouTube, RuTube, or VK Video link; a standalone supported URL starts the same flow automatically
 
 The persistent Telegram keyboard keeps common actions one tap away. A text sent while Codex is working steers the active turn; after it finishes, the next text starts a new turn in the same thread.
 
@@ -81,6 +84,10 @@ Passwords, API tokens, bearer credentials, JWTs, Telegram bot tokens, and OTP-li
 Install the local transcription dependency in a dedicated Python environment and set `WHISPER_PYTHON` to its interpreter. The default model is `mlx-community/whisper-large-v3-turbo`.
 
 An unlabelled voice message is a plain transcription. The bot returns sender/date metadata, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward.
+
+A standalone YouTube, RuTube, or VK Video URL starts the private media-summary flow. The bot downloads only the audio track, rejects live streams and recordings above the configured duration limit, converts the audio into 30-minute local chunks, transcribes each chunk with automatic language detection, and asks an ephemeral Codex process for a concise personal summary. Only the finished summary is added to assistant memory; downloaded audio, chunks, and the raw transcript are deleted when the run finishes. Use `/summary <url>` when you want to make the intent explicit.
+
+YouTube may require a browser check even for public videos. Authentication is opt-in: set either `MEDIA_COOKIES_FROM_BROWSER=chrome` (or another browser supported by `yt-dlp`) or `MEDIA_COOKIES_FILE=/absolute/path/to/cookies.txt`. The browser option allows `yt-dlp` to read that browser's cookies, so it is never enabled implicitly. A dedicated cookies file is preferable for an always-on background service.
 
 Forwarded voice and audio messages use package processing. After each forwarded item, the bot waits 45 seconds for more messages from the same original sender. Original messages join the same package while consecutive source timestamps are no more than 10 minutes apart. Every file is transcribed separately and ordered by its Telegram source time; Codex then creates one coherent transcript or separates real topic changes with short headings. A different sender or a larger source-time gap starts a new package. Forwarded speech is always treated as content and can never trigger calendar, task, reminder, or other spoken commands.
 

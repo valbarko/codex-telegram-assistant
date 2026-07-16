@@ -19,6 +19,9 @@ describe("readConfiguration", () => {
     expect(config.memsearchExecutable).toBe("/home/person/.local/bin/memsearch");
     expect(config.profiles.map((profile) => profile.id)).toEqual(["default", "review", "readonly"]);
     expect(config).toMatchObject({ weatherLocation: "Москва", weatherLatitude: 55.7558, weatherLongitude: 37.6173 });
+    expect(config).toMatchObject({
+      mediaDownloaderExecutable: "yt-dlp", ffmpegExecutable: "ffmpeg", mediaSummaryMaxDurationSeconds: 21_600,
+    });
   });
 
   it("loads a configurable weather location", () => {
@@ -28,6 +31,26 @@ describe("readConfiguration", () => {
       WEATHER_LATITUDE: "43.5855", WEATHER_LONGITUDE: "39.7231",
     });
     expect(config).toMatchObject({ weatherLocation: "Сочи", weatherLatitude: 43.5855, weatherLongitude: 39.7231 });
+  });
+
+  it("loads media summary executables and duration limit", () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
+    const config = readConfiguration(cwd, {
+      TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12",
+      MEDIA_DOWNLOADER_BIN: "/opt/bin/yt-dlp", FFMPEG_BIN: "/opt/bin/ffmpeg",
+      MEDIA_SUMMARY_MAX_DURATION_SECONDS: "10800", MEDIA_COOKIES_FROM_BROWSER: "chrome:Profile 1",
+    });
+    expect(config).toMatchObject({
+      mediaDownloaderExecutable: "/opt/bin/yt-dlp", ffmpegExecutable: "/opt/bin/ffmpeg",
+      mediaSummaryMaxDurationSeconds: 10_800, mediaCookiesFromBrowser: "chrome:Profile 1",
+    });
+  });
+
+  it("rejects two media cookie sources", () => {
+    expect(() => readConfiguration("/tmp", {
+      TELEGRAM_BOT_TOKEN: "x", TELEGRAM_ALLOWED_USER_IDS: "12",
+      MEDIA_COOKIES_FROM_BROWSER: "chrome", MEDIA_COOKIES_FILE: "/tmp/cookies.txt",
+    })).toThrow("Set only one");
   });
 
   it("loads isolated transcription-only users", () => {

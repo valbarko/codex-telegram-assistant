@@ -11,20 +11,57 @@ export interface TranscriptOrigin {
   sentAt?: number;
 }
 
+export interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface AudioTranscript {
+  text: string;
+  segments: readonly TranscriptSegment[];
+}
+
+export interface TranscriptionOptions {
+  /** `null` enables Whisper language auto-detection. The default preserves the existing Russian voice-message behavior. */
+  language?: string | null;
+  timeoutMs?: number;
+}
+
 export async function transcribeAudio(file: string): Promise<string> {
+  return (await transcribeAudioDetailed(file)).text;
+}
+
+export async function transcribeAudioDetailed(file: string, options: TranscriptionOptions = {}): Promise<AudioTranscript> {
   const localPython = path.join(process.cwd(), ".venv", "bin", "python");
   const python = process.env.WHISPER_PYTHON?.trim() || (existsSync(localPython) ? localPython : "python3");
   const model = process.env.WHISPER_MODEL?.trim() || DEFAULT_MODEL;
+  const language = options.language === undefined ? "ru" : options.language;
   const program = [
     "import json,sys",
     "import mlx_whisper",
-    "result=mlx_whisper.transcribe(sys.argv[1], path_or_hf_repo=sys.argv[2], language='ru')",
-    "print(json.dumps({'text': result.get('text','')}, ensure_ascii=False))",
+    "language=sys.argv[3] or None",
+    "result=mlx_whisper.transcribe(sys.argv[1], path_or_hf_repo=sys.argv[2], language=language)",
+    "segments=[{'start': item.get('start',0), 'end': item.get('end',0), 'text': item.get('text','')} for item in result.get('segments',[])]",
+    "print(json.dumps({'text': result.get('text',''), 'segments': segments}, ensure_ascii=False))",
   ].join(";");
-  const { stdout } = await execute(python, ["-c", program, file, model], { timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024 });
-  const parsed = JSON.parse(stdout.trim()) as { text?: unknown };
+  const { stdout } = await execute(python, ["-c", program, file, model, language ?? ""], {
+    timeout: options.timeoutMs ?? 30 * 60_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const parsed = JSON.parse(stdout.trim()) as { text?: unknown; segments?: unknown };
   if (typeof parsed.text !== "string" || !parsed.text.trim()) throw new Error("Распознавание вернуло пустой текст");
-  return parsed.text.trim();
+  const segments = Array.isArray(parsed.segments) ? parsed.segments.map(parseSegment).filter((item): item is TranscriptSegment => Boolean(item)) : [];
+  return { text: parsed.text.trim(), segments };
+}
+
+function parseSegment(value: unknown): TranscriptSegment | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  const start = typeof item.start === "number" && Number.isFinite(item.start) ? Math.max(0, item.start) : undefined;
+  const end = typeof item.end === "number" && Number.isFinite(item.end) ? Math.max(start ?? 0, item.end) : undefined;
+  const text = typeof item.text === "string" ? item.text.replace(/\s+/g, " ").trim() : "";
+  return start === undefined || end === undefined || !text ? undefined : { start, end, text };
 }
 
 export function structureTranscript(raw: string, origin: TranscriptOrigin = {}): string {
