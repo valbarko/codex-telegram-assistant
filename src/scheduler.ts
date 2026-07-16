@@ -5,6 +5,7 @@ import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex-engine.js";
+import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
 import { todayCalendar, type CalendarEntry } from "./mac-bridge.js";
 import type { MemoryService } from "./memory-service.js";
 import { quietCodexPrompt } from "./prompt-policy.js";
@@ -24,6 +25,7 @@ export interface WorkJournalEntry {
 export class BackgroundScheduler {
   private timer?: NodeJS.Timeout;
   private active = false;
+  private readonly textEditor: EphemeralTextEditor;
 
   constructor(
     private readonly configuration: AppConfiguration,
@@ -31,7 +33,9 @@ export class BackgroundScheduler {
     private readonly hub: CodexHub,
     private readonly bot: Bot<Context>,
     private readonly memory: MemoryService,
-  ) {}
+  ) {
+    this.textEditor = new EphemeralTextEditor(configuration);
+  }
 
   start(): void {
     if (this.timer) return;
@@ -99,15 +103,16 @@ export class BackgroundScheduler {
       const prompt = await this.memory.augmentPrompt(task.owner, task.prompt, workspace);
       await this.memory.record({ owner: task.owner, body: `Запуск фоновой задачи: ${task.prompt}`, role: "action", kind: "action", project: workspace, source: "scheduler" });
       await conversation.run(quietCodexPrompt(prompt), observer);
+      const polishedResponse = await this.polishContent(response.trim());
       this.database.updateTask(task.id, { status: "done", finishedAt: Date.now(), threadId: conversation.snapshot().threadId });
       this.saveConversation(task.owner, conversation);
-      if (response.trim()) await this.memory.record({ owner: task.owner, body: response.trim(), role: "assistant", kind: "response", project: workspace, source: "scheduler-final" });
-      await this.send(task.owner, `✅ ${task.title}${response.trim() ? `\n\n${response.trim()}` : ""}`);
+      if (polishedResponse) await this.memory.record({ owner: task.owner, body: polishedResponse, role: "assistant", kind: "response", project: workspace, source: "scheduler-final" });
+      await this.send(task.owner, `✅ ${task.title}${polishedResponse ? `\n\n${polishedResponse}` : ""}`);
     } catch (error) {
       logInternalError(`Scheduled task ${task.id} failed`, error);
-      const message = publicErrorMessage("scheduled-task");
-      this.database.updateTask(task.id, { status: "waiting", error: message });
-      await this.send(task.owner, `❌ ${task.title}\n\n${message}`);
+      const internalMessage = error instanceof Error ? error.message : String(error);
+      this.database.updateTask(task.id, { status: "waiting", error: internalMessage });
+      await this.send(task.owner, `❌ ${task.title}\n\n${publicErrorMessage("scheduled-task")}`);
     }
   }
 
@@ -132,13 +137,13 @@ export class BackgroundScheduler {
       !generatedWorkspace(thread.workspace) && !internalAssistantWorkspace(thread.workspace, this.configuration.dataDirectory)
       && !internalWorkThread(thread))) : [];
     const groups = groupActiveWork(mergeActiveWork(tasks, visibleThreads, this.configuration.projectAliases, excluded));
-    return morningDigestText({
+    return this.polishContent(morningDigestText({
       weather: weather.status === "fulfilled" ? weather.value : `🌦 Погода · ${this.configuration.weatherLocation}\nНе удалось получить прогноз.`,
       calendar: calendar.status === "fulfilled" ? calendar.value : undefined,
       groups,
       inbox,
       tasks,
-    });
+    }));
   }
 
   private async sendEveningSummary(owner: string): Promise<void> {
@@ -155,7 +160,7 @@ export class BackgroundScheduler {
     const dryDigest = localDailyDigest(tasks, events, this.configuration.projectAliases, journal);
     const completionEvidence = dailyCompletionEvidence(tasks, journal, this.configuration.projectAliases);
     const digest = await this.polishDailyDigest(owner, dryDigest, completionEvidence);
-    await this.send(owner, dailyReport(digest, since));
+    await this.send(owner, await this.polishContent(dailyReport(digest, since)));
   }
 
   private async polishDailyDigest(owner: string, dryDigest: string, completionEvidence: string): Promise<string> {
@@ -199,6 +204,16 @@ export class BackgroundScheduler {
 
   private async send(owner: string, text: string): Promise<void> {
     await sendTelegramMarkdown(this.bot.api, owner, text);
+  }
+
+  private async polishContent(source: string): Promise<string> {
+    if (!source.trim()) return source;
+    try {
+      return await this.textEditor.polishAssistantResponse(source);
+    } catch (error) {
+      logInternalError("Scheduled final Codex editorial pass failed; using original text", error);
+      return source;
+    }
   }
 }
 

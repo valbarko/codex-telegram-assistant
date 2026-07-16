@@ -369,7 +369,7 @@ export class TelegramApplication {
           return;
         }
         await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, formatPlainTranscript(raw));
+        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, await this.formatSourceText(raw));
         return;
       }
       await this.memory.record({ owner: ownerId(ctx), body: raw, role: "user", kind: "voice", project: this.memoryProject(ctx), source: sender ? `telegram-voice:${sender}` : "telegram-voice" });
@@ -394,9 +394,7 @@ export class TelegramApplication {
       const command = parseSpokenVoiceCommand(raw);
       if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id)) return;
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-      for (const part of htmlChunks(formatVoiceTranscript(command.content, "direct"), TELEGRAM_LIMIT)) {
-        await ctx.reply(part);
-      }
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
     } catch (error) {
       console.error("Voice transcription failed", error);
       await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, publicTranscriptionErrorMessage(error)).catch(() => undefined);
@@ -440,8 +438,9 @@ export class TelegramApplication {
     }
     try {
       if (fragments.length === 1) {
+        const formatted = await this.formatSourceText(target.transcript);
         if (activeProgressId !== undefined) await this.bot.api.deleteMessage(target.chatId, activeProgressId).catch(() => undefined);
-        for (const part of htmlChunks(formatVoiceTranscript(target.transcript, "forwarded",
+        for (const part of htmlChunks(formatVoiceTranscript(formatted, "forwarded",
           { sender: target.sender, sentAt: target.sentAt }), TELEGRAM_LIMIT)) {
           await this.bot.api.sendMessage(target.chatId, part, telegramHtmlOptions(target.messageThreadId));
         }
@@ -533,9 +532,7 @@ export class TelegramApplication {
     }
     if (command.kind === "transcript") {
       await clearProgress();
-      for (const part of htmlChunks(structureTranscript(command.content, { sender, sentAt }), TELEGRAM_LIMIT)) {
-        await ctx.reply(part, { parse_mode: "HTML" });
-      }
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
       return true;
     }
     if (command.kind === "task" || command.kind === "reminder" || command.kind === "inbox" || command.kind === "memory" || command.kind === "calendar") {
@@ -661,22 +658,34 @@ export class TelegramApplication {
     });
   }
 
+  private async formatPersonalText(source: string): Promise<string> {
+    try {
+      return await this.restrictedTextEditor.formatPersonalText(source);
+    } catch (error) {
+      logInternalError("Personal text editing failed; using deterministic formatting", error);
+      return formatPlainTranscript(source);
+    }
+  }
+
+  private async formatSourceText(source: string): Promise<string> {
+    try {
+      return await this.restrictedTextEditor.formatText(source);
+    } catch (error) {
+      logInternalError("Source text editing failed; using deterministic formatting", error);
+      return formatPlainTranscript(source);
+    }
+  }
+
   private async restrictedTextMessage(ctx: Context): Promise<void> {
     const source = ctx.message?.text?.trim();
     if (!source || !ctx.chat) return;
     const progress = await ctx.reply("✍️ Оформляю текст…");
     try {
-      let result: string;
-      try {
-        result = await this.restrictedTextEditor.formatText(source);
-      } catch (error) {
-        console.error("Restricted text editing failed", error);
-        result = formatPlainTranscript(source);
-      }
+      const result = await this.formatSourceText(source);
       await ctx.api.deleteMessage(ctx.chat.id, progress.message_id).catch(() => undefined);
       await this.sendRestrictedResult(ctx.chat.id, ctx.message?.message_thread_id, result);
     } catch (error) {
-      logInternalError("Restricted text formatting failed", error);
+      logInternalError("Restricted text delivery failed", error);
       await ctx.api.editMessageText(ctx.chat.id, progress.message_id, publicErrorMessage("text-formatting")).catch(() => undefined);
     }
   }
@@ -821,16 +830,27 @@ export class TelegramApplication {
   private async executePrompt(ctx: Context, prompt: string): Promise<void> {
     const conversation = await this.conversation(ctx);
     const view = new TelegramTurnView(ctx, (request) => this.askApproval(ctx, request),
-      (request) => this.askUserInput(ctx, request), this.configuration.showUsage);
+      (request) => this.askUserInput(ctx, request), this.configuration.showUsage, false);
     try {
+      await view.start();
       await conversation.run(prompt, view);
-      await view.finish();
+      const answer = await this.polishAssistantResponse(view.content());
+      await view.finish(answer);
       this.persist(ctx, conversation);
-      const answer = view.content();
       if (answer) await this.memory.record({ owner: ownerId(ctx), body: answer, role: "assistant", kind: "response", project: conversation.snapshot().workspace, source: "codex-final" });
     } catch (error) {
       logInternalError("Codex request failed", error);
       await view.fail();
+    }
+  }
+
+  private async polishAssistantResponse(source: string): Promise<string> {
+    if (!source.trim()) return source;
+    try {
+      return await this.restrictedTextEditor.polishAssistantResponse(source);
+    } catch (error) {
+      logInternalError("Final Codex editorial pass failed; using original answer", error);
+      return source;
     }
   }
 
@@ -1353,11 +1373,12 @@ export class TelegramTurnView implements TurnObserver {
     readonly approval: (prompt: ApprovalPrompt) => Promise<ApprovalChoice>,
     readonly userInput: (prompt: UserInputPrompt) => Promise<UserInputAnswers>,
     private readonly showUsage: boolean,
+    private readonly publishDrafts = true,
   ) {}
 
   text(delta: string): void {
     this.answer += delta;
-    this.schedule();
+    if (this.publishDrafts) this.schedule();
   }
   toolStarted(_id: string, _label: string): void {}
   toolProgress(_id: string, _delta: string): void {}
@@ -1369,15 +1390,21 @@ export class TelegramTurnView implements TurnObserver {
 
   content(): string { return this.answer.trim(); }
 
-  async finish(): Promise<void> {
+  async start(): Promise<void> {
+    if (this.messageId !== undefined) return;
+    const message = await this.ctx.reply("✍️ Привожу ответ в порядок…");
+    this.messageId = message.message_id;
+  }
+
+  async finish(answer?: string): Promise<void> {
     this.cancelTimer();
+    if (answer !== undefined) this.answer = answer;
     await this.requestFlush(true);
   }
 
   async fail(): Promise<void> {
     this.cancelTimer();
-    const message = publicErrorMessage("request");
-    this.answer = this.answer ? `${this.answer}\n\n${message}` : message;
+    this.answer = publicErrorMessage("request");
     await this.requestFlush(true);
   }
 

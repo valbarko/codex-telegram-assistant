@@ -59,6 +59,38 @@ describe("TelegramTurnView", () => {
     expect(editMessageText).not.toHaveBeenCalled();
   });
 
+  it("replaces the streamed draft with the final editorial result", async () => {
+    vi.useFakeTimers();
+    const reply = vi.fn(async () => ({ message_id: 9 }));
+    const editMessageText = vi.fn(async () => true);
+    const ctx = { chat: { id: 7 }, reply, api: { editMessageText } };
+    const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false);
+
+    view.text("сырой ответ");
+    await vi.advanceTimersByTimeAsync(0);
+    await view.finish("**Готовый ответ**");
+
+    expect(reply).toHaveBeenCalledWith("сырой ответ", { parse_mode: "HTML" });
+    expect(editMessageText).toHaveBeenLastCalledWith(7, 9, "<b>Готовый ответ</b>", { parse_mode: "HTML" });
+  });
+
+  it("keeps an unedited draft hidden until the final editorial pass", async () => {
+    const reply = vi.fn(async () => ({ message_id: 9 }));
+    const editMessageText = vi.fn(async () => true);
+    const ctx = { chat: { id: 7 }, reply, api: { editMessageText } };
+    const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false, false);
+
+    await view.start();
+    view.text("сырой внутренний черновик");
+    expect(editMessageText).not.toHaveBeenCalled();
+
+    await view.finish("**Финальный ответ**");
+
+    expect(reply).toHaveBeenCalledWith("✍️ Привожу ответ в порядок…");
+    expect(editMessageText).toHaveBeenCalledOnce();
+    expect(editMessageText).toHaveBeenCalledWith(7, 9, "<b>Финальный ответ</b>", { parse_mode: "HTML" });
+  });
+
   it("never exposes a system exception in a failed streamed answer", async () => {
     const reply = vi.fn(async () => ({ message_id: 9 }));
     const ctx = { chat: { id: 7 }, reply, api: { editMessageText: vi.fn(async () => true) } };
