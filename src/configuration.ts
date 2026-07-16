@@ -24,6 +24,11 @@ export interface AppConfiguration {
   weatherLocation: string;
   weatherLatitude: number;
   weatherLongitude: number;
+  mediaDownloaderExecutable: string;
+  ffmpegExecutable: string;
+  mediaSummaryMaxDurationSeconds: number;
+  mediaCookiesFromBrowser?: string;
+  mediaCookiesFile?: string;
   defaultModel?: string;
   defaultProfile: string;
   profiles: readonly ExecutionProfile[];
@@ -50,6 +55,11 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
   if (!profiles.some((profile) => profile.id === defaultProfile)) {
     throw new Error(`Unknown ASSISTANT_DEFAULT_PROFILE: ${defaultProfile}`);
   }
+  const mediaCookiesFromBrowser = optional(env.MEDIA_COOKIES_FROM_BROWSER);
+  const mediaCookiesFile = optional(env.MEDIA_COOKIES_FILE);
+  if (mediaCookiesFromBrowser && mediaCookiesFile) {
+    throw new Error("Set only one of MEDIA_COOKIES_FROM_BROWSER and MEDIA_COOKIES_FILE");
+  }
   return {
     telegramToken,
     allowedUsers,
@@ -63,6 +73,12 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     weatherLocation: optional(env.WEATHER_LOCATION) || "Москва",
     weatherLatitude: parseCoordinate(env.WEATHER_LATITUDE, 55.7558, -90, 90, "WEATHER_LATITUDE"),
     weatherLongitude: parseCoordinate(env.WEATHER_LONGITUDE, 37.6173, -180, 180, "WEATHER_LONGITUDE"),
+    mediaDownloaderExecutable: optional(env.MEDIA_DOWNLOADER_BIN) || "yt-dlp",
+    ffmpegExecutable: optional(env.FFMPEG_BIN) || "ffmpeg",
+    mediaSummaryMaxDurationSeconds: parsePositiveInteger(env.MEDIA_SUMMARY_MAX_DURATION_SECONDS, 6 * 60 * 60,
+      "MEDIA_SUMMARY_MAX_DURATION_SECONDS"),
+    mediaCookiesFromBrowser,
+    mediaCookiesFile: mediaCookiesFile ? path.resolve(mediaCookiesFile) : undefined,
     defaultModel: optional(env.CODEX_MODEL),
     defaultProfile,
     profiles,
@@ -149,6 +165,12 @@ function isApprovals(value: unknown): value is ApprovalPolicy {
 function parseByteLimit(value: string | undefined): number {
   const parsed = Number(value ?? 20 * 1024 * 1024);
   if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error("MAX_UPLOAD_BYTES must be a positive integer");
+  return parsed;
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number, key: string): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${key} must be a positive integer`);
   return parsed;
 }
 

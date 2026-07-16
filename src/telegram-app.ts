@@ -14,6 +14,7 @@ import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
 import { ForwardedVoiceBatcher, ForwardedVoiceEditor, forwardedVoiceHeading,
   type ForwardedVoiceBatch, type ForwardedVoiceFragment } from "./forwarded-voice.js";
 import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, appendAppleNote, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
+import { MediaSummaryService, parseSupportedMediaUrl, type MediaSummaryProgress } from "./media-summary.js";
 import { MemoryService, type RecallHit } from "./memory-service.js";
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
@@ -62,6 +63,7 @@ export class TelegramApplication {
   private readonly forwardedVoiceBatcher: ForwardedVoiceBatcher;
   private readonly restrictedForwardedVoiceBatcher: ForwardedVoiceBatcher;
   private readonly restrictedTextEditor: EphemeralTextEditor;
+  private readonly mediaSummary: MediaSummaryService;
   private readonly forwardedVoiceFlushes = new Map<string, Promise<void>>();
 
   constructor(
@@ -76,6 +78,7 @@ export class TelegramApplication {
     this.forwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueForwardedVoiceBatch(batch));
     this.restrictedForwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueRestrictedForwardedVoiceBatch(batch));
     this.restrictedTextEditor = new EphemeralTextEditor(configuration);
+    this.mediaSummary = new MediaSummaryService(configuration, this.restrictedTextEditor);
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
     this.install();
@@ -106,6 +109,7 @@ export class TelegramApplication {
       { command: "memory_pause", description: "Приостановить или включить память" },
       { command: "memory_export", description: "Экспорт долговременной памяти" },
       { command: "voice", description: "Метки для текста и голосовых" },
+      { command: "summary", description: "Конспект YouTube, RuTube или VK Видео" },
       { command: "story", description: "Выбрать цикл рассказов" },
       { command: "search", description: "Поиск по рабочей памяти" },
       { command: "launch_profiles", description: "Профиль разрешений" },
@@ -172,7 +176,7 @@ export class TelegramApplication {
         "<b>Основное</b>", "/home · /task · /tasks · /inbox", "",
         "<b>Codex</b>", "/chat · /new · /sessions · /session · /rename · /fork · /archive · /abort", "",
         "<b>Ассистент</b>", "/remind · /reminders · /remember · /memory · /recall · /about_me", "",
-        "<b>Голосовые тексты</b>", "/voice · /story", "",
+        "<b>Голосовые тексты и видео</b>", "/voice · /story · /summary", "",
         "<b>Память</b>", "/memory_status · /memory_pause · /memory_export · /forget", "",
         "<b>Mac</b>", "/calendar · /event · /draft · /mac", "",
         "<b>Автоматизация</b>", "/schedule · /digest", "",
@@ -196,6 +200,14 @@ export class TelegramApplication {
     this.bot.command("memory_pause", async (ctx) => this.toggleMemory(ctx));
     this.bot.command("memory_export", async (ctx) => this.exportMemory(ctx));
     this.bot.command("voice", async (ctx) => this.voiceCommand(ctx));
+    this.bot.command("summary", async (ctx) => {
+      const sourceUrl = parseSupportedMediaUrl(typeof ctx.match === "string" ? ctx.match : "");
+      if (!sourceUrl) {
+        await ctx.reply("Отправьте команду со ссылкой на YouTube, RuTube или VK Видео:\n/summary https://youtu.be/…");
+        return;
+      }
+      await this.mediaSummaryMessage(ctx, sourceUrl);
+    });
     this.bot.command("story", async (ctx) => this.storyCommand(ctx));
 
     this.bot.command("chat", async (ctx) => {
@@ -692,6 +704,12 @@ export class TelegramApplication {
       await this.acceptPending(ctx, pending, text);
       return;
     }
+    const mediaUrl = parseSupportedMediaUrl(text);
+    if (mediaUrl) {
+      await this.rememberIncoming(ctx, text, "action");
+      await this.mediaSummaryMessage(ctx, mediaUrl);
+      return;
+    }
     if (ctx.message?.forward_origin) {
       await this.rememberIncoming(ctx, text);
       const source = forwardedSource(ctx);
@@ -729,6 +747,30 @@ export class TelegramApplication {
       return;
     }
     await this.executePrompt(ctx, routed);
+  }
+
+  private async mediaSummaryMessage(ctx: Context, sourceUrl: string): Promise<void> {
+    if (!ctx.chat) return;
+    const progress = await ctx.reply("🔎 Проверяю видео…");
+    let lastStatus = "";
+    const updateProgress = async (state: MediaSummaryProgress): Promise<void> => {
+      const status = mediaSummaryProgressText(state);
+      if (status === lastStatus) return;
+      lastStatus = status;
+      await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, status).catch(() => undefined);
+    };
+    try {
+      const result = await this.mediaSummary.summarize(sourceUrl, updateProgress);
+      await ctx.api.deleteMessage(ctx.chat.id, progress.message_id).catch(() => undefined);
+      await sendTelegramMarkdown(ctx.api, ctx.chat.id, result.markdown, TELEGRAM_LIMIT - 100);
+      await this.memory.record({
+        owner: ownerId(ctx), body: result.markdown, role: "assistant", kind: "response",
+        project: this.memoryProject(ctx), source: "media-summary",
+      });
+    } catch (error) {
+      await ctx.api.editMessageText(ctx.chat.id, progress.message_id,
+        `Не удалось подготовить конспект: ${errorMessage(error)}`).catch(() => undefined);
+    }
   }
 
   private async handleLocalIntent(ctx: Context, text: string): Promise<boolean> {
@@ -1378,6 +1420,13 @@ function taskKeyboard(task: WorkItem): InlineKeyboard { return new InlineKeyboar
 function captureKeyboard(id: string): InlineKeyboard { return new InlineKeyboard().text("✅ Задача", `capture:task:${id}`).row().text("📚 В память", `capture:memory:${id}`).text("🗑", `capture:drop:${id}`); }
 function taskCard(task: WorkItem): string { return `<b>${taskIcon(task.status)} ${escape(task.title)}</b>\nСтатус: ${escape(task.status)}${task.projectLabel ? `\nПроект: ${escape(task.projectLabel)}` : ""}`; }
 function captureCard(item: CapturedItem): string { return `<b>📥 Добавлено в инбокс</b>${item.sender ? `\nОт: ${escape(item.sender)}` : ""}\n\n${escape(oneLine(item.body, 700))}`; }
+function mediaSummaryProgressText(progress: MediaSummaryProgress): string {
+  if (progress.stage === "inspect") return "🔎 Проверяю видео…";
+  if (progress.stage === "download") return "⬇️ Загружаю аудиодорожку…";
+  if (progress.stage === "prepare") return "🎛 Готовлю длинное аудио к распознаванию…";
+  if (progress.stage === "transcribe") return `🎙 Расшифровываю фрагмент ${progress.current ?? 1} из ${progress.total ?? 1}…`;
+  return "🧠 Собираю личный конспект…";
+}
 function voiceModeLabel(settings: VoiceWritingSettings): string {
   if (settings.mode === "diary") return "Дневник";
   if (settings.mode === "story") return `Рассказы · ${settings.storyTitle ?? "без названия"}`;
