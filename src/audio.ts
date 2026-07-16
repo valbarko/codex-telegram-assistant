@@ -26,16 +26,18 @@ export interface TranscriptionOptions {
   /** `null` enables Whisper language auto-detection. The default preserves the existing Russian voice-message behavior. */
   language?: string | null;
   timeoutMs?: number;
+  python?: string;
+  model?: string;
 }
 
-export async function transcribeAudio(file: string): Promise<string> {
-  return (await transcribeAudioDetailed(file)).text;
+export async function transcribeAudio(file: string, options: TranscriptionOptions = {}): Promise<string> {
+  return (await transcribeAudioDetailed(file, options)).text;
 }
 
 export async function transcribeAudioDetailed(file: string, options: TranscriptionOptions = {}): Promise<AudioTranscript> {
   const localPython = path.join(process.cwd(), ".venv", "bin", "python");
-  const python = process.env.WHISPER_PYTHON?.trim() || (existsSync(localPython) ? localPython : "python3");
-  const model = process.env.WHISPER_MODEL?.trim() || DEFAULT_MODEL;
+  const python = options.python?.trim() || process.env.WHISPER_PYTHON?.trim() || (existsSync(localPython) ? localPython : "python3");
+  const model = options.model?.trim() || process.env.WHISPER_MODEL?.trim() || DEFAULT_MODEL;
   const language = options.language === undefined ? "ru" : options.language;
   const program = [
     "import json,sys",

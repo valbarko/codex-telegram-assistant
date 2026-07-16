@@ -20,7 +20,7 @@ import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, ty
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
 import { isTranscriptionMedia, isTranscriptionText, telegramAccessMode } from "./telegram-access.js";
-import { transcriptionCopyPresentation } from "./telegram-copy.js";
+import { publicTranscriptionErrorMessage, transcriptionCopyPresentation } from "./telegram-copy.js";
 import { renderTelegramMarkdown, sendTelegramMarkdown, telegramMarkdownChunks } from "./telegram-markdown.js";
 import { isStyleWritingKind, parseSpokenVoiceCommand, VoiceWritingArchive, VoiceWritingEditor,
   type EditedVoiceEntry, type SpokenVoiceCommand } from "./voice-writing.js";
@@ -339,7 +339,10 @@ export class TelegramApplication {
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (bytes.byteLength > this.configuration.maxUploadBytes) throw new Error("Файл превышает допустимый размер");
       await writeFile(target, bytes);
-      const raw = await transcribeAudio(target);
+      const raw = await transcribeAudio(target, {
+        python: this.configuration.whisperPython,
+        model: this.configuration.whisperModel,
+      });
       const forwarded = forwardedSource(ctx);
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : Date.now());
@@ -392,8 +395,8 @@ export class TelegramApplication {
         await ctx.reply(part, { parse_mode: "HTML" });
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, `Не удалось расшифровать: ${message}`).catch(() => undefined);
+      console.error("Voice transcription failed", error);
+      await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, publicTranscriptionErrorMessage(error)).catch(() => undefined);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

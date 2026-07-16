@@ -29,6 +29,8 @@ export interface AppConfiguration {
   mediaSummaryMaxDurationSeconds: number;
   mediaCookiesFromBrowser?: string;
   mediaCookiesFile?: string;
+  whisperPython?: string;
+  whisperModel?: string;
   defaultModel?: string;
   defaultProfile: string;
   profiles: readonly ExecutionProfile[];
@@ -79,6 +81,8 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
       "MEDIA_SUMMARY_MAX_DURATION_SECONDS"),
     mediaCookiesFromBrowser,
     mediaCookiesFile: mediaCookiesFile ? path.resolve(mediaCookiesFile) : undefined,
+    whisperPython: optional(env.WHISPER_PYTHON),
+    whisperModel: optional(env.WHISPER_MODEL),
     defaultModel: optional(env.CODEX_MODEL),
     defaultProfile,
     profiles,
