@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseEventKitCalendar, shortcutDateInput } from "../src/mac-bridge.js";
+import { calendarReadAccessGranted, parseEventKitCalendar, shortcutDateInput } from "../src/mac-bridge.js";
 
 describe("system alarm shortcut input", () => {
   it("passes an unambiguous local date and time to Shortcuts", () => {
@@ -10,6 +10,13 @@ describe("system alarm shortcut input", () => {
 });
 
 describe("Apple Calendar EventKit output", () => {
+  it("requires full access and rejects modern write-only access", () => {
+    expect(calendarReadAccessGranted(3)).toBe(true);
+    expect(calendarReadAccessGranted(4)).toBe(false);
+    expect(calendarReadAccessGranted(5)).toBe(false);
+    expect(calendarReadAccessGranted(0)).toBe(false);
+  });
+
   it("formats timed and all-day events in Moscow time", () => {
     const rows = parseEventKitCalendar(JSON.stringify([
       { title: "Тренировка", start: Date.parse("2026-07-15T10:00:00+03:00"), allDay: false, calendar: "Работа" },

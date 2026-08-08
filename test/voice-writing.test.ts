@@ -70,6 +70,9 @@ describe("voice writing", () => {
       kind: "calendar", content: "19:00 четверг Концерт", label: "календарь",
     });
     expect(parseSpokenVoiceCommand("Задача подготовить отчёт")).toMatchObject({ kind: "task", content: "подготовить отчёт" });
+    expect(parseSpokenVoiceCommand("Задачи ГМК — отчёт; ТВК — регистрация")).toMatchObject({
+      kind: "task", content: "ГМК — отчёт; ТВК — регистрация", label: "задачи",
+    });
     expect(parseSpokenVoiceCommand("Пост мой первый день в новом зале")).toEqual({
       kind: "post", content: "мой первый день в новом зале", label: "пост",
     });

@@ -56,7 +56,7 @@ export interface MemoryNote {
 }
 
 export type MemoryRole = "user" | "assistant" | "action";
-export type MemoryKind = "message" | "voice" | "response" | "action" | "explicit";
+export type MemoryKind = "message" | "voice" | "response" | "action" | "explicit" | "document";
 
 export interface MemoryEvent {
   id: string;
@@ -71,6 +71,11 @@ export interface MemoryEvent {
   deletedAt?: number;
 }
 
+export interface MemoryEventUpsertResult {
+  event: MemoryEvent;
+  status: "created" | "updated" | "unchanged" | "forgotten";
+}
+
 export interface MemoryStatus {
   paused: boolean;
   active: number;
@@ -78,6 +83,44 @@ export interface MemoryStatus {
   global: number;
   project: number;
 }
+
+export type PersonalFactCategory =
+  | "identity"
+  | "location"
+  | "education"
+  | "work"
+  | "project"
+  | "interest"
+  | "preference"
+  | "value"
+  | "relationship"
+  | "health"
+  | "goal"
+  | "style"
+  | "other";
+
+export type PersonalFactStatus = "current" | "historical" | "uncertain" | "superseded";
+
+export interface PersonalFact {
+  id: string;
+  owner: string;
+  category: PersonalFactCategory;
+  statement: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  status: PersonalFactStatus;
+  confidence: number;
+  source?: string;
+  evidenceMemoryId?: string;
+  validFrom?: number;
+  validTo?: number;
+  observedAt: number;
+  createdAt: number;
+  changedAt: number;
+}
+
+export interface UpsertPersonalFactInput extends Omit<PersonalFact, "createdAt" | "changedAt"> {}
 
 export type VoiceWritingMode = "transcript" | "diary" | "story";
 
@@ -240,15 +283,49 @@ export class AssistantDatabase {
   }
 
   recordMemoryEvent(input: Pick<MemoryEvent, "owner" | "namespace" | "role" | "kind" | "body"> &
-    Partial<Pick<MemoryEvent, "project" | "source">>): MemoryEvent {
+    Partial<Pick<MemoryEvent, "project" | "source" | "createdAt">>): MemoryEvent {
     const event: MemoryEvent = {
       id: randomUUID(), owner: input.owner, namespace: input.namespace, project: input.project,
-      role: input.role, kind: input.kind, body: input.body.trim(), source: input.source, createdAt: Date.now(),
+      role: input.role, kind: input.kind, body: input.body.trim(), source: input.source, createdAt: input.createdAt ?? Date.now(),
     };
     if (!event.body) throw new Error("Memory event body is required");
     this.sql.prepare(`INSERT INTO memory_events(id,owner,namespace,project,role,kind,body,source,created_at,deleted_at)
       VALUES(@id,@owner,@namespace,@project,@role,@kind,@body,@source,@createdAt,NULL)`).run(nullable(event));
     return event;
+  }
+
+  upsertMemoryEventBySource(input: Pick<MemoryEvent,
+    "owner" | "namespace" | "role" | "kind" | "body" | "source" | "createdAt"> &
+    Partial<Pick<MemoryEvent, "project">>): MemoryEventUpsertResult {
+    const source = input.source?.trim();
+    const body = input.body.trim();
+    if (!source) throw new Error("Memory event source is required");
+    if (!body) throw new Error("Memory event body is required");
+    const existing = mapMemoryEvent(this.sql.prepare(
+      "SELECT * FROM memory_events WHERE owner=? AND source=? ORDER BY created_at DESC LIMIT 1",
+    ).get(input.owner, source));
+    if (!existing) {
+      return { event: this.recordMemoryEvent({ ...input, source, body }), status: "created" };
+    }
+    if (existing.deletedAt) return { event: existing, status: "forgotten" };
+    const changed = existing.namespace !== input.namespace ||
+      existing.project !== input.project ||
+      existing.role !== input.role ||
+      existing.kind !== input.kind ||
+      existing.body !== body ||
+      existing.createdAt !== input.createdAt;
+    if (!changed) return { event: existing, status: "unchanged" };
+    this.sql.prepare(`UPDATE memory_events SET namespace=@namespace,project=@project,role=@role,kind=@kind,
+      body=@body,created_at=@createdAt WHERE id=@id`).run(nullable({
+      id: existing.id,
+      namespace: input.namespace,
+      project: input.project,
+      role: input.role,
+      kind: input.kind,
+      body,
+      createdAt: input.createdAt,
+    }));
+    return { event: this.memoryEvent(existing.id)!, status: "updated" };
   }
 
   memoryEvent(id: string): MemoryEvent | undefined {
@@ -263,7 +340,7 @@ export class AssistantDatabase {
 
   reportExcludedMemoryEvents(): MemoryEvent[] {
     return this.sql.prepare(`SELECT * FROM memory_events WHERE deleted_at IS NULL AND
-      (source='telegram-voice' OR source LIKE 'telegram-voice:%' OR source='forwarded-voice-batch' OR source='daily-summary')
+      (source LIKE 'telegram-forwarded-voice:%' OR source='forwarded-voice-batch' OR source='daily-summary')
       ORDER BY created_at`).all().map(mapMemoryEvent).filter(present);
   }
 
@@ -319,6 +396,58 @@ export class AssistantDatabase {
       }
     }
     return result;
+  }
+
+  upsertPersonalFact(input: UpsertPersonalFactInput): PersonalFact {
+    const existing = mapPersonalFact(this.sql.prepare("SELECT * FROM personal_facts WHERE id=?").get(input.id));
+    if (existing && existing.owner !== input.owner) throw new Error("Personal fact belongs to another owner");
+    const now = Date.now();
+    const fact: PersonalFact = {
+      ...input,
+      id: input.id.trim(),
+      owner: input.owner.trim(),
+      category: input.category,
+      statement: input.statement.trim(),
+      subject: input.subject.trim(),
+      predicate: input.predicate.trim(),
+      object: input.object.trim(),
+      confidence: Math.max(0, Math.min(1, input.confidence)),
+      source: input.source?.trim() || undefined,
+      evidenceMemoryId: input.evidenceMemoryId?.trim() || undefined,
+      validFrom: input.validFrom,
+      validTo: input.validTo,
+      createdAt: existing?.createdAt ?? now,
+      changedAt: now,
+    };
+    if (!fact.id || !fact.owner || !fact.statement || !fact.subject || !fact.predicate || !fact.object) {
+      throw new Error("Personal fact id, owner, statement, subject, predicate and object are required");
+    }
+    if (fact.validFrom !== undefined && fact.validTo !== undefined && fact.validTo < fact.validFrom) {
+      throw new Error("Personal fact validTo cannot precede validFrom");
+    }
+    this.sql.prepare(`INSERT INTO personal_facts(
+      id,owner,category,statement,subject,predicate,object_value,status,confidence,source,evidence_memory_id,
+      valid_from,valid_to,observed_at,created_at,changed_at
+    ) VALUES(
+      @id,@owner,@category,@statement,@subject,@predicate,@object,@status,@confidence,@source,@evidenceMemoryId,
+      @validFrom,@validTo,@observedAt,@createdAt,@changedAt
+    ) ON CONFLICT(id) DO UPDATE SET
+      category=excluded.category,statement=excluded.statement,subject=excluded.subject,predicate=excluded.predicate,
+      object_value=excluded.object_value,status=excluded.status,confidence=excluded.confidence,source=excluded.source,
+      evidence_memory_id=excluded.evidence_memory_id,valid_from=excluded.valid_from,valid_to=excluded.valid_to,
+      observed_at=excluded.observed_at,changed_at=excluded.changed_at`).run(nullable(fact));
+    return this.personalFact(fact.id)!;
+  }
+
+  personalFact(id: string): PersonalFact | undefined {
+    return mapPersonalFact(this.sql.prepare("SELECT * FROM personal_facts WHERE id=?").get(id));
+  }
+
+  personalFacts(owner: string, options: { includeSuperseded?: boolean; limit?: number } = {}): PersonalFact[] {
+    const superseded = options.includeSuperseded ? "" : " AND status<>'superseded'";
+    return this.sql.prepare(`SELECT * FROM personal_facts WHERE owner=?${superseded}
+      ORDER BY CASE status WHEN 'current' THEN 0 WHEN 'historical' THEN 1 WHEN 'uncertain' THEN 2 ELSE 3 END,
+      confidence DESC, observed_at DESC LIMIT ?`).all(owner, options.limit ?? 200).map(mapPersonalFact).filter(present);
   }
 
   createAlarm(input: Pick<Alarm, "owner" | "label" | "nextAt"> & Partial<Pick<Alarm, "cadence" | "mode" | "prompt" | "project">>): Alarm {
@@ -386,6 +515,25 @@ export class AssistantDatabase {
       CREATE TABLE IF NOT EXISTS memory_events(id TEXT PRIMARY KEY, owner TEXT NOT NULL, namespace TEXT NOT NULL, project TEXT, role TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, source TEXT, created_at INTEGER NOT NULL, deleted_at INTEGER);
       CREATE INDEX IF NOT EXISTS memory_event_owner_scope ON memory_events(owner,namespace,project,created_at);
       CREATE TABLE IF NOT EXISTS memory_settings(owner TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0, changed_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS personal_facts(
+        id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        category TEXT NOT NULL,
+        statement TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        predicate TEXT NOT NULL,
+        object_value TEXT NOT NULL,
+        status TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        source TEXT,
+        evidence_memory_id TEXT,
+        valid_from INTEGER,
+        valid_to INTEGER,
+        observed_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        changed_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS personal_fact_owner_status ON personal_facts(owner,status,category,changed_at);
       CREATE TABLE IF NOT EXISTS voice_writing_settings(context TEXT PRIMARY KEY, owner TEXT NOT NULL, mode TEXT NOT NULL, story_title TEXT, changed_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS alarms(id TEXT PRIMARY KEY, owner TEXT NOT NULL, label TEXT NOT NULL, next_at INTEGER NOT NULL, cadence TEXT NOT NULL, mode TEXT NOT NULL, prompt TEXT, project TEXT, enabled INTEGER NOT NULL);
     `);
@@ -440,6 +588,28 @@ function mapMemoryEvent(row: unknown): MemoryEvent | undefined {
     id: str(r.id), owner: str(r.owner), namespace: str(r.namespace) as MemoryEvent["namespace"], project: maybe(r.project),
     role: str(r.role) as MemoryRole, kind: str(r.kind) as MemoryKind, body: str(r.body), source: maybe(r.source),
     createdAt: Number(r.created_at), deletedAt: num(r.deleted_at),
+  };
+}
+
+function mapPersonalFact(row: unknown): PersonalFact | undefined {
+  const r = object(row); if (!r) return undefined;
+  return {
+    id: str(r.id),
+    owner: str(r.owner),
+    category: str(r.category) as PersonalFactCategory,
+    statement: str(r.statement),
+    subject: str(r.subject),
+    predicate: str(r.predicate),
+    object: str(r.object_value),
+    status: str(r.status) as PersonalFactStatus,
+    confidence: Number(r.confidence),
+    source: maybe(r.source),
+    evidenceMemoryId: maybe(r.evidence_memory_id),
+    validFrom: num(r.valid_from),
+    validTo: num(r.valid_to),
+    observedAt: Number(r.observed_at),
+    createdAt: Number(r.created_at),
+    changedAt: Number(r.changed_at),
   };
 }
 

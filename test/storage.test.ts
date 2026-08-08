@@ -52,12 +52,74 @@ describe("AssistantDatabase", () => {
     expect(database.memoryStatus("1")).toMatchObject({ active: 1, deleted: 1, paused: true });
   });
 
+  it("updates an imported memory event by stable source without resurrecting forgotten content", () => {
+    const first = database.upsertMemoryEventBySource({
+      owner: "1", namespace: "global", role: "user", kind: "document",
+      body: "Первая версия", source: "apple-notes:abc", createdAt: 100,
+    });
+    const unchanged = database.upsertMemoryEventBySource({
+      owner: "1", namespace: "global", role: "user", kind: "document",
+      body: "Первая версия", source: "apple-notes:abc", createdAt: 100,
+    });
+    const updated = database.upsertMemoryEventBySource({
+      owner: "1", namespace: "global", role: "user", kind: "document",
+      body: "Вторая версия", source: "apple-notes:abc", createdAt: 200,
+    });
+
+    expect(first.status).toBe("created");
+    expect(unchanged.status).toBe("unchanged");
+    expect(updated).toMatchObject({ status: "updated", event: { id: first.event.id, body: "Вторая версия", createdAt: 200 } });
+    database.forgetMemoryEvent("1", first.event.id);
+    expect(database.upsertMemoryEventBySource({
+      owner: "1", namespace: "global", role: "user", kind: "document",
+      body: "Третья версия", source: "apple-notes:abc", createdAt: 300,
+    }).status).toBe("forgotten");
+    expect(database.memoryEvents("1")).toEqual([]);
+  });
+
+  it("stores source-linked temporal facts for the canonical personal profile", () => {
+    const first = database.upsertPersonalFact({
+      id: "identity:name",
+      owner: "1",
+      category: "identity",
+      statement: "Имя — Валентин",
+      subject: "Валентин",
+      predicate: "has_name",
+      object: "Валентин",
+      status: "current",
+      confidence: 1,
+      source: "telegram-export:test",
+      evidenceMemoryId: "memory-1",
+      validFrom: Date.parse("2023-07-07T00:00:00Z"),
+      observedAt: Date.parse("2026-07-29T00:00:00Z"),
+    });
+    const { createdAt: _createdAt, changedAt: _changedAt, ...input } = first;
+    const updated = database.upsertPersonalFact({
+      ...input,
+      statement: "Имя владельца — Валентин",
+      confidence: 0.95,
+    });
+
+    expect(updated).toMatchObject({
+      id: "identity:name",
+      statement: "Имя владельца — Валентин",
+      confidence: 0.95,
+      evidenceMemoryId: "memory-1",
+    });
+    expect(updated.createdAt).toBe(first.createdAt);
+    expect(database.personalFacts("1")).toHaveLength(1);
+    const { createdAt: _updatedCreatedAt, changedAt: _updatedChangedAt, ...otherOwner } = updated;
+    expect(() => database.upsertPersonalFact({ ...otherOwner, owner: "2" })).toThrow("another owner");
+  });
+
   it("finds voice transcripts and generated daily summaries that must not remain in memory", () => {
-    database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "voice", body: "Чужая речь", source: "telegram-voice:Анна" });
+    database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "voice", body: "Моя речь", source: "telegram-voice" });
+    database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "voice", body: "Чужая речь", source: "telegram-forwarded-voice:Анна" });
+    database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "voice", body: "Старая собственная речь", source: "telegram-voice:Валентин" });
     database.recordMemoryEvent({ owner: "1", namespace: "global", role: "assistant", kind: "response", body: "Ошибочная сводка", source: "daily-summary" });
     database.recordMemoryEvent({ owner: "1", namespace: "global", role: "user", kind: "message", body: "Рабочая задача", source: "telegram-text" });
 
-    expect(database.reportExcludedMemoryEvents().map((event) => event.source)).toEqual(["telegram-voice:Анна", "daily-summary"]);
+    expect(database.reportExcludedMemoryEvents().map((event) => event.source)).toEqual(["telegram-forwarded-voice:Анна", "daily-summary"]);
   });
 
   it("finds task activity in a bounded day and aligns daily digests to fixed times", () => {
@@ -69,9 +131,9 @@ describe("AssistantDatabase", () => {
 
     database.createAlarm({ owner: "1", label: "Вечерний дайджест", nextAt: 10_000, cadence: "daily", mode: "digest-evening" });
     database.createAlarm({ owner: "1", label: "Утро", nextAt: 11_000, cadence: "daily", mode: "digest-morning" });
-    expect(database.alignDailyDigests(6_000, 9_000, 1_000)).toBe(2);
+    expect(database.alignDailyDigests(6_000, 6_000, 1_000)).toBe(2);
     expect(database.alarms("1").map((alarm) => [alarm.label, alarm.nextAt])).toEqual([
-      ["Итог за вчера", 6_000], ["Утренний дайджест", 9_000],
+      ["Итог за вчера", 6_000], ["Утренний дайджест", 6_000],
     ]);
   });
 

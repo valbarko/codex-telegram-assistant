@@ -13,13 +13,15 @@ import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, 
 import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
 import { ForwardedVoiceBatcher, ForwardedVoiceEditor, forwardedVoiceHeading,
   type ForwardedVoiceBatch, type ForwardedVoiceFragment } from "./forwarded-voice.js";
-import { activateCodexWithResume, addCalendarEvent, addSystemAlarm, appendAppleNote, makeMailDraft, upcomingCalendar } from "./mac-bridge.js";
+import { activateCodexWithResume, addAppleChecklistItem, addCalendarEvent, addSystemAlarm, appendAppleNote, makeMailDraft,
+  upcomingCalendar } from "./mac-bridge.js";
 import { MediaSummaryService, parseSupportedMediaUrl, type MediaSummaryProgress } from "./media-summary.js";
 import { MemoryService, type RecallHit } from "./memory-service.js";
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { logInternalError, publicErrorMessage } from "./public-errors.js";
 import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
+import { parseWorkTasks, taskChecklistText, taskSummary, WorkTaskArchive } from "./task-capture.js";
 import { isTranscriptionMedia, isTranscriptionText, telegramAccessMode } from "./telegram-access.js";
 import { publicTranscriptionErrorMessage, transcriptionCopyPresentation } from "./telegram-copy.js";
 import { markdownTelegramTransformer, markdownToPlainText, renderTelegramMarkdown, sendTelegramMarkdown,
@@ -66,6 +68,7 @@ export class TelegramApplication {
   private readonly restrictedForwardedVoiceBatcher: ForwardedVoiceBatcher;
   private readonly restrictedTextEditor: EphemeralTextEditor;
   private readonly mediaSummary: MediaSummaryService;
+  private readonly workTaskArchive: WorkTaskArchive;
   private readonly forwardedVoiceFlushes = new Map<string, Promise<void>>();
 
   constructor(
@@ -81,6 +84,7 @@ export class TelegramApplication {
     this.restrictedForwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueRestrictedForwardedVoiceBatch(batch));
     this.restrictedTextEditor = new EphemeralTextEditor(configuration);
     this.mediaSummary = new MediaSummaryService(configuration, this.restrictedTextEditor);
+    this.workTaskArchive = new WorkTaskArchive(configuration.writingArchiveDirectory);
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
     this.bot.api.config.use(markdownTelegramTransformer);
@@ -372,7 +376,14 @@ export class TelegramApplication {
         await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, await this.formatSourceText(raw));
         return;
       }
-      await this.memory.record({ owner: ownerId(ctx), body: raw, role: "user", kind: "voice", project: this.memoryProject(ctx), source: sender ? `telegram-voice:${sender}` : "telegram-voice" });
+      await this.memory.record({
+        owner: ownerId(ctx),
+        body: raw,
+        role: "user",
+        kind: "voice",
+        project: this.memoryProject(ctx),
+        source: forwarded.key ? `telegram-forwarded-voice:${sender || forwarded.key}` : "telegram-voice",
+      });
       if (forwarded.key) {
         const batchKey = `${contextId(ctx)}:${forwarded.key}`;
         const fragment: ForwardedVoiceFragment = {
@@ -538,8 +549,7 @@ export class TelegramApplication {
     if (command.kind === "task" || command.kind === "reminder" || command.kind === "inbox" || command.kind === "memory" || command.kind === "calendar") {
       await clearProgress();
       if (command.kind === "task") {
-        const task = this.database.createTask({ owner: ownerId(ctx), title: oneLine(command.content, 140), prompt: command.content });
-        await ctx.reply(taskCard(task), { parse_mode: "HTML", reply_markup: taskKeyboard(task) });
+        await this.captureWorkTasks(ctx, command.content, sentAt);
       } else if (command.kind === "reminder") {
         await this.acceptPending(ctx, "reminder", command.content);
       } else if (command.kind === "inbox") {
@@ -979,8 +989,7 @@ export class TelegramApplication {
   private async acceptPending(ctx: Context, kind: PendingInput, value: string): Promise<void> {
     const owner = ownerId(ctx);
     if (kind === "task") {
-      const task = this.database.createTask({ owner, title: oneLine(value, 140), prompt: value });
-      await ctx.reply(taskCard(task), { parse_mode: "HTML", reply_markup: taskKeyboard(task) });
+      await this.captureWorkTasks(ctx, value);
     } else if (kind === "capture") {
       const captured = this.database.capture({ owner, kind: value.includes("http") ? "link" : "text", body: value });
       await ctx.reply(captureCard(captured), { parse_mode: "HTML", reply_markup: captureKeyboard(captured.id) });
@@ -1009,6 +1018,51 @@ export class TelegramApplication {
 
   private async voiceCommand(ctx: Context): Promise<void> {
     await ctx.reply(spokenVoiceHelp(), { parse_mode: "HTML" });
+  }
+
+  private async captureWorkTasks(ctx: Context, value: string, sentAt = Date.now()): Promise<void> {
+    const parsed = parseWorkTasks(value, this.configuration.homeDirectory, sentAt);
+    if (!parsed.length) {
+      await ctx.reply("Не удалось выделить задачу. Продиктуйте действие после слова «задача» или список после слова «задачи».");
+      return;
+    }
+    const tasks = parsed.map((item) => this.database.createTask({
+      owner: ownerId(ctx),
+      title: oneLine(item.title, 140),
+      prompt: item.source,
+      project: item.project?.workspace,
+      projectLabel: item.project?.code,
+      dueAt: item.dueAt,
+    }));
+    let markdownSaved = true;
+    try {
+      await this.workTaskArchive.save(parsed);
+    } catch (error) {
+      markdownSaved = false;
+      logInternalError("Work task Markdown archive failed", error);
+    }
+    let notesSaved = true;
+    for (const item of parsed) {
+      try {
+        await addAppleChecklistItem(taskChecklistText(item));
+      } catch (error) {
+        notesSaved = false;
+        logInternalError("Work task Apple Notes update failed", error);
+      }
+    }
+    for (let index = 0; index < tasks.length; index += 1) {
+      const task = tasks[index]!;
+      const details = parsed[index]!;
+      await ctx.reply(`${taskCard(task)}\n${escape(taskSummary(details))}`, {
+        parse_mode: "HTML",
+        reply_markup: taskKeyboard(task),
+      });
+    }
+    const copies = [
+      markdownSaved ? "Markdown сохранён" : "Markdown не обновлён",
+      notesSaved ? "Apple Notes обновлены" : "Apple Notes не обновлены",
+    ];
+    await ctx.reply(`✅ ${tasks.length === 1 ? "Задача сохранена" : `Сохранено задач: ${tasks.length}`}\n${copies.join(" · ")}`);
   }
 
   private async storyCommand(ctx: Context): Promise<void> {
@@ -1040,8 +1094,8 @@ export class TelegramApplication {
   }
 
   private async showAboutMe(ctx: Context): Promise<void> {
-    const hits = await this.memory.recall(ownerId(ctx), "личные факты предпочтения цели работа проекты привычки обо мне", undefined, 10);
-    await ctx.reply(hits.length ? `<b>Что я помню о вас</b>\n\n${hits.map((hit) => `• ${escape(oneLine(hit.body, 500))}`).join("\n")}` : "Пока недостаточно данных для профиля. Используйте /remember для важных фактов.", { parse_mode: "HTML" });
+    if (!ctx.chat) return;
+    await sendTelegramMarkdown(ctx.api, ctx.chat.id, await this.memory.aboutMe(ownerId(ctx)), TELEGRAM_LIMIT - 100);
   }
 
   private async toggleMemory(ctx: Context): Promise<void> {
@@ -1180,11 +1234,11 @@ export class TelegramApplication {
     }
     if (input !== "on" && input !== "вкл") return void await ctx.reply("Используйте <code>/digest on</code>, <code>/digest off</code> или <code>/digest status</code>.", { parse_mode: "HTML" });
     existing.forEach((alarm) => this.database.deleteAlarm(alarm.id));
-    const morning = nextLocalTime(9, 0);
+    const morning = nextLocalTime(6, 0);
     const evening = nextLocalTime(21, 0);
     this.database.createAlarm({ owner, label: "Утренний дайджест", nextAt: morning, cadence: "daily", mode: "digest-morning" });
     this.database.createAlarm({ owner, label: "Итог дня", nextAt: evening, cadence: "daily", mode: "digest-evening" });
-    await ctx.reply("✅ Дайджесты включены: утром в 09:00 и общий итог дня в 21:00.");
+    await ctx.reply("✅ Дайджесты включены: утром в 06:00 и общий итог дня в 21:00.");
   }
 
   private async openOnMac(ctx: Context): Promise<void> {
@@ -1318,7 +1372,7 @@ export class TelegramApplication {
     const item = this.database.captures(ownerId(ctx), "new", 500).find((candidate) => candidate.id === id);
     if (!item) { await ctx.answerCallbackQuery({ text: "Не найдено" }); return; }
     if (action === "task") {
-      this.database.createTask({ owner: item.owner, title: oneLine(item.body, 140), prompt: item.body });
+      await this.captureWorkTasks(ctx, item.body, item.sourceTime ?? Date.now());
       this.database.resolveCapture(id, "task");
     } else if (action === "memory") {
       await this.memory.record({ owner: item.owner, body: item.body, role: "user", kind: "explicit", project: this.memoryProject(ctx), source: "telegram-inbox" });
@@ -1500,7 +1554,7 @@ function spokenVoiceHelp(): string {
     "<b>Дневник / Заметки</b> — с текстом добавить запись; без текста показать сегодняшний день",
     "<b>Рассказ</b> — продолжить выбранный через /story цикл",
     "<b>Календарь</b> — подготовить событие для подтверждения",
-    "<b>Задача</b> — создать задачу",
+    "<b>Задача / Задачи</b> — сохранить одну задачу или список с проектом, сроком, приоритетом и срочностью",
     "<b>Напоминание</b> — создать напоминание",
     "<b>Идея</b> — положить в инбокс",
     "<b>Запомни</b> — сохранить в долговременную память",
