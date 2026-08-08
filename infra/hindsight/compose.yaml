@@ -1,0 +1,40 @@
+name: codex-telegram-assistant-hindsight
+
+services:
+  hindsight:
+    # GHCR publishes 0.8.5 only as `latest`; pin its immutable digest.
+    image: ghcr.io/vectorize-io/hindsight@sha256:0710076cd1539b4f89537d2e5b0ea1e4d179885bc12809a56cf748c538c8c4fb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:9999:9999"
+    environment:
+      CODEX_HOME: /home/hindsight/.codex
+      HINDSIGHT_API_LLM_PROVIDER: openai-codex
+      HINDSIGHT_API_LLM_MODEL: gpt-5.6-luna
+      HINDSIGHT_API_RETAIN_LLM_MODEL: gpt-5.6-luna
+      HINDSIGHT_API_CONSOLIDATION_LLM_MODEL: gpt-5.6-terra
+      HINDSIGHT_API_REFLECT_LLM_MODEL: gpt-5.6-terra
+      HINDSIGHT_API_LLM_REASONING_EFFORT: low
+      HINDSIGHT_API_WORKER_ID: codex-telegram-assistant
+      HINDSIGHT_API_LLM_MAX_CONCURRENT: "2"
+      HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT: "1"
+      HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT: "1"
+      HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT: "1"
+      HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL: BAAI/bge-m3
+      # BGE-M3 provides the high-recall multilingual index; the 15-language
+      # MiniLM reranker keeps Russian ranking fast enough for an always-on bot.
+      HINDSIGHT_API_RERANKER_LOCAL_MODEL: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE: russian
+      # After the first successful download, offline mode avoids Hub metadata
+      # calls at every restart. Leave it off until the named cache is warm.
+      HF_HUB_OFFLINE: ${HINDSIGHT_HF_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${HINDSIGHT_HF_OFFLINE:-0}
+    volumes:
+      - hindsight_data:/home/hindsight/.pg0
+      - hindsight_models:/home/hindsight/.cache/huggingface
+      - ${HINDSIGHT_CODEX_HOME:?Set HINDSIGHT_CODEX_HOME to a dedicated absolute path}:/home/hindsight/.codex:rw
+
+volumes:
+  hindsight_data:
+  hindsight_models:

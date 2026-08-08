@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -16,6 +16,9 @@ describe("MemoryService", () => {
   it("redacts credentials and rejects standalone OTP values", () => {
     expect(sanitizeMemoryContent("мой пароль: hunter2, проект важный")).toBe("мой пароль: [REDACTED], проект важный");
     expect(sanitizeMemoryContent("sk-proj_abcdefghijklmnopqrstuvwxyz123456")).toBeUndefined();
+    expect(sanitizeMemoryContent("Ваш секретный ключ\nAQVN0TOcyrVPkN3MLP73IEBSH9NK6vNJ")).toBe("Ваш секретный ключ\n[REDACTED]");
+    expect(sanitizeMemoryContent("Доступ: XmETKe6j7BSYq30y4cEv")).toBe("Доступ: [REDACTED]");
+    expect(sanitizeMemoryContent("Импорт калорий из FatSecret.")).toBe("Импорт калорий из FatSecret.");
     expect(sanitizeMemoryContent("482913")).toBeUndefined();
   });
 
@@ -42,5 +45,92 @@ describe("MemoryService", () => {
     service.setPaused("1", true);
     expect(await service.record({ owner: "1", body: "Не сохранять", role: "user", kind: "message" })).toBeUndefined();
     expect(await service.recall("1", "сохранять")).toEqual([]);
+  });
+
+  it("uses the matched MemSearch chunk instead of the beginning of a large archive document", async () => {
+    let eventId = "";
+    const service = new MemoryService(folder, "memsearch", database, async (_executable, args) => {
+      if (args[0] !== "search") return "";
+      return JSON.stringify([{
+        source: `/tmp/${eventId}.md`,
+        score: 0.95,
+        content: "Релевантный фрагмент из середины большого Telegram-архива",
+      }]);
+    });
+    const event = await service.record({
+      owner: "1",
+      body: `${"Начало архива. ".repeat(200)}\nРелевантный фрагмент`,
+      role: "user",
+      kind: "document",
+      source: "telegram-export:test",
+    });
+    eventId = event!.id;
+
+    expect((await service.recall("1", "релевантный"))[0]?.body)
+      .toBe("Релевантный фрагмент из середины большого Telegram-архива");
+  });
+
+  it("mirrors source events to derived knowledge and uses local knowledge recall in prompts", async () => {
+    const knowledge = {
+      capture: vi.fn(),
+      remove: vi.fn(),
+      recall: vi.fn(async () => [{
+        id: "fact-1",
+        text: "Валентин предпочитает сначала увидеть конкретный результат.",
+        type: "observation",
+        score: 0.9,
+      }]),
+      reflect: vi.fn(async () => undefined),
+      status: vi.fn(() => "Hindsight: готов"),
+    };
+    const service = new MemoryService(folder, "/missing/memsearch", database, async () => "[]", knowledge);
+    const event = await service.record({
+      owner: "1", body: "Сначала покажи результат", role: "user", kind: "message", source: "telegram-text",
+    });
+
+    expect(knowledge.capture).toHaveBeenCalledWith(event);
+    expect(await service.augmentPrompt("1", "Как построить ответ?")).toContain("конкретный результат");
+    expect(service.status("1")).toContain("Hindsight: готов");
+    expect(await service.forget("1", event!.id)).toBe(true);
+    expect(knowledge.remove).toHaveBeenCalledWith(expect.objectContaining({ id: event!.id }));
+  });
+
+  it("maintains compact ABOUT and NOW views from confirmed facts and operational state", async () => {
+    const service = new MemoryService(folder, "/missing/memsearch", database, async () => "[]");
+    database.upsertPersonalFact({
+      id: "project:trainer",
+      owner: "1",
+      category: "project",
+      statement: "Развивает продукт «Тренер в кармане»",
+      subject: "Валентин",
+      predicate: "develops",
+      object: "Тренер в кармане",
+      status: "current",
+      confidence: 1,
+      source: "telegram-export:test",
+      evidenceMemoryId: "memory-1",
+      validFrom: Date.parse("2026-07-11T00:00:00Z"),
+      observedAt: Date.parse("2026-07-29T00:00:00Z"),
+    });
+    await service.record({
+      owner: "1", body: "Предпочитаю краткие ответы с конкретными действиями", role: "user", kind: "explicit",
+      source: "telegram-remember",
+    });
+    database.createTask({ owner: "1", title: "Подготовить импорт Apple Notes", dueAt: Date.parse("2026-08-01T09:00:00Z") });
+    database.createAlarm({
+      owner: "1", label: "Проверить импорт памяти", nextAt: Date.parse("2026-08-02T09:00:00Z"), cadence: "once",
+    });
+
+    const views = await service.personalContext("1");
+
+    expect(views.about).toContain("## Проекты");
+    expect(views.about).toContain("Тренер в кармане");
+    expect(views.about).toContain("уверенность 100%");
+    expect(views.about).toContain("memory_id: memory-1");
+    expect(views.about).toContain("Предпочитаю краткие ответы");
+    expect(views.now).toContain("Подготовить импорт Apple Notes");
+    expect(views.now).toContain("Проверить импорт памяти");
+    expect(readFileSync(path.join(views.directory, "ABOUT.md"), "utf8")).toBe(views.about);
+    expect(readFileSync(path.join(views.directory, "NOW.md"), "utf8")).toBe(views.now);
   });
 });

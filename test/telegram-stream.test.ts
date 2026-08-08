@@ -98,6 +98,6 @@ describe("TelegramTurnView", () => {
 
     await view.fail();
 
-    expect(reply).toHaveBeenCalledWith("Не удалось выполнить запрос. Попробуйте ещё раз.", { parse_mode: "HTML" });
+    expect(reply).toHaveBeenCalledWith("Не\u00a0удалось выполнить запрос. Попробуйте ещё\u00a0раз.", { parse_mode: "HTML" });
   });
 });

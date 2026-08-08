@@ -47,6 +47,7 @@ const SPOKEN_LABELS: Readonly<Record<string, SpokenVoiceCommandKind>> = {
   "ответ": "reply",
   "календарь": "calendar",
   "задача": "task",
+  "задачи": "task",
   "напоминание": "reminder",
   "идея": "inbox",
   "инбокс": "inbox",

@@ -1,10 +1,12 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
+const CALENDAR_READ_AUTHORIZATION_STATUSES = [3] as const;
 
 export interface CalendarEntry { title: string; start: string; calendar: string; startOrder?: number; }
 
@@ -30,9 +32,13 @@ export async function todayCalendar(maximum = 12): Promise<CalendarEntry[]> {
 }
 
 async function eventKitCalendar(from: number, until: number, maximum: number, includeDate: boolean): Promise<CalendarEntry[]> {
+  const nativeContent = await nativeCalendar(from, until);
+  if (nativeContent !== undefined) {
+    return parseEventKitCalendar(nativeContent, includeDate).slice(0, Math.max(0, maximum));
+  }
   const script = `ObjC.import('EventKit')
 var authorization = Number($.EKEventStore.authorizationStatusForEntityType($.EKEntityTypeEvent))
-if (authorization !== 3) throw new Error('Apple Calendar access is not granted')
+if (${JSON.stringify(CALENDAR_READ_AUTHORIZATION_STATUSES)}.indexOf(authorization) === -1) throw new Error('Apple Calendar full access is not granted (status ' + authorization + ')')
 var store = $.EKEventStore.alloc.init
 var calendars = store.calendarsForEntityType($.EKEntityTypeEvent)
 if (Number(calendars.count) === 0) throw new Error('Apple Calendar has no readable calendars')
@@ -53,6 +59,53 @@ for (var index = 0; index < Number(events.count); index++) {
 JSON.stringify(rows)`;
   const content = await javaScript(script, 8_000);
   return parseEventKitCalendar(content, includeDate).slice(0, Math.max(0, maximum));
+}
+
+interface NativeCalendarResult {
+  ok?: unknown;
+  events?: unknown;
+  error?: unknown;
+  authorizationStatus?: unknown;
+}
+
+async function nativeCalendar(from: number, until: number): Promise<string | undefined> {
+  if (process.platform !== "darwin") return undefined;
+  const application = await calendarReaderApplication();
+  if (!application) return undefined;
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-calendar-reader-"));
+  const output = path.join(directory, "result.json");
+  try {
+    await execute("/usr/bin/open", ["-W", "-n", application, "--args", "--output", output,
+      "--from", String(from), "--until", String(until)], { timeout: 40_000, maxBuffer: 1024 * 1024 });
+    const parsed = JSON.parse(await readFile(output, "utf8")) as NativeCalendarResult;
+    if (parsed.ok !== true || !Array.isArray(parsed.events)) {
+      const status = typeof parsed.authorizationStatus === "number" ? ` (status ${parsed.authorizationStatus})` : "";
+      const reason = typeof parsed.error === "string" && parsed.error.trim() ? `: ${parsed.error.trim()}` : "";
+      throw new Error(`Apple Calendar full access is not granted${status}${reason}`);
+    }
+    return JSON.stringify(parsed.events);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function calendarReaderApplication(): Promise<string | undefined> {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.join(moduleDirectory, "CodexCalendarReader.app"),
+    path.join(moduleDirectory, "..", "dist", "CodexCalendarReader.app"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      await access(path.join(candidate, "Contents", "MacOS", "CodexCalendarReader"));
+      return candidate;
+    } catch {}
+  }
+  return undefined;
+}
+
+export function calendarReadAccessGranted(status: number): boolean {
+  return CALENDAR_READ_AUTHORIZATION_STATUSES.some((candidate) => candidate === status);
 }
 
 export function parseEventKitCalendar(content: string, includeDate: boolean): CalendarEntry[] {
@@ -142,6 +195,46 @@ return name of targetAccount as text
 end tell
 end run`;
   return appleScript(script, [input.folder, input.title, input.html, input.sectionMarker ?? "", input.continuationHtml ?? input.html]);
+}
+
+export async function addAppleChecklistItem(text: string, shortcut = "Codex Рабочая задача"): Promise<void> {
+  const value = text.trim();
+  if (!value) throw new Error("Checklist item is required");
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-work-task-"));
+  const input = path.join(directory, "task.txt");
+  try {
+    await writeFile(input, value, "utf8");
+    try {
+      await execute("/usr/bin/shortcuts", ["run", shortcut, "--input-path", input], {
+        timeout: 12_000,
+        maxBuffer: 1024 * 1024,
+      });
+    } catch (error) {
+      if (await appleNoteContains("РАБОЧИЕ ЗАДАЧИ", value)) return;
+      throw error;
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function appleNoteContains(title: string, text: string): Promise<boolean> {
+  const script = `on run argv
+set noteTitle to item 1 of argv
+set needle to item 2 of argv
+tell application "Notes"
+repeat with candidateAccount in accounts
+repeat with candidateFolder in folders of candidateAccount
+set matches to every note of candidateFolder whose name is noteTitle
+repeat with candidateNote in matches
+if (body of candidateNote as text) contains needle then return "yes"
+end repeat
+end repeat
+end repeat
+end tell
+return "no"
+end run`;
+  return await appleScript(script, [title, text], 10_000) === "yes";
 }
 
 export async function addSystemAlarm(start: number): Promise<void> {

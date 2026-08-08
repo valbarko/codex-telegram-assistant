@@ -9,7 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && scripts/build-calendar-reader.sh",
     "dev": "tsx src/main.ts",
     "start": "node dist/main.js",
     "test": "vitest run",
@@ -18,12 +18,23 @@
     "style:index": "memsearch index .private/style-corpus/posts --collection cta_style_valentin --provider onnx --description 'Private writing corpus for Valentin Barko' --force",
     "style:search": "memsearch search --top-k 8 --collection cta_style_valentin --provider onnx",
     "style:search:personal": "memsearch search --top-k 8 --collection cta_style_valentin --provider onnx --source-prefix \"$PWD/.private/style-corpus/posts/barko-pro-zhizn\"",
-    "style:search:expert": "memsearch search --top-k 8 --collection cta_style_valentin --provider onnx --source-prefix \"$PWD/.private/style-corpus/posts/v-svoem-tele\""
+    "style:search:expert": "memsearch search --top-k 8 --collection cta_style_valentin --provider onnx --source-prefix \"$PWD/.private/style-corpus/posts/v-svoem-tele\"",
+    "apple-notes:import": "tsx src/apple-notes-import.ts",
+    "memory:import": "tsx src/archive-import-cli.ts",
+    "profile:import": "tsx src/profile-import-cli.ts",
+    "hindsight:up": "docker compose --env-file .env -f infra/hindsight/compose.yaml up -d",
+    "hindsight:down": "docker compose --env-file .env -f infra/hindsight/compose.yaml down",
+    "hindsight:status": "docker compose --env-file .env -f infra/hindsight/compose.yaml ps",
+    "hindsight:logs": "docker compose --env-file .env -f infra/hindsight/compose.yaml logs --tail=100 hindsight",
+    "hindsight:smoke": "tsx src/hindsight-smoke.ts",
+    "hindsight:backfill": "tsx src/hindsight-backfill.ts"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "2.0.2",
+    "@vectorize-io/hindsight-client": "0.8.5",
     "better-sqlite3": "12.11.1",
-    "grammy": "1.38.2"
+    "grammy": "1.38.2",
+    "typograf": "7.7.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",

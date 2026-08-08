@@ -13,8 +13,8 @@ This repository is an independent implementation with its own source structure, 
 - **Style-aware drafts:** turn a text or voice note beginning with `Пост`, `Анонс`, or `Ответ` into a ready Telegram draft using a private, locally indexed corpus of the owner's accepted writing.
 - **Forwarded voice packages:** collect rapidly forwarded voice messages from the same original sender, preserve their order, and use Codex to merge one topic or split genuine topic changes.
 - **Content-only accounts:** grant selected Telegram users three isolated tools—clean direct-voice transcription, summarized forwarded-voice packages, and text proofreading—without exposing commands, memory, or assistant workflows.
-- **Apple Notes publishing:** append diary entries to one monthly note grouped by date, keep story continuity, and retain readable Markdown plus untouched transcript backups.
-- **Spoken and text commands:** route one-shot labels such as `Пост`, `Анонс`, `Ответ`, `Дневник`, `Рассказ`, `Календарь`, `Задача`, and `Напоминание` to the correct workflow.
+- **Apple Notes integration:** append diary entries, and incrementally import private non-shared notes into local long-term memory.
+- **Spoken and text commands:** route one-shot labels such as `Пост`, `Анонс`, `Ответ`, `Дневник`, `Рассказ`, `Календарь`, `Задача`, `Задачи`, and `Напоминание` to the correct workflow.
 - **Safe calendar automation:** parse common dates locally, fall back to validated Codex extraction for ambiguous phrasing, and require confirmation before creating Apple Calendar events.
 - **Personal productivity:** manage tasks, inbox captures, a FIFO Codex queue, reminders, scheduled runs, project aliases, and recently active threads.
 - **Long-term memory:** store and recall project or global context with explicit pause, export, and deletion controls.
@@ -30,6 +30,7 @@ This repository is an independent implementation with its own source structure, 
 - An installed and authenticated `codex` CLI with `codex app-server`
 - A Telegram bot token from BotFather
 - MemSearch with local ONNX embeddings (`uv tool install "memsearch[onnx]"`)
+- Optional Hindsight knowledge layer: a Docker runtime, ChatGPT Plus/Pro, and a dedicated Codex login
 - Optional voice support: Python with `mlx-whisper`
 - Optional video-link summaries: `yt-dlp` and `ffmpeg` (`brew install yt-dlp ffmpeg`)
 
@@ -64,7 +65,7 @@ These inputs never route to commands or the owner's assistant workflows. Audio i
 - `/sessions` — recent Codex threads, sorted by activity
 - `/abort` — interrupt the current turn
 - `/remind` and `/schedule` — notification or Codex run at a later time
-- `/digest on` — morning task plan at 09:00 and a cross-project work summary at 21:00
+- `/digest on` — morning task plan at 06:00 and a cross-project work summary at 21:00
 - `/calendar`, `/event`, `/draft`, `/mac` — local Mac integrations
 - `/recall`, `/forget`, `/about_me` — recall, delete, and inspect personal memory
 - `/memory_status`, `/memory_pause`, `/memory_export` — control and export long-term memory
@@ -75,9 +76,65 @@ The persistent Telegram keyboard keeps common actions one tap away. A text sent 
 
 ## Long-term memory
 
-The assistant stores sanitized user messages, voice transcripts, actions, and final Codex answers. SQLite tracks exact records, namespaces, pause state, and deletions; Markdown under the private data directory is the readable archive; MemSearch/Milvus provides hybrid semantic recall. Global memory and the active project's memory are searched separately and then merged.
+The assistant stores sanitized user messages, the owner's voice transcripts, actions, and final Codex answers. SQLite tracks exact records, namespaces, pause state, and deletions; Markdown under the private data directory is the readable archive; MemSearch/Milvus provides hybrid semantic recall. Forwarded third-party voices are excluded. Global memory and the active project's memory are searched separately and then merged.
 
 Passwords, API tokens, bearer credentials, JWTs, Telegram bot tokens, and OTP-like values are rejected or redacted before either SQLite or Markdown is written. MemSearch is a derived local index and can be rebuilt from the archive. If MemSearch is unavailable, `/recall` falls back to a scoped local text search.
+
+### Apple Notes import
+
+Set `APPLE_NOTES_IMPORT_ENABLED=true` to read Apple Notes locally on the Mac at startup and every 24 hours. With one full-access Telegram owner, the owner ID is inferred; otherwise set `APPLE_NOTES_IMPORT_OWNER_ID`. Each note keeps a stable hashed source ID and its Notes modification time, so edits update one canonical memory event instead of creating duplicates. Shared notes, Recently Deleted, empty notes, and password-protected notes are excluded by default.
+
+Protected notes require both manual unlocking in Notes and the explicit `APPLE_NOTES_IMPORT_PROTECTED=true` opt-in. Their plaintext is then copied into the assistant's local archive, so this option should only be used when that archive has the required physical privacy. Run `npm run apple-notes:import` for a one-shot import and summary. This importer only updates SQLite, Markdown, and local MemSearch; it does not start Hindsight or make an LLM request.
+
+Official Telegram Desktop, Claude, and ChatGPT data exports plus standalone Markdown knowledge documents can be imported together without sending their contents to an LLM:
+
+```bash
+npm run memory:import -- \
+  --telegram /absolute/path/to/result.json \
+  --claude /absolute/path/to/claude-export.zip \
+  --chatgpt /absolute/path/to/chatgpt-export.zip \
+  --markdown /absolute/path/to/knowledge.md
+```
+
+Telegram import keeps only the owner's substantive messages, removes exact duplicate text, and groups them into stable chat/month batches. Claude import keeps visible human and assistant text with separate roles; hidden thinking, tool calls, tool results, attachments, and files are excluded. ChatGPT import follows only the selected branch of each conversation and keeps the owner's substantive messages; assistant answers, reasoning recaps, hidden thoughts, abandoned branches, and attachments are excluded because they are not facts about the owner. Markdown import stores the complete file as one global, user-confirmed source; its stable ID is derived from the absolute path, so running the same command after editing updates the existing memory instead of creating a duplicate. All importers redact credentials and rebuild the local index once after the complete batch.
+
+### Canonical personal profile
+
+The canonical profile is a small temporal fact graph stored directly in SQLite above the raw archive. Every fact has a stable ID, category, readable statement, `subject → predicate → object` triple, current/historical/uncertain/superseded status, confidence, validity date, source ID, and optional evidence memory ID. This keeps disputed or stale facts out of the current profile while preserving their history and provenance.
+
+Import reviewed facts from a private JSON file:
+
+```bash
+npm run profile:import -- --file .private/profile-facts.json
+```
+
+The import updates `ABOUT.md` without rebuilding the large MemSearch index or calling an LLM. `/about_me` renders the categorized canonical profile together with facts explicitly saved through `/remember`; `NOW.md` remains the operational view of active tasks and reminders.
+
+### Hindsight knowledge layer
+
+Hindsight is an optional derived layer above the exact SQLite/Markdown archive. It extracts facts, people, relationships, timelines, preferences, goals, and recurring patterns. Normal questions use Hindsight's local `recall` together with a compact confirmed `ABOUT.md`, operational `NOW.md`, and selected MemSearch source fragments; the current Codex produces the only final answer. LLM-backed `reflect` is reserved for explicit deep analysis. Assistant output remains in the canonical archive but is not ingested as personal fact.
+
+The bundled Compose stack is pinned to Hindsight 0.8.5, persists both its embedded pg0 database and local model cache in Docker volumes, uses a stable worker ID so interrupted jobs can recover, and binds its API and UI only to localhost.
+
+```bash
+# Create and authenticate an isolated Codex home once. Do not copy the active
+# ~/.codex/auth.json because refresh tokens rotate.
+mkdir -p /absolute/path/to/hindsight-codex
+CODEX_HOME=/absolute/path/to/hindsight-codex codex login --device-auth
+# Put the same absolute path in HINDSIGHT_CODEX_HOME inside .env.
+
+npm run hindsight:up
+npm run hindsight:status
+npm run hindsight:smoke
+# Submit up to 500 existing active memory events for background extraction:
+npm run hindsight:backfill -- 500
+```
+
+The first `hindsight:up` downloads the local retrieval models. Once `/health` is ready, set `HINDSIGHT_HF_OFFLINE=1` and run `hindsight:up` again for deterministic restarts without Hugging Face metadata requests.
+
+Set `HINDSIGHT_ENABLED=true` to mirror eligible new events in small batches. The bundled stack uses `openai-codex`: Luna extracts facts, Terra consolidates observations and handles rare reflection, and the same ChatGPT/Codex subscription limits are consumed without an OpenAI Platform API key. BGE-M3 supplies high-recall multilingual embeddings, a compact MMARCO MiniLM model reranks Russian results, and PostgreSQL's Russian dictionary handles lexical recall. `npm run hindsight:down` stops the service without deleting its database or model volumes.
+
+The generated views live under `ASSISTANT_DATA_DIR/personal-context/<owner>/`. `ABOUT.md` contains reviewed canonical facts and explicit memories; `NOW.md` is rebuilt from active tasks and reminders. See [the unified Personal Memory v2 plan](docs/personal-memory-v2-plan.md).
 
 ## Voice messages
 
@@ -94,6 +151,8 @@ Forwarded voice and audio messages use package processing. After each forwarded 
 Destinations are one-shot labels for both voice and text, not persistent modes. Start the message with `пост`, `анонс`, `ответ`, `дневник`, `рассказ`, `календарь`, `задача`, `напоминание`, `идея`, or `запомни`, then continue normally. `Пост`, `Анонс`, and `Ответ` select relevant examples from the private writing corpus and ask a read-only Codex thread for a finished Telegram draft without inventing facts or copying source passages. If the local semantic index is unavailable, the assistant falls back to local lexical retrieval from the same private corpus.
 
 `дневник` sends the remaining text through Codex and appends it to one Apple Notes note per month, grouped by date and time. Use `/story <cycle name>` once to select a cycle; subsequent messages beginning with `рассказ` use the same editorial flow and the end of the previous draft as continuity context. Calendar, task, reminder, inbox, and memory labels route the remaining content to the corresponding local workflow.
+
+`задача` and `задачи` accept one item or a dictated list. The assistant recognizes `ГМК` / `Где мои клиенты`, `ТВК` / `Тренер в кармане`, and `ГМД` / `Где мои деньги`, extracts common deadlines and urgency phrases, adds the work to SQLite, appends a native checklist item to the Apple Notes note `РАБОЧИЕ ЗАДАЧИ` through the `Codex Рабочая задача` Shortcut, and keeps a readable Markdown copy at `WRITING_ARCHIVE_DIR/Рабочие задачи/РАБОЧИЕ ЗАДАЧИ.md`.
 
 Send `Дневник` or `Заметки` without additional text to receive all entries for the current day. Add text after either label to create a new entry. Telegram renders the structured entry and also sends the same content as a downloadable Markdown file.
 

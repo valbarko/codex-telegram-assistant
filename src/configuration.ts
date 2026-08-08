@@ -3,6 +3,7 @@ import path from "node:path";
 
 export type ApprovalPolicy = "never" | "on-request" | "untrusted";
 export type SandboxPreset = "read-only" | "workspace-write" | "danger-full-access";
+export type HindsightBudget = "low" | "mid" | "high";
 
 export interface ExecutionProfile {
   id: string;
@@ -19,6 +20,17 @@ export interface AppConfiguration {
   dataDirectory: string;
   writingArchiveDirectory: string;
   memsearchExecutable: string;
+  appleNotesImportEnabled: boolean;
+  appleNotesImportOwner?: string;
+  appleNotesImportIntervalMs: number;
+  appleNotesImportProtected: boolean;
+  hindsightEnabled: boolean;
+  hindsightBaseUrl: string;
+  hindsightApiKey?: string;
+  hindsightReflectBudget: HindsightBudget;
+  hindsightTimeoutMs: number;
+  hindsightLiveBatchSize: number;
+  hindsightLiveFlushMs: number;
   defaultWorkspace: string;
   projectAliases: Readonly<Record<string, string>>;
   weatherLocation: string;
@@ -62,6 +74,15 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
   if (mediaCookiesFromBrowser && mediaCookiesFile) {
     throw new Error("Set only one of MEDIA_COOKIES_FROM_BROWSER and MEDIA_COOKIES_FILE");
   }
+  const appleNotesImportEnabled = parseBoolean(env.APPLE_NOTES_IMPORT_ENABLED, false);
+  const configuredAppleNotesOwner = parseOptionalPositiveInteger(env.APPLE_NOTES_IMPORT_OWNER_ID, "APPLE_NOTES_IMPORT_OWNER_ID");
+  const appleNotesImportOwner = configuredAppleNotesOwner ?? (allowedUsers.size === 1 ? [...allowedUsers][0] : undefined);
+  if (appleNotesImportOwner !== undefined && !allowedUsers.has(appleNotesImportOwner)) {
+    throw new Error("APPLE_NOTES_IMPORT_OWNER_ID must be a full-access Telegram user");
+  }
+  if (appleNotesImportEnabled && appleNotesImportOwner === undefined) {
+    throw new Error("APPLE_NOTES_IMPORT_OWNER_ID is required when multiple full-access users are configured");
+  }
   return {
     telegramToken,
     allowedUsers,
@@ -70,6 +91,18 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     dataDirectory,
     writingArchiveDirectory: path.resolve(env.WRITING_ARCHIVE_DIR?.trim() || path.join(homeDirectory, "Documents", "Codex Writer")),
     memsearchExecutable: path.resolve(env.MEMSEARCH_BIN?.trim() || path.join(homeDirectory, ".local", "bin", "memsearch")),
+    appleNotesImportEnabled,
+    appleNotesImportOwner: appleNotesImportOwner === undefined ? undefined : String(appleNotesImportOwner),
+    appleNotesImportIntervalMs: parsePositiveInteger(env.APPLE_NOTES_IMPORT_INTERVAL_MS, 24 * 60 * 60_000,
+      "APPLE_NOTES_IMPORT_INTERVAL_MS"),
+    appleNotesImportProtected: parseBoolean(env.APPLE_NOTES_IMPORT_PROTECTED, false),
+    hindsightEnabled: parseBoolean(env.HINDSIGHT_ENABLED, false),
+    hindsightBaseUrl: (optional(env.HINDSIGHT_BASE_URL) || "http://127.0.0.1:8888").replace(/\/+$/, ""),
+    hindsightApiKey: optional(env.HINDSIGHT_API_KEY),
+    hindsightReflectBudget: parseHindsightBudget(env.HINDSIGHT_REFLECT_BUDGET),
+    hindsightTimeoutMs: parsePositiveInteger(env.HINDSIGHT_TIMEOUT_MS, 45_000, "HINDSIGHT_TIMEOUT_MS"),
+    hindsightLiveBatchSize: parsePositiveInteger(env.HINDSIGHT_LIVE_BATCH_SIZE, 10, "HINDSIGHT_LIVE_BATCH_SIZE"),
+    hindsightLiveFlushMs: parsePositiveInteger(env.HINDSIGHT_LIVE_FLUSH_MS, 5_000, "HINDSIGHT_LIVE_FLUSH_MS"),
     defaultWorkspace,
     projectAliases: parseAliases(env.PROJECT_ALIASES_JSON || env.WORKSPACE_LABELS_JSON),
     weatherLocation: optional(env.WEATHER_LOCATION) || "Москва",
@@ -132,6 +165,14 @@ function parseOptionalPositiveIntegers(value: string | undefined, key: string): 
   return normalized ? parsePositiveIntegers(normalized, key) : [];
 }
 
+function parseOptionalPositiveInteger(value: string | undefined, key: string): number | undefined {
+  const normalized = optional(value);
+  if (!normalized) return undefined;
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${key} must be a positive integer`);
+  return parsed;
+}
+
 function parseAliases(value: string | undefined): Readonly<Record<string, string>> {
   if (!optional(value)) return {};
   const parsed = JSON.parse(value!) as unknown;
@@ -183,6 +224,12 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (["1", "true", "yes"].includes(value.toLowerCase())) return true;
   if (["0", "false", "no"].includes(value.toLowerCase())) return false;
   throw new Error(`Invalid boolean: ${value}`);
+}
+
+function parseHindsightBudget(value: string | undefined): HindsightBudget {
+  const budget = optional(value) || "low";
+  if (budget === "low" || budget === "mid" || budget === "high") return budget;
+  throw new Error("HINDSIGHT_REFLECT_BUDGET must be low, mid, or high");
 }
 
 function parseCoordinate(value: string | undefined, fallback: number, minimum: number, maximum: number, key: string): number {

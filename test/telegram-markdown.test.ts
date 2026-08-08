@@ -8,17 +8,28 @@ import {
   telegramMarkdownChunks,
   truncateTelegramHtml,
 } from "../src/telegram-markdown.js";
+import { typografTelegramHtml } from "../src/typography.js";
 
 describe("Telegram Markdown", () => {
   it("renders headings, emphasis, code, quotes and fenced code as Telegram HTML", () => {
     const markdown = "## 12 июля\n\nОбычный текст, **важная мысль** и `rsync`.\n\n> Цитата\n\n```js\nconst a = 1 < 2;\n```";
     const html = markdownToTelegramHtml(markdown);
 
-    expect(html).toContain("<b>12 июля</b>");
+    expect(html).toContain("<b>12\u00a0июля</b>");
     expect(html).toContain("<b>важная мысль</b>");
     expect(html).toContain("<code>rsync</code>");
     expect(html).toContain("<blockquote>Цитата</blockquote>");
     expect(html).toContain("<pre><code class=\"language-js\">const a = 1 &lt; 2;</code></pre>");
+  });
+
+  it("typographs prose without rewriting code, URLs, dates or expressive punctuation", () => {
+    const html = typografTelegramHtml(
+      '<b>Он сказал "привет" - и ушёл...</b>\n<code>2026-08-10 1/2 --flag</code>\n<a href="https://example.com/a-b?q=x-y">ссылка</a> - дальше!!',
+    );
+
+    expect(html).toContain("<b>Он\u00a0сказал «привет»\u00a0— и\u00a0ушёл…</b>");
+    expect(html).toContain("<code>2026-08-10 1/2 --flag</code>");
+    expect(html).toContain('<a href="https://example.com/a-b?q=x-y">ссылка</a>\u00a0— дальше!!');
   });
 
   it("truncates Telegram HTML without leaving tags or entities open", () => {
@@ -37,7 +48,7 @@ describe("Telegram Markdown", () => {
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(sendMessage).toHaveBeenCalledWith(
       "owner",
-      "<b>Главное</b>\n\n<b>Готово</b> и <code>rsync</code>.",
+      "<b>Главное</b>\n\n<b>Готово</b> и\u00a0<code>rsync</code>.",
       { parse_mode: "HTML" },
     );
   });

@@ -1,5 +1,7 @@
 import type { Transformer } from "grammy";
 
+import { typografTelegramHtml } from "./typography.js";
+
 export interface TelegramMarkdownChunk {
   html: string;
   plain: string;
@@ -36,7 +38,7 @@ export function markdownToTelegramHtml(markdown: string): string {
     result.push(inlineHtml(line));
   }
   if (code) result.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
-  return result.join("\n");
+  return typografTelegramHtml(result.join("\n"));
 }
 
 export function renderTelegramMarkdown(markdown: string, limit = 3950): TelegramMarkdownChunk {
@@ -86,7 +88,7 @@ export const markdownTelegramTransformer: Transformer = async (prev, method, pay
   const parseField = field === "text" ? "parse_mode" : "parse_mode";
   const original = source[field] as string;
   const alreadyHtml = source[parseField] === "HTML";
-  const formatted = alreadyHtml ? original : markdownToTelegramHtml(original);
+  const formatted = alreadyHtml ? typografTelegramHtml(original) : markdownToTelegramHtml(original);
   const formattedPayload = {
     ...source,
     [field]: formatted,
@@ -105,7 +107,7 @@ export const markdownTelegramTransformer: Transformer = async (prev, method, pay
   });
   const plainPayload = {
     ...source,
-    [field]: alreadyHtml ? telegramHtmlToPlainText(original) : markdownToPlainText(original),
+    [field]: alreadyHtml ? telegramHtmlToPlainText(typografTelegramHtml(original)) : markdownToPlainText(original),
     [parseField]: undefined,
   } as unknown as typeof payload;
   return prev(method, plainPayload, signal);
