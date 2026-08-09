@@ -21,7 +21,9 @@ coverage/
 # Private/local working artifacts. The repository is public.
 output/
 outputs/
+.playwright-cli/
 pieter-levels-article-ru.html
 docs/article-work-sport-pareto.md
 docs/valentin-brand-ecosystem-master-plan.md
+docs/valentin-personal-hq-and-editorial-bank-plan.md
 writing/VALENTIN_GOLD_CORPUS.md
