@@ -145,4 +145,18 @@ describe("AssistantDatabase", () => {
 
     expect(database.alarms("1")[0]?.nextAt).toBe(Date.parse("2026-07-16T06:00:00+03:00"));
   });
+
+  it("remembers sent blog-topic sources so they are not repeated within the history window", () => {
+    database.recordBlogTopic({
+      owner: "1", sourceId: "111", pillar: "training", studyTitle: "First", sourceUrl: "https://pubmed.ncbi.nlm.nih.gov/111/",
+      markdown: "Первая тема", sentAt: 100,
+    });
+    database.recordBlogTopic({
+      owner: "1", sourceId: "222", pillar: "nutrition", studyTitle: "Second", sourceUrl: "https://pubmed.ncbi.nlm.nih.gov/222/",
+      markdown: "Вторая тема", sentAt: 200,
+    });
+
+    expect(database.sentBlogTopicSourceIds("1", 150)).toEqual(["222"]);
+    expect(database.sentBlogTopicSourceIds("1", 0)).toEqual(["222", "111"]);
+  });
 });

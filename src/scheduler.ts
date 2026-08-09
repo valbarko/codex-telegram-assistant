@@ -5,6 +5,7 @@ import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex-engine.js";
+import { findDailyBlogStudy, type BlogStudy } from "./daily-blog-topic.js";
 import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
 import { todayCalendar, type CalendarEntry } from "./mac-bridge.js";
 import type { MemoryService } from "./memory-service.js";
@@ -12,6 +13,7 @@ import { quietCodexPrompt } from "./prompt-policy.js";
 import { logInternalError, publicErrorMessage } from "./public-errors.js";
 import type { Alarm, AssistantDatabase, MemoryEvent, WorkItem } from "./storage.js";
 import { sendTelegramMarkdown } from "./telegram-markdown.js";
+import { todayInspiration } from "./today-inspiration.js";
 import { countActiveWork, groupActiveWork, internalAssistantWorkspace, internalWorkThread, mergeActiveWork, type UnifiedWorkGroup } from "./work-dashboard.js";
 import { todayWeather } from "./weather.js";
 
@@ -20,6 +22,16 @@ export interface WorkJournalEntry {
   time: string;
   request: string;
   result: string;
+}
+
+interface PreparedBlogTopic {
+  study: BlogStudy;
+  markdown: string;
+}
+
+interface MorningDigestResult {
+  text: string;
+  blogTopic?: PreparedBlogTopic;
 }
 
 export class BackgroundScheduler {
@@ -68,7 +80,19 @@ export class BackgroundScheduler {
           const task = this.database.createTask({ owner: alarm.owner, title: alarm.label, prompt: alarm.prompt || alarm.label, project: alarm.project, status: "queued" });
           this.database.enqueue(task.id);
           await this.send(alarm.owner, `⏰ ${alarm.label}\n\nЗадача добавлена в очередь Codex.`);
-        } else if (alarm.mode === "digest-morning") await this.send(alarm.owner, await this.morningDigest(alarm.owner));
+        } else if (alarm.mode === "digest-morning") {
+          const digest = await this.morningDigest(alarm.owner);
+          await this.send(alarm.owner, digest.text);
+          if (digest.blogTopic) this.database.recordBlogTopic({
+            owner: alarm.owner,
+            sourceId: digest.blogTopic.study.sourceId,
+            pillar: digest.blogTopic.study.pillar,
+            studyTitle: digest.blogTopic.study.title,
+            sourceUrl: digest.blogTopic.study.sourceUrl,
+            markdown: digest.blogTopic.markdown,
+            sentAt: Date.now(),
+          });
+        }
         else if (alarm.mode === "digest-evening") await this.sendEveningSummary(alarm.owner);
         else await this.send(alarm.owner, `⏰ ${alarm.label}`);
       } catch (error) {
@@ -116,34 +140,53 @@ export class BackgroundScheduler {
     }
   }
 
-  private async morningDigest(owner: string): Promise<string> {
+  private async morningDigest(owner: string): Promise<MorningDigestResult> {
     const inbox = this.database.captures(owner, "new", 100).length;
     const tasks = this.database.tasks(owner, undefined, 500);
     const summaryThread = this.database.conversation(`daily-summary:${owner}`)?.threadId;
-    const [weather, calendar, threads] = await Promise.allSettled([
+    const usedBlogSources = new Set(this.database.sentBlogTopicSourceIds(owner, Date.now() - 365 * 86_400_000));
+    const [weather, calendar, inspiration, blogStudy, threads] = await Promise.allSettled([
       todayWeather({
         label: this.configuration.weatherLocation,
         latitude: this.configuration.weatherLatitude,
         longitude: this.configuration.weatherLongitude,
       }),
       within(todayCalendar(20), 10_000, "calendar"),
+      within(todayInspiration(), 15_000, "daily inspiration"),
+      within(findDailyBlogStudy({ usedSourceIds: usedBlogSources }), 25_000, "daily blog study"),
       within(this.hub.threads(150), 7_000, "Codex threads"),
     ]);
     if (weather.status === "rejected") console.error("Morning weather failed", weather.reason);
     if (calendar.status === "rejected") console.error("Morning calendar failed", calendar.reason);
+    if (inspiration.status === "rejected") console.error("Morning daily inspiration failed", inspiration.reason);
+    if (blogStudy.status === "rejected") console.error("Morning blog study failed", blogStudy.reason);
     if (threads.status === "rejected") console.error("Morning project loading failed", threads.reason);
+    let blogTopic: PreparedBlogTopic | undefined;
+    if (blogStudy.status === "fulfilled" && blogStudy.value) {
+      try {
+        blogTopic = {
+          study: blogStudy.value,
+          markdown: await within(this.textEditor.createDailyBlogTopic(blogStudy.value), 185_000, "daily blog topic"),
+        };
+      } catch (error) {
+        console.error("Morning blog topic generation failed", error);
+      }
+    }
     const excluded = new Set(summaryThread ? [summaryThread] : []);
     const visibleThreads = threads.status === "fulfilled" ? recentProjectThreads(threads.value.filter((thread) =>
       !generatedWorkspace(thread.workspace) && !internalAssistantWorkspace(thread.workspace, this.configuration.dataDirectory)
       && !internalWorkThread(thread))) : [];
     const groups = groupActiveWork(mergeActiveWork(tasks, visibleThreads, this.configuration.projectAliases, excluded));
-    return this.polishContent(morningDigestText({
+    const text = await this.polishContent(morningDigestText({
       weather: weather.status === "fulfilled" ? weather.value : `🌦 Погода · ${this.configuration.weatherLocation}\nНе удалось получить прогноз.`,
       calendar: calendar.status === "fulfilled" ? calendar.value : undefined,
+      inspiration: inspiration.status === "fulfilled" ? inspiration.value : undefined,
+      blogTopic: blogTopic?.markdown,
       groups,
       inbox,
       tasks,
     }));
+    return { text, blogTopic };
   }
 
   private async sendEveningSummary(owner: string): Promise<void> {
@@ -224,6 +267,8 @@ function symbol(task: WorkItem): string {
 export interface MorningDigestInput {
   weather: string;
   calendar?: readonly CalendarEntry[];
+  inspiration?: string;
+  blogTopic?: string;
   groups: readonly UnifiedWorkGroup[];
   inbox: number;
   tasks: readonly WorkItem[];
@@ -269,6 +314,8 @@ export function morningDigestText(input: MorningDigestInput): string {
     "",
     ...calendarLines,
     "",
+    ...(input.inspiration ? [input.inspiration, ""] : []),
+    ...(input.blogTopic ? [input.blogTopic, ""] : []),
     "**Главное**",
     "",
     `Активно: **${countLabel(items.length, "тема", "темы", "тем")}** в **${countLabel(input.groups.length, "проекте", "проектах", "проектах")}**`,
