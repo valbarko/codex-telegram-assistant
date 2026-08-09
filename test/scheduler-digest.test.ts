@@ -100,12 +100,17 @@ describe("dailySummaryPrompt", () => {
     const text = morningDigestText({
       weather: "🌦 Погода · Москва\nясно · +18…+27 °C",
       calendar: [{ title: "Тренировка", start: "15 июля 10:00", calendar: "Работа" }],
+      inspiration: "📌 **Сегодня · среда, 15 июля**\n\n**Памятные дни и поводы для блога**\n\n- День полезного дела",
+      blogTopic: "🧠 **Тема дня для блога**\n\n**Почему мышцы не обязаны болеть**\n\nКороткое объяснение.\n\n**О чём написать:** о крепатуре.\n\n**Заход для поста:** «Боль не равна эффективности».\n\n[Исследование](https://pubmed.ncbi.nlm.nih.gov/1/)",
       groups, inbox: 2, tasks: [], now: Date.parse("2026-07-15T09:00:00+03:00"),
     });
 
     expect(text).toContain("Погода · Москва");
     expect(text).toContain("**+18…+27 °C**");
     expect(text).toContain("Тренировка");
+    expect(text).toContain("Памятные дни и поводы для блога");
+    expect(text).toContain("Тема дня для блога");
+    expect(text).toContain("Боль не равна эффективности");
     expect(text).toContain("Активно: **2 темы** в **2 проектах**");
     expect(text).toContain("❓ **Нужен ответ · КЛИЕНТЫ** — Ответить Анне");
     expect(text).toContain("**ТРЕНЕР · 1** — отчёты.");

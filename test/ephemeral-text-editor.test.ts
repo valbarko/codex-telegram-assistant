@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { cleanEditedText, plainTextEditingPrompt, restrictedForwardedVoicePrompt } from "../src/ephemeral-text-editor.js";
+import {
+  cleanEditedText,
+  dailyBlogTopicPrompt,
+  normalizeDailyBlogTopic,
+  plainTextEditingPrompt,
+  restrictedForwardedVoicePrompt,
+} from "../src/ephemeral-text-editor.js";
 import type { ForwardedVoiceFragment } from "../src/forwarded-voice.js";
 
 describe("ephemeral text editor prompts", () => {
@@ -27,6 +33,31 @@ describe("ephemeral text editor prompts", () => {
 
   it("removes an accidental surrounding code fence", () => {
     expect(cleanEditedText("```text\nГотовый текст.\n```")).toBe("Готовый текст.");
+  });
+
+  it("grounds a daily blog topic in one supplied study and fixes its source link", () => {
+    const study = {
+      sourceId: "123",
+      pillar: "recovery" as const,
+      pillarLabel: "сон, боль и восстановление",
+      title: "Sleep and recovery",
+      abstract: "A small randomized study found a difference and described its limitations.",
+      year: 2025,
+      sourceUrl: "https://pubmed.ncbi.nlm.nih.gov/123/",
+    };
+    const prompt = dailyBlogTopicPrompt(study);
+    const normalized = normalizeDailyBlogTopic([
+      "🧠 **Тема дня для блога**",
+      "", "**Сон — часть тренировочного плана**", "", "Короткое объяснение.", "",
+      "**О чём написать:** о восстановлении.", "", "**Заход для поста:** «Сон нельзя вынести за скобки».", "",
+      "[лишняя ссылка](https://example.com)",
+    ].join("\n"), study.sourceUrl);
+
+    expect(prompt).toContain("Используй только сведения из названия и аннотации");
+    expect(prompt).toContain("не превращай единичный опыт в универсальное правило");
+    expect(prompt).toContain("<STUDY>");
+    expect(normalized).not.toContain("example.com");
+    expect(normalized).toContain("[Исследование](https://pubmed.ncbi.nlm.nih.gov/123/)");
   });
 });
 

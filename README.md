@@ -65,7 +65,7 @@ These inputs never route to commands or the owner's assistant workflows. Audio i
 - `/sessions` — recent Codex threads, sorted by activity
 - `/abort` — interrupt the current turn
 - `/remind` and `/schedule` — notification or Codex run at a later time
-- `/digest on` — morning task plan at 06:00 and a cross-project work summary at 21:00
+- `/digest on` — утренняя сводка в 06:00 с погодой, календарём, памятными днями, темой дня для блога и задачами; межпроектный итог работы в 21:00
 - `/calendar`, `/event`, `/draft`, `/mac` — local Mac integrations
 - `/recall`, `/forget`, `/about_me` — recall, delete, and inspect personal memory
 - `/memory_status`, `/memory_pause`, `/memory_export` — control and export long-term memory

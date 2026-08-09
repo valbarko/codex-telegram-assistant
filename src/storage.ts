@@ -149,6 +149,16 @@ export interface SearchHit {
   changedAt: number;
 }
 
+export interface SentBlogTopic {
+  owner: string;
+  sourceId: string;
+  pillar: string;
+  studyTitle: string;
+  sourceUrl: string;
+  markdown: string;
+  sentAt: number;
+}
+
 export class AssistantDatabase {
   private readonly sql: Database.Database;
 
@@ -482,6 +492,18 @@ export class AssistantDatabase {
     return this.sql.prepare("DELETE FROM alarms WHERE id=?").run(id).changes > 0;
   }
 
+  recordBlogTopic(input: SentBlogTopic): void {
+    this.sql.prepare(`INSERT INTO sent_blog_topics(owner,source_id,pillar,study_title,source_url,markdown,sent_at)
+      VALUES(@owner,@sourceId,@pillar,@studyTitle,@sourceUrl,@markdown,@sentAt)
+      ON CONFLICT(owner,source_id) DO UPDATE SET pillar=excluded.pillar,study_title=excluded.study_title,
+      source_url=excluded.source_url,markdown=excluded.markdown,sent_at=excluded.sent_at`).run(input);
+  }
+
+  sentBlogTopicSourceIds(owner: string, since: number): string[] {
+    return (this.sql.prepare("SELECT source_id FROM sent_blog_topics WHERE owner=? AND sent_at>=? ORDER BY sent_at DESC")
+      .all(owner, since) as Array<{ source_id: string }>).map((row) => row.source_id);
+  }
+
   alignDailyDigests(summaryAt: number, morningAt: number, now = Date.now()): number {
     const summary = this.sql.prepare(`UPDATE alarms SET label='Итог за вчера',
       next_at=CASE WHEN next_at<=? THEN next_at ELSE ? END
@@ -536,6 +558,17 @@ export class AssistantDatabase {
       CREATE INDEX IF NOT EXISTS personal_fact_owner_status ON personal_facts(owner,status,category,changed_at);
       CREATE TABLE IF NOT EXISTS voice_writing_settings(context TEXT PRIMARY KEY, owner TEXT NOT NULL, mode TEXT NOT NULL, story_title TEXT, changed_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS alarms(id TEXT PRIMARY KEY, owner TEXT NOT NULL, label TEXT NOT NULL, next_at INTEGER NOT NULL, cadence TEXT NOT NULL, mode TEXT NOT NULL, prompt TEXT, project TEXT, enabled INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS sent_blog_topics(
+        owner TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        pillar TEXT NOT NULL,
+        study_title TEXT NOT NULL,
+        source_url TEXT NOT NULL,
+        markdown TEXT NOT NULL,
+        sent_at INTEGER NOT NULL,
+        PRIMARY KEY(owner,source_id)
+      );
+      CREATE INDEX IF NOT EXISTS sent_blog_topic_owner_date ON sent_blog_topics(owner,sent_at);
     `);
   }
 }
