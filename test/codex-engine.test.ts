@@ -75,6 +75,20 @@ describe("CodexHub", () => {
     expect(transport.calls.map((call) => call.name)).toEqual(["thread/start", "turn/start"]);
   });
 
+  it("unsubscribes before handing a thread back to Codex on Mac", async () => {
+    const transport = new FakeTransport();
+    const hub = new CodexHub(config, transport as never);
+    await (await hub.conversation("1")).start("/work");
+
+    await hub.detach("1");
+
+    expect(hub.get("1")).toBeUndefined();
+    expect(transport.calls.at(-1)).toEqual({
+      name: "thread/unsubscribe",
+      payload: { threadId: "thread-1" },
+    });
+  });
+
   it("maps command approvals to host responses", async () => {
     const transport = new FakeTransport();
     transport.autoComplete = false;

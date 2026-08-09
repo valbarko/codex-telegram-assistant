@@ -187,7 +187,7 @@ export class TelegramApplication {
         "<b>Память</b>", "/memory_status · /memory_pause · /memory_export · /forget", "",
         "<b>Mac</b>", "/calendar · /event · /draft · /mac", "",
         "<b>Автоматизация</b>", "/schedule · /digest", "",
-        "Начните текст или голосовое с метки «пост», «анонс», «ответ», «дневник», «календарь» и т. п. Без метки голосовое просто расшифруется.",
+        "Начните текст или голосовое с метки «помощник», «пост», «анонс», «ответ», «дневник», «календарь» и т. п. Без метки голосовое просто расшифруется.",
       ].join("\n"), { parse_mode: "HTML", reply_markup: persistentKeyboard() });
     });
 
@@ -546,6 +546,20 @@ export class TelegramApplication {
       await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
       return true;
     }
+    if (command.kind === "assistant") {
+      await clearProgress();
+      const conversation = await this.conversation(ctx);
+      const project = conversation.snapshot().workspace;
+      const augmented = await this.memory.augmentPrompt(ownerId(ctx), command.content, project);
+      const prompt = quietCodexPrompt(augmented);
+      if (conversation.snapshot().running) {
+        await conversation.steer(prompt);
+        await ctx.reply("↪️ Мысль добавлена в текущий ход.");
+      } else {
+        await this.executePrompt(ctx, prompt);
+      }
+      return true;
+    }
     if (command.kind === "task" || command.kind === "reminder" || command.kind === "inbox" || command.kind === "memory" || command.kind === "calendar") {
       await clearProgress();
       if (command.kind === "task") {
@@ -807,6 +821,10 @@ export class TelegramApplication {
   private async handleLocalIntent(ctx: Context, text: string): Promise<boolean> {
     const intent = localIntent(text);
     if (!intent) return false;
+    if (intent === "codex-open") {
+      await this.openOnMac(ctx);
+      return true;
+    }
     if (intent === "calendar-list") {
       await this.showCalendar(ctx);
       return true;
@@ -1242,10 +1260,15 @@ export class TelegramApplication {
   }
 
   private async openOnMac(ctx: Context): Promise<void> {
-    const snapshot = (await this.conversation(ctx)).snapshot();
-    if (!snapshot.threadId) return void await ctx.reply("Сначала откройте или создайте Codex-тред.");
+    const context = contextId(ctx);
+    const active = this.hub.get(context)?.snapshot();
+    const saved = this.database.conversation(context);
+    const threadId = active?.threadId ?? saved?.threadId;
+    const workspace = active?.workspace ?? saved?.workspace;
+    if (!threadId || !workspace) return void await ctx.reply("Сначала откройте или создайте Codex-тред.");
     try {
-      const command = await activateCodexWithResume(snapshot.workspace, snapshot.threadId);
+      await this.hub.detach(context);
+      const command = await activateCodexWithResume(workspace, threadId);
       await ctx.reply(`💻 Codex открыт на Mac. Команда продолжения скопирована:\n<code>${escape(command)}</code>`, { parse_mode: "HTML" });
     } catch (error) {
       logInternalError("Opening Codex on Mac failed", error);
@@ -1548,6 +1571,7 @@ function styleWritingLabel(kind: "post" | "announcement" | "reply"): string {
 }
 function spokenVoiceHelp(): string {
   return ["<b>🎙 Метки-команды для текста и голоса</b>", "Напишите или произнесите метку первым словом и сразу продолжайте:", "",
+    "<b>Помощник</b> — отправить мысль в выбранную задачу Codex и получить ответ в её контексте",
     "<b>Пост</b> — оформить публикацию в вашем стиле",
     "<b>Анонс</b> — сделать короткий анонс в вашем стиле",
     "<b>Ответ</b> — подготовить короткий ответ в вашем стиле",
@@ -1571,9 +1595,10 @@ function oneLine(value: string, limit: number): string { const text = value.repl
 function formatDate(value: number): string { return new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short", timeZone: "Europe/Moscow" }).format(new Date(value)); }
 function distinct(values: string[]): string[] { return [...new Set(values)]; }
 function looksLikeMail(value: string): boolean { const text = value.toLocaleLowerCase("ru-RU"); return /(?:последн|нов|входящ|непрочитанн|найди|покажи|прочитай|ответь).{0,40}(?:письм|почт|gmail)|(?:письм|почт|gmail).{0,40}(?:последн|нов|входящ|непрочитанн|найди|покажи|прочитай|ответь)/i.test(text); }
-export type LocalIntent = "reminder" | "calendar-create" | "calendar-list";
+export type LocalIntent = "reminder" | "calendar-create" | "calendar-list" | "codex-open";
 export function localIntent(value: string): LocalIntent | null {
   const text = value.toLocaleLowerCase("ru-RU");
+  if (/(?:перейд(?:ём|ем|и|ите)|продолж(?:им|ить)|открой|открыть|верн(?:ёмся|емся)).{0,40}(?:codex|кодекс)/i.test(text)) return "codex-open";
   if (/(?:напомни|напоминание|будильник)/i.test(text)) return "reminder";
   if (/(?:создай|добавь|запланируй|поставь).{0,40}(?:в\s+)?календар(?:ь|е)/i.test(text)) return "calendar-create";
   if (/(?:создай|добавь|запланируй|поставь).{0,40}(?:событ|встреч)|(?:событ|встреч).{0,40}(?:создай|добавь|запланируй|поставь)/i.test(text)) return "calendar-create";

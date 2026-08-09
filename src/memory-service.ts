@@ -61,6 +61,8 @@ export class MemoryService {
   private readonly root: string;
   private readonly queues = new Map<string, Promise<void>>();
   private readonly dirty = new Set<string>();
+  private readonly pendingFiles = new Map<string, Set<string>>();
+  private readonly fullReindex = new Set<string>();
   private readonly errors = new Set<string>();
 
   constructor(
@@ -90,7 +92,7 @@ export class MemoryService {
     const file = this.eventFile(event);
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, renderEvent(event), "utf8");
-    this.scheduleIndex(event.owner);
+    this.scheduleIndex(event.owner, file);
     this.knowledge?.capture(event);
     if (event.kind === "explicit") await this.personalContext(event.owner);
     return event;
@@ -119,7 +121,7 @@ export class MemoryService {
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, renderEvent(result.event), { encoding: "utf8", mode: 0o600 });
     if (!options.deferDerived) {
-      this.scheduleIndex(result.event.owner);
+      this.scheduleIndex(result.event.owner, file);
       this.knowledge?.capture(result.event);
     }
     return result;
@@ -138,7 +140,6 @@ export class MemoryService {
 
   async recall(owner: string, query: string, project?: string, limit = 6): Promise<RecallHit[]> {
     if (this.database.memoryPaused(owner) || !query.trim()) return [];
-    await this.waitForIndex(owner);
     const normalizedProject = normalizeProject(project);
     try {
       const candidates = await this.search(owner, query, this.ownerDirectory(owner), Math.max(limit * 4, 20));
@@ -270,7 +271,15 @@ export class MemoryService {
     return JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), events: this.database.memoryEvents(owner, { includeDeleted: true }) }, null, 2);
   }
 
-  private scheduleIndex(owner: string): void {
+  private scheduleIndex(owner: string, file?: string): void {
+    if (file && !this.fullReindex.has(owner)) {
+      const pending = this.pendingFiles.get(owner) ?? new Set<string>();
+      pending.add(file);
+      this.pendingFiles.set(owner, pending);
+    } else if (!file) {
+      this.fullReindex.add(owner);
+      this.pendingFiles.delete(owner);
+    }
     this.dirty.add(owner);
     if (this.queues.has(owner)) return;
     const next = this.indexLoop(owner);
@@ -283,7 +292,16 @@ export class MemoryService {
   }
 
   private async indexLoop(owner: string): Promise<void> {
-    while (this.dirty.delete(owner)) await this.index(owner).catch(() => undefined);
+    while (this.dirty.delete(owner)) {
+      if (this.fullReindex.delete(owner)) {
+        this.pendingFiles.delete(owner);
+        await this.index(owner).catch(() => undefined);
+        continue;
+      }
+      const files = [...(this.pendingFiles.get(owner) ?? [])];
+      this.pendingFiles.delete(owner);
+      await this.indexFiles(owner, files).catch(() => undefined);
+    }
   }
 
   private async waitForIndex(owner: string): Promise<void> {
@@ -524,6 +542,9 @@ function formatProfileDate(value: number): string {
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex").slice(0, 20); }
 function collection(owner: string): string { return `cta_memory_${hash(owner)}`; }
 async function run(executable: string, args: readonly string[]): Promise<string> {
-  const result = await execFileAsync(executable, [...args], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+  const timeout = args[0] === "search" ? 8_000 : 120_000;
+  const result = await execFileAsync(executable, [...args], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout, killSignal: "SIGKILL",
+  });
   return result.stdout;
 }

@@ -70,6 +70,32 @@ describe("MemoryService", () => {
       .toBe("Релевантный фрагмент из середины большого Telegram-архива");
   });
 
+  it("indexes new events incrementally without blocking recall on background indexing", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let finishIndex: (() => void) | undefined;
+    const calls: string[][] = [];
+    const service = new MemoryService(folder, "memsearch", database, async (_executable, args) => {
+      calls.push([...args]);
+      if (args[0] === "index") await new Promise<void>((resolve) => { finishIndex = resolve; });
+      if (args[0] === "search") throw new Error("index is busy");
+      return "";
+    });
+    const event = await service.record({
+      owner: "1", body: "Новая запись не должна задерживать ответ", role: "user", kind: "message",
+    });
+
+    const recalled = await Promise.race([
+      service.recall("1", "задерживать ответ"),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("recall timed out")), 100)),
+    ]);
+
+    expect(recalled.map((hit) => hit.body)).toEqual(["Новая запись не должна задерживать ответ"]);
+    expect(calls.find((args) => args[0] === "index")?.[1]).toMatch(new RegExp(`${event!.id}\\.md$`));
+    finishIndex?.();
+    await service.flush("1");
+    errors.mockRestore();
+  });
+
   it("mirrors source events to derived knowledge and uses local knowledge recall in prompts", async () => {
     const knowledge = {
       capture: vi.fn(),

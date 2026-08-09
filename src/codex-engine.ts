@@ -102,6 +102,13 @@ export class CodexHub {
     this.conversations.delete(context);
   }
 
+  async detach(context: string): Promise<void> {
+    const conversation = this.conversations.get(context);
+    if (!conversation) return;
+    await conversation.detach();
+    this.conversations.delete(context);
+  }
+
   async threads(limit = 50, query?: string): Promise<StoredThread[]> {
     const response = await this.transport.call<{ data?: unknown[] }>("thread/list", {
       limit, archived: false, searchTerm: query || null, sortKey: "updated_at", sortDirection: "desc",
@@ -293,10 +300,15 @@ export class Conversation {
   }
 
   release(): void {
-    if (this.turnId) void this.interrupt();
-    if (this.threadId) void this.transport.call("thread/unsubscribe", { threadId: this.threadId }).catch(() => undefined);
+    void this.detach().catch(() => undefined);
+  }
+
+  async detach(): Promise<void> {
+    const threadId = this.threadId;
+    if (this.turnId) await this.interrupt();
     this.turnId = undefined;
     this.threadId = undefined;
+    if (threadId) await this.transport.call("thread/unsubscribe", { threadId });
   }
 
   private profile(): ExecutionProfile {
