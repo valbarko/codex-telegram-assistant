@@ -75,6 +75,67 @@ describe("MemoryService", () => {
       .toBe("Релевантный фрагмент из середины большого Telegram-архива");
   });
 
+  it("fuses semantic and lexical ranks and prioritizes hits found by both", async () => {
+    const semanticOnly = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Совсем другой эпизод из кофейни", source: "telegram-export:semantic",
+    });
+    const hybrid = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Светлый зал, большие окна и много пространства", source: "telegram-export:hybrid",
+    });
+    const lexicalOnly = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Светлый зал понравился", source: "telegram-export:lexical",
+    });
+    const service = new MemoryService(folder, "memsearch", database, async (_executable, args) => {
+      if (args[0] !== "search") return "";
+      return JSON.stringify([
+        { source: `/tmp/${semanticOnly.id}.md`, score: 0.95, content: semanticOnly.body },
+        { source: `/tmp/${hybrid.id}.md`, score: 0.9, content: hybrid.body },
+      ]);
+    });
+
+    const hits = await service.recall("1", "светлый зал большие окна", "/work/trainer", 3);
+
+    expect(hits[0]).toMatchObject({ id: hybrid.id, retrieval: "hybrid", fusionScore: 1 });
+    expect(hits.map((hit) => hit.id)).toContain(semanticOnly.id);
+    expect(hits.map((hit) => hit.id)).toContain(lexicalOnly.id);
+  });
+
+  it("extracts the matching lexical excerpt from a large archive when semantic search is unavailable", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    database.recordMemoryEvent({
+      owner: "1", namespace: "global", role: "user", kind: "document",
+      body: [
+        ...Array.from({ length: 80 }, (_, index) => `Старая запись номер ${index} без нужной темы.`),
+        "### 2026-08-09T10:00:00.000Z · message 42",
+        "Мне понравился светлый зал: большие окна и пространство.",
+        "После этого идёт другая заметка.",
+      ].join("\n"),
+      source: "telegram-export:large",
+    });
+    const service = new MemoryService(folder, "memsearch", database, async () => { throw new Error("offline"); });
+
+    const hit = (await service.recall("1", "светлый зал большие окна", undefined, 1))[0];
+
+    expect(hit?.body).toContain("Мне понравился светлый зал");
+    expect(hit?.body).not.toContain("Старая запись номер 0");
+    errors.mockRestore();
+  });
+
+  it("matches lexical terms as words instead of accidental substrings", async () => {
+    database.recordMemoryEvent({
+      owner: "1", namespace: "global", role: "user", kind: "message",
+      body: "У меня залежалось два банана, поэтому я решила приготовить банановый кекс",
+      source: "telegram-export:banana",
+    });
+    const service = new MemoryService(folder, "memsearch", database, async (_executable, args) =>
+      args[0] === "search" ? "[]" : "");
+
+    expect(await service.recall("1", "Что я решил про новый зал?", undefined, 5)).toEqual([]);
+  });
+
   it("indexes new events incrementally without blocking recall on background indexing", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     let finishIndex: (() => void) | undefined;
@@ -244,6 +305,46 @@ describe("MemoryService", () => {
     expect(context.length).toBeLessThanOrEqual(3_500);
     expect(prompt).not.toContain("# ABOUT");
     expect(prompt).not.toContain("# NOW");
+  });
+
+  it("keeps automatic memory inside the task boundary and opens cross-task history only for deep recall", async () => {
+    const current = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Текущая задача про условия работы", source: scopedMemorySource("telegram-text", "thread-current"),
+    });
+    const other = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "В другой задаче я выбрал светлый зал", source: scopedMemorySource("telegram-text", "thread-other"),
+    });
+    const legacy = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Старый разговор Codex про окна", source: "telegram-text",
+    });
+    const archive = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "document",
+      body: "В архиве я писал, что предпочитаю светлые залы", source: "telegram-export:archive",
+    });
+    const service = new MemoryService(folder, "memsearch", database, async (_executable, args) => {
+      if (args[0] !== "search") return "";
+      return JSON.stringify([current, other, legacy, archive].map((event, index) => ({
+        source: `/tmp/${event.id}.md`, score: 0.95 - index * 0.01, content: event.body,
+      })));
+    });
+
+    const relevant = await service.augmentPrompt(
+      "1", "Какие условия я предпочитаю?", "/work/trainer", { mode: "relevant", threadId: "thread-current" },
+    );
+    const deep = await service.augmentPrompt(
+      "1", "Что я решил раньше про условия?", "/work/trainer", { mode: "deep", threadId: "thread-current" },
+    );
+
+    expect(relevant).toContain(archive.body);
+    expect(relevant).not.toContain(current.body);
+    expect(relevant).not.toContain(other.body);
+    expect(relevant).not.toContain(legacy.body);
+    expect(deep).not.toContain(current.body);
+    expect(deep).toContain(other.body);
+    expect(deep).toContain(legacy.body);
   });
 
   it("injects NOW without the personal profile for operational questions", async () => {
