@@ -27,6 +27,8 @@ export interface RecallHit {
   source?: string;
   createdAt: number;
   score: number;
+  fusionScore?: number;
+  retrieval?: "semantic" | "lexical" | "hybrid";
 }
 
 export interface RecordMemoryInput {
@@ -64,6 +66,7 @@ export interface PromptContextOptions {
 
 interface RecallOptions {
   excludeQuery?: string;
+  includeOtherThreads?: boolean;
   minScore?: number;
   roles?: readonly MemoryRole[];
   threadId?: string;
@@ -167,10 +170,16 @@ export class MemoryService {
   ): Promise<RecallHit[]> {
     if (this.database.memoryPaused(owner) || !query.trim()) return [];
     const normalizedProject = normalizeProject(project);
+    const candidateLimit = Math.max(limit * 4, 20);
+    const lexical = this.lexicalRecall(owner, query, normalizedProject, candidateLimit, options);
     try {
-      const candidates = await this.search(owner, query, this.ownerDirectory(owner), Math.max(limit * 4, 20));
+      const semantic = await this.search(owner, query, this.ownerDirectory(owner), candidateLimit);
+      this.errors.delete(owner);
       return selectRecallHits(
-        candidates.filter((hit) => !hit.project || hit.project === normalizedProject),
+        reciprocalRankFusion(
+          semantic.filter((hit) => (!hit.project || hit.project === normalizedProject) && recallSourceAllowed(hit.source, options)),
+          lexical,
+        ),
         limit,
         options,
       );
@@ -178,7 +187,7 @@ export class MemoryService {
       logInternalError(`Memory search failed for owner ${owner}`, error);
       this.errors.add(owner);
       return selectRecallHits(
-        this.lexicalRecall(owner, query, normalizedProject, Math.max(limit * 4, 20)),
+        lexical,
         limit,
         options,
       );
@@ -213,6 +222,7 @@ export class MemoryService {
     const [hits, knowledge] = await Promise.all([
       this.recall(owner, query, project, itemLimit * 4, {
         excludeQuery: query,
+        includeOtherThreads: mode === "deep",
         minScore: RELEVANT_SCORE,
         roles: mode === "deep" ? ["user", "assistant"] : ["user"],
         threadId: options.threadId,
@@ -224,6 +234,7 @@ export class MemoryService {
       limit: itemLimit,
       minScore: RELEVANT_SCORE,
       query,
+      includeOtherThreads: mode === "deep",
       threadId: options.threadId,
     });
     if (!context.text) return query;
@@ -380,21 +391,35 @@ export class MemoryService {
       const event = id ? this.database.memoryEvent(id) : undefined;
       if (!event || event.owner !== owner || event.deletedAt) return [];
       const content = row.content?.trim();
-      return [{ ...event, body: cleanRecallText(content || event.body), score: Number(row.score) || 0 } satisfies RecallHit];
+      return [{
+        ...event,
+        body: cleanRecallText(content || event.body),
+        score: Number(row.score) || 0,
+        retrieval: "semantic" as const,
+      } satisfies RecallHit];
     });
   }
 
-  private lexicalRecall(owner: string, query: string, project: string | undefined, limit: number): RecallHit[] {
-    const words = query.toLocaleLowerCase("ru-RU").split(/[^\p{L}\p{N}]+/u)
-      .filter((word) => word.length > 2 && !LEXICAL_STOP_WORDS.has(word));
-    return this.database.memoryEvents(owner).filter((event) => !event.project || event.project === project).map((event) => {
-      const body = event.body.toLocaleLowerCase("ru-RU");
-      const matches = words.reduce((count, word) => {
-        const root = word.length >= 7 ? word.slice(0, 7) : word;
-        return count + (body.includes(word) || body.includes(root) ? 1 : 0);
-      }, 0);
-      return { ...event, score: words.length ? matches / words.length : 0 } satisfies RecallHit;
-    }).filter((hit) => hit.score > 0).sort((left, right) => right.score - left.score || right.createdAt - left.createdAt).slice(0, limit);
+  private lexicalRecall(
+    owner: string,
+    query: string,
+    project: string | undefined,
+    limit: number,
+    options: RecallOptions,
+  ): RecallHit[] {
+    const words = lexicalTerms(query);
+    return this.database.memoryEvents(owner)
+      .filter((event) => (!event.project || event.project === project) && recallSourceAllowed(event.source, options))
+      .map((event) => {
+      const body = bestLexicalExcerpt(event.body, words);
+      return {
+        ...event,
+        body,
+        score: lexicalMatchScore(body, words),
+        retrieval: "lexical" as const,
+      } satisfies RecallHit;
+      }).filter((hit) => hit.score > 0)
+      .sort((left, right) => right.score - left.score || right.createdAt - left.createdAt).slice(0, limit);
   }
 
   private eventFile(event: MemoryEvent): string {
@@ -409,6 +434,92 @@ export class MemoryService {
 const LEXICAL_STOP_WORDS = new Set([
   "как", "какая", "какие", "какой", "когда", "кто", "мне", "мои", "мой", "про", "что", "это",
 ]);
+
+function reciprocalRankFusion(
+  semantic: readonly RecallHit[],
+  lexical: readonly RecallHit[],
+): RecallHit[] {
+  const entries = new Map<string, {
+    channels: Set<"semantic" | "lexical">;
+    fusion: number;
+    hit: RecallHit;
+    rawScore: number;
+  }>();
+  const add = (hits: readonly RecallHit[], channel: "semantic" | "lexical", weight: number): void => {
+    const seen = new Set<string>();
+    let rank = 0;
+    for (const hit of hits) {
+      if (seen.has(hit.id)) continue;
+      seen.add(hit.id);
+      rank += 1;
+      const existing = entries.get(hit.id);
+      if (!existing) {
+        entries.set(hit.id, {
+          channels: new Set([channel]),
+          fusion: weight / (60 + rank),
+          hit,
+          rawScore: hit.score,
+        });
+        continue;
+      }
+      existing.channels.add(channel);
+      existing.fusion += weight / (60 + rank);
+      existing.rawScore = Math.max(existing.rawScore, hit.score);
+      if (channel === "semantic") existing.hit = hit;
+    }
+  };
+  add(semantic, "semantic", 1);
+  add(lexical, "lexical", 0.85);
+  const maxFusion = Math.max(...[...entries.values()].map((entry) => entry.fusion), Number.EPSILON);
+  return [...entries.values()].sort((left, right) => right.fusion - left.fusion).map((entry) => ({
+    ...entry.hit,
+    score: entry.rawScore,
+    fusionScore: entry.fusion / maxFusion,
+    retrieval: entry.channels.size > 1 ? "hybrid" : [...entry.channels][0],
+  }));
+}
+
+function lexicalTerms(value: string): string[] {
+  return normalizeForComparison(value).split(" ")
+    .filter((word) => word.length > 2 && !LEXICAL_STOP_WORDS.has(word));
+}
+
+function lexicalMatchScore(value: string, terms: readonly string[]): number {
+  if (!terms.length) return 0;
+  const text = normalizeForComparison(value);
+  const tokens = text.split(" ").filter(Boolean);
+  const matches = terms.reduce((count, word) => {
+    const root = word.length >= 7 ? word.slice(0, Math.max(5, word.length - 3)) : word;
+    const matched = tokens.some((token) => token === word || (word.length >= 7 && token.startsWith(root)));
+    return count + (matched ? 1 : 0);
+  }, 0);
+  const coverage = matches / terms.length;
+  const wordCount = tokens.length;
+  const density = wordCount > 120 ? Math.max(0.5, 120 / wordCount) : 1;
+  return coverage * density;
+}
+
+function bestLexicalExcerpt(value: string, terms: readonly string[]): string {
+  const text = cleanRecallText(value);
+  if (text.length <= 900 || !terms.length) return text;
+  const lines = text.split(/\r?\n/).flatMap((line) => {
+    if (line.length <= 700) return [line];
+    const chunks: string[] = [];
+    for (let start = 0; start < line.length; start += 500) chunks.push(line.slice(start, start + 650));
+    return chunks;
+  });
+  let best = "";
+  let bestScore = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const excerpt = lines.slice(Math.max(0, index - 1), Math.min(lines.length, index + 3)).join("\n").trim();
+    const score = lexicalMatchScore(excerpt, terms);
+    if (score > bestScore || (score === bestScore && excerpt.length < best.length)) {
+      best = excerpt;
+      bestScore = score;
+    }
+  }
+  return cleanRecallText(best || text.slice(0, 900));
+}
 
 export function sanitizeMemoryContent(value: string): string | undefined {
   const source = value.trim();
@@ -557,6 +668,7 @@ function formatKnowledgeHits(hits: readonly KnowledgeRecallHit[]): string {
 
 interface RecallContextOptions {
   budget: number;
+  includeOtherThreads: boolean;
   limit: number;
   minScore: number;
   query: string;
@@ -614,7 +726,7 @@ function selectRecallHits(candidates: readonly RecallHit[], limit: number, optio
     recallRankScore(right) - recallRankScore(left) || right.score - left.score || right.createdAt - left.createdAt)) {
     if (hit.score < (options.minScore ?? 0)) continue;
     if (roles && !roles.has(hit.role)) continue;
-    if (options.threadId && sourceBelongsToThread(hit.source, options.threadId)) continue;
+    if (!recallSourceAllowed(hit.source, options)) continue;
     if (options.excludeQuery && nearDuplicate(hit.body, options.excludeQuery, 0.9)) continue;
     if (selected.some((existing) => nearDuplicate(existing.body, hit.body, 0.9))) continue;
     selected.push(hit);
@@ -644,6 +756,7 @@ function buildRecallContext(
   for (const hit of knowledge) {
     if (hit.score < options.minScore) continue;
     if (options.threadId && sourceBelongsToThread(hit.source, options.threadId)) continue;
+    if (!options.includeOtherThreads && isTaskConversationSource(hit.source)) continue;
     if (nearDuplicate(hit.text, options.query, 0.9)) continue;
     if (candidates.some((candidate) => nearDuplicate(candidate.text, hit.text, 0.9))) continue;
     const label = hit.type === "observation" ? "вероятный вывод"
@@ -682,6 +795,18 @@ function sourceBelongsToThread(source: string | undefined, threadId: string): bo
   return source.split(";").includes(`thread=${encodeURIComponent(threadId.trim())}`);
 }
 
+function recallSourceAllowed(source: string | undefined, options: RecallOptions): boolean {
+  if (options.threadId && sourceBelongsToThread(source, options.threadId)) return false;
+  return options.includeOtherThreads !== false || !isTaskConversationSource(source);
+}
+
+function isTaskConversationSource(source: string | undefined): boolean {
+  if (!source) return false;
+  const parts = source.split(";");
+  if (parts.some((part) => part.startsWith("thread="))) return true;
+  return parts[0] === "telegram-text" || parts[0] === "telegram-voice" || parts[0] === "codex-final";
+}
+
 function displayMemorySource(source: string | undefined): string {
   return source?.split(";").filter((part) => !part.startsWith("thread=")).join(";").trim() ?? "";
 }
@@ -702,9 +827,12 @@ function nearDuplicate(left: string, right: string, threshold: number): boolean 
 
 function recallRankScore(hit: RecallHit): number {
   const text = cleanRecallText(hit.body);
-  const shortPenalty = text.length < 24 ? 0.16 : text.length < 60 ? 0.08 : 0;
-  const questionPenalty = /\?\s*$/u.test(text) ? 0.06 : 0;
-  return hit.score - shortPenalty - questionPenalty;
+  const shortPenalty = text.length < 24 ? 0.22 : text.length < 60 ? 0.12 : 0;
+  const questionPenalty = /\?\s*$/u.test(text) ? 0.15 : 0;
+  const retrievalScore = hit.fusionScore === undefined
+    ? hit.score
+    : 0.7 * hit.fusionScore + 0.3 * hit.score;
+  return retrievalScore - shortPenalty - questionPenalty;
 }
 
 function cleanRecallText(value: string): string {
