@@ -124,7 +124,9 @@ export class BackgroundScheduler {
       approval: async () => "decline",
     };
     try {
-      const prompt = await this.memory.augmentPrompt(task.owner, task.prompt, workspace);
+      const prompt = await this.memory.augmentPrompt(task.owner, task.prompt, workspace, {
+        threadId: conversation.snapshot().threadId,
+      });
       await this.memory.record({ owner: task.owner, body: `Запуск фоновой задачи: ${task.prompt}`, role: "action", kind: "action", project: workspace, source: "scheduler" });
       await conversation.run(quietCodexPrompt(prompt), observer);
       const polishedResponse = await this.polishContent(response.trim());

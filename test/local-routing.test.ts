@@ -19,10 +19,11 @@ describe("local Telegram routing", () => {
 describe("quiet Codex policy", () => {
   it("suppresses internal implementation narration", () => {
     const prompt = quietCodexPrompt("проверь проект");
-    expect(prompt).toContain("Не описывай внутренние skills, MCP, RTK, PATH");
-    expect(prompt).toContain("Пиши по-русски в стиле Валентина");
-    expect(prompt).toContain("не придумывай личный опыт");
+    expect(prompt).toContain("Не описывай внутренние инструменты");
+    expect(prompt).toContain("Ответь по-русски");
+    expect(prompt).toContain("Не выдумывай факты, личный опыт или эмоции");
     expect(prompt).toContain("проверь проект");
+    expect(prompt.length - "проверь проект".length).toBeLessThan(350);
   });
 
   it("asks Codex to clarify an unparsed local command without acting", () => {

@@ -4,7 +4,12 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { MemoryService, sanitizeMemoryContent } from "../src/memory-service.js";
+import {
+  contextModeForQuery,
+  MemoryService,
+  sanitizeMemoryContent,
+  scopedMemorySource,
+} from "../src/memory-service.js";
 import { AssistantDatabase } from "../src/storage.js";
 
 describe("MemoryService", () => {
@@ -115,7 +120,8 @@ describe("MemoryService", () => {
     });
 
     expect(knowledge.capture).toHaveBeenCalledWith(event);
-    expect(await service.augmentPrompt("1", "Как построить ответ?")).toContain("конкретный результат");
+    expect(await service.augmentPrompt("1", "Как построить ответ?", undefined, { mode: "relevant" }))
+      .toContain("конкретный результат");
     expect(service.status("1")).toContain("Hindsight: готов");
     expect(await service.forget("1", event!.id)).toBe(true);
     expect(knowledge.remove).toHaveBeenCalledWith(expect.objectContaining({ id: event!.id }));
@@ -158,5 +164,101 @@ describe("MemoryService", () => {
     expect(views.now).toContain("Проверить импорт памяти");
     expect(readFileSync(path.join(views.directory, "ABOUT.md"), "utf8")).toBe(views.about);
     expect(readFileSync(path.join(views.directory, "NOW.md"), "utf8")).toBe(views.now);
+  });
+
+  it("keeps ordinary same-thread messages free from memory payloads", async () => {
+    const runCommand = vi.fn(async () => "[]");
+    const knowledge = {
+      capture: vi.fn(),
+      remove: vi.fn(),
+      recall: vi.fn(async () => []),
+      reflect: vi.fn(async () => undefined),
+      status: vi.fn(() => "Hindsight: готов"),
+    };
+    const service = new MemoryService(folder, "memsearch", database, runCommand, knowledge);
+    const query = "Его могу проходить в отпуске? Это считается отдыхом?";
+
+    expect(await service.augmentPrompt("1", query, "/work/trainer", { threadId: "thread-1" })).toBe(query);
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(knowledge.recall).not.toHaveBeenCalled();
+  });
+
+  it("routes only explicit historical and operational questions to context", () => {
+    expect(contextModeForQuery("Его могу проходить в отпуске?")).toBe("none");
+    expect(contextModeForQuery("Какие ответы я предпочитаю?")).toBe("relevant");
+    expect(contextModeForQuery("Что я решил про новый зал?")).toBe("deep");
+    expect(contextModeForQuery("Какие у меня задачи и напоминания на сегодня?")).toBe("operational");
+  });
+
+  it("filters weak, duplicate, current-thread and current-query memories", async () => {
+    const current = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Текущий чат не должен вернуться в промпт", source: scopedMemorySource("telegram-text", "thread-1"),
+    });
+    const duplicate = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "voice",
+      body: "Мне понравился светлый зал с большими окнами", source: scopedMemorySource("telegram-voice", "thread-2"),
+    });
+    const distinct = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Я решил посмотреть ещё несколько залов после отпуска", source: scopedMemorySource("telegram-text", "thread-3"),
+    });
+    const weak = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "document",
+      body: "Старый нерелевантный черновик про ролики", source: "apple-notes:test",
+    });
+    const queryCopy = database.recordMemoryEvent({
+      owner: "1", namespace: "project", project: "/work/trainer", role: "user", kind: "message",
+      body: "Помощник, что я решил про новый зал?", source: scopedMemorySource("telegram-text", "thread-4"),
+    });
+    const scores = new Map([
+      [current.id, 0.99], [duplicate.id, 0.91], [distinct.id, 0.87], [weak.id, 0.2], [queryCopy.id, 0.98],
+    ]);
+    const runCommand = vi.fn(async (_executable: string, args: readonly string[]) => {
+      if (args[0] !== "search") return "";
+      return JSON.stringify([...scores].map(([id, score]) => ({ source: `/tmp/${id}.md`, score })));
+    });
+    const knowledge = {
+      capture: vi.fn(),
+      remove: vi.fn(),
+      recall: vi.fn(async () => [{
+        id: "observation-1",
+        text: "Мне понравился светлый зал с большими окнами",
+        type: "observation",
+        score: 0.96,
+      }]),
+      reflect: vi.fn(async () => undefined),
+      status: vi.fn(() => "Hindsight: готов"),
+    };
+    const service = new MemoryService(folder, "memsearch", database, runCommand, knowledge);
+    const query = "Что я решил про новый зал?";
+
+    const prompt = await service.augmentPrompt("1", query, "/work/trainer", { threadId: "thread-1" });
+    const context = prompt.split("\n\nТекущий запрос:")[0];
+
+    expect(prompt).not.toContain(current.body);
+    expect(prompt).not.toContain(weak.body);
+    expect(prompt).not.toContain(queryCopy.body);
+    expect(prompt.split(duplicate.body)).toHaveLength(2);
+    expect(prompt).toContain(distinct.body);
+    expect(context.length).toBeLessThanOrEqual(3_500);
+    expect(prompt).not.toContain("# ABOUT");
+    expect(prompt).not.toContain("# NOW");
+  });
+
+  it("injects NOW without the personal profile for operational questions", async () => {
+    const service = new MemoryService(folder, "memsearch", database, async () => "[]");
+    database.upsertPersonalFact({
+      id: "identity:name", owner: "1", category: "identity", statement: "Имя — Валентин",
+      subject: "Валентин", predicate: "name", object: "Валентин", status: "current", confidence: 1,
+      observedAt: Date.parse("2026-08-09T00:00:00Z"), source: "user-confirmed:test",
+    });
+    database.createTask({ owner: "1", title: "Проверить билеты" });
+
+    const prompt = await service.augmentPrompt("1", "Какие у меня задачи на сегодня?");
+
+    expect(prompt).toContain("Проверить билеты");
+    expect(prompt).not.toContain("Имя — Валентин");
+    expect(prompt).not.toContain("# ABOUT");
   });
 });

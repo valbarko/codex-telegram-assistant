@@ -16,7 +16,7 @@ import { ForwardedVoiceBatcher, ForwardedVoiceEditor, forwardedVoiceHeading,
 import { activateCodexWithResume, addAppleChecklistItem, addCalendarEvent, addSystemAlarm, appendAppleNote, makeMailDraft,
   upcomingCalendar } from "./mac-bridge.js";
 import { MediaSummaryService, parseSupportedMediaUrl, type MediaSummaryProgress } from "./media-summary.js";
-import { MemoryService, type RecallHit } from "./memory-service.js";
+import { MemoryService, scopedMemorySource, type RecallHit } from "./memory-service.js";
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { logInternalError, publicErrorMessage } from "./public-errors.js";
@@ -376,13 +376,19 @@ export class TelegramApplication {
         await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, await this.formatSourceText(raw));
         return;
       }
+      const command = parseSpokenVoiceCommand(raw);
+      if (!forwarded.key && command.kind === "assistant" && command.label) {
+        if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
+      }
       await this.memory.record({
         owner: ownerId(ctx),
         body: raw,
         role: "user",
         kind: "voice",
         project: this.memoryProject(ctx),
-        source: forwarded.key ? `telegram-forwarded-voice:${sender || forwarded.key}` : "telegram-voice",
+        source: forwarded.key
+          ? `telegram-forwarded-voice:${sender || forwarded.key}`
+          : this.memorySource(ctx, "telegram-voice"),
       });
       if (forwarded.key) {
         const batchKey = `${contextId(ctx)}:${forwarded.key}`;
@@ -402,8 +408,7 @@ export class TelegramApplication {
           `🎙 Фрагмент ${count} принят · собираю пересылки ещё 45 секунд…`).catch(() => undefined);
         return;
       }
-      const command = parseSpokenVoiceCommand(raw);
-      if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id)) return;
+      if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
       await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
     } catch (error) {
@@ -524,7 +529,7 @@ export class TelegramApplication {
   }
 
   private async handleLabeledCommand(ctx: Context, command: SpokenVoiceCommand, raw: string, sentAt: number,
-    sender?: string, existingProgressId?: number): Promise<boolean> {
+    sender?: string, existingProgressId?: number, inputKind: "message" | "voice" = "message"): Promise<boolean> {
     if (!command.label) return false;
     const clearProgress = async (): Promise<void> => {
       if (existingProgressId !== undefined) {
@@ -549,10 +554,21 @@ export class TelegramApplication {
     if (command.kind === "assistant") {
       await clearProgress();
       const conversation = await this.conversation(ctx);
-      const project = conversation.snapshot().workspace;
-      const augmented = await this.memory.augmentPrompt(ownerId(ctx), command.content, project);
+      const snapshot = conversation.snapshot();
+      const project = snapshot.workspace;
+      const augmented = await this.memory.augmentPrompt(ownerId(ctx), command.content, project, {
+        threadId: snapshot.threadId,
+      });
+      await this.memory.record({
+        owner: ownerId(ctx),
+        body: raw,
+        role: "user",
+        kind: inputKind,
+        project,
+        source: scopedMemorySource(inputKind === "voice" ? "telegram-voice" : "telegram-text", snapshot.threadId),
+      });
       const prompt = quietCodexPrompt(augmented);
-      if (conversation.snapshot().running) {
+      if (snapshot.running) {
         await conversation.steer(prompt);
         await ctx.reply("↪️ Мысль добавлена в текущий ход.");
       } else {
@@ -765,10 +781,10 @@ export class TelegramApplication {
     if (labeled.label) {
       const action = labeled.kind === "calendar" || labeled.kind === "task" || labeled.kind === "reminder"
         || labeled.kind === "inbox" || labeled.kind === "memory";
-      await this.rememberIncoming(ctx, text, action ? "action" : "message");
+      if (labeled.kind !== "assistant") await this.rememberIncoming(ctx, text, action ? "action" : "message");
       const sender = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = ctx.message?.date ? ctx.message.date * 1000 : Date.now();
-      if (await this.handleLabeledCommand(ctx, labeled, text, sentAt, sender)) return;
+      if (await this.handleLabeledCommand(ctx, labeled, text, sentAt, sender, undefined, "message")) return;
     }
     const intent = localIntent(text);
     let localFallback = false;
@@ -780,9 +796,13 @@ export class TelegramApplication {
       localFallback = true;
     }
     const conversation = await this.conversation(ctx);
-    const project = conversation.snapshot().workspace;
-    const augmented = await this.memory.augmentPrompt(ownerId(ctx), text, project);
-    await this.memory.record({ owner: ownerId(ctx), body: text, role: "user", kind: "message", project, source: "telegram-text" });
+    const snapshot = conversation.snapshot();
+    const project = snapshot.workspace;
+    const augmented = await this.memory.augmentPrompt(ownerId(ctx), text, project, { threadId: snapshot.threadId });
+    await this.memory.record({
+      owner: ownerId(ctx), body: text, role: "user", kind: "message", project,
+      source: scopedMemorySource("telegram-text", snapshot.threadId),
+    });
     const routed = looksLikeMail(text) ? gmailPrompt(augmented)
       : quietCodexPrompt(localFallback ? localCommandFallbackPrompt(augmented) : augmented);
     if (conversation.snapshot().running) {
@@ -865,7 +885,13 @@ export class TelegramApplication {
       const answer = await this.polishAssistantResponse(view.content());
       await view.finish(answer);
       this.persist(ctx, conversation);
-      if (answer) await this.memory.record({ owner: ownerId(ctx), body: answer, role: "assistant", kind: "response", project: conversation.snapshot().workspace, source: "codex-final" });
+      if (answer) {
+        const snapshot = conversation.snapshot();
+        await this.memory.record({
+          owner: ownerId(ctx), body: answer, role: "assistant", kind: "response", project: snapshot.workspace,
+          source: scopedMemorySource("codex-final", snapshot.threadId),
+        });
+      }
     } catch (error) {
       logInternalError("Codex request failed", error);
       await view.fail();
@@ -1412,8 +1438,15 @@ export class TelegramApplication {
     return this.database.conversation(contextId(ctx))?.workspace;
   }
 
+  private memorySource(ctx: Context, source: string): string {
+    return scopedMemorySource(source, this.database.conversation(contextId(ctx))?.threadId);
+  }
+
   private async rememberIncoming(ctx: Context, body: string, kind: "message" | "action" = "message"): Promise<void> {
-    await this.memory.record({ owner: ownerId(ctx), body, role: kind === "action" ? "action" : "user", kind, project: this.memoryProject(ctx), source: "telegram-text" });
+    await this.memory.record({
+      owner: ownerId(ctx), body, role: kind === "action" ? "action" : "user", kind,
+      project: this.memoryProject(ctx), source: this.memorySource(ctx, "telegram-text"),
+    });
   }
 
   private cancelApprovals(context: string): void {
