@@ -82,6 +82,9 @@ describe("voice writing", () => {
     expect(parseSpokenVoiceCommand("Ответ: да, можно начать с двух тренировок")).toEqual({
       kind: "reply", content: "да, можно начать с двух тренировок", label: "ответ",
     });
+    expect(parseSpokenVoiceCommand("Помощник, сегодня я наконец выспался")).toEqual({
+      kind: "assistant", content: "сегодня я наконец выспался", label: "помощник",
+    });
     expect(parseSpokenVoiceCommand("Заметки")).toEqual({ kind: "diary", content: "", label: "заметки" });
     expect(parseSpokenVoiceCommand("Просто обычная речь")).toEqual({ kind: "transcript", content: "Просто обычная речь" });
   });

@@ -9,6 +9,8 @@ describe("local Telegram routing", () => {
     expect(localIntent("создай событие сегодня, 18:00")).toBe("calendar-create");
     expect(localIntent("создай задачу в календаре на сегодня 18:00 стоматолог")).toBe("calendar-create");
     expect(localIntent("покажи ближайшие события календаря")).toBe("calendar-list");
+    expect(localIntent("давай перейдем в кодекс")).toBe("codex-open");
+    expect(localIntent("продолжим этот чат в Codex")).toBe("codex-open");
   });
 
   it("leaves unrelated work for Codex", () => expect(localIntent("проверь git status проекта")).toBeNull());
