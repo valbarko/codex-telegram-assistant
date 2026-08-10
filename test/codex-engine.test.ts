@@ -5,29 +5,34 @@ import { CodexHub } from "../src/codex-engine.js";
 import type { EventListener, HostRequestListener, RpcRecord } from "../src/appserver-transport.js";
 
 class FakeTransport {
-  event?: EventListener;
+  events = new Set<EventListener>();
   host?: HostRequestListener;
   calls: Array<{ name: string; payload: RpcRecord }> = [];
   autoComplete = true;
+  closeCalls = 0;
+  threadSerial = 0;
   async connect() {}
-  listen(listener: EventListener) { this.event = listener; return () => { this.event = undefined; }; }
+  listen(listener: EventListener) { this.events.add(listener); return () => { this.events.delete(listener); }; }
   answerRequestsFor(_thread: string, listener?: HostRequestListener) { this.host = listener; }
   emit() {}
-  close() {}
+  async close() { this.closeCalls += 1; }
   async call<T>(name: string, payload: RpcRecord): Promise<T> {
     this.calls.push({ name, payload });
-    if (name === "thread/start" || name === "thread/resume") return { thread: { id: "thread-1" }, cwd: "/work", model: "gpt" } as T;
+    if (name === "thread/start") return { thread: { id: `thread-${++this.threadSerial}` }, cwd: "/work", model: "gpt" } as T;
+    if (name === "thread/resume") return { thread: { id: payload.threadId }, cwd: "/work", model: "gpt" } as T;
     if (name === "turn/start") {
+      const threadId = String(payload.threadId);
       queueMicrotask(() => {
-        this.event?.("turn/started", { threadId: "thread-1", turn: { id: "turn-1" } });
-        this.event?.("item/agentMessage/delta", { threadId: "thread-1", turnId: "turn-1", delta: "Готово" });
-        if (this.autoComplete) this.complete();
+        this.notify("turn/started", { threadId, turn: { id: "turn-1" } });
+        this.notify("item/agentMessage/delta", { threadId, turnId: "turn-1", delta: "Готово" });
+        if (this.autoComplete) this.complete(threadId);
       });
       return { turn: { id: "turn-1" } } as T;
     }
     return {} as T;
   }
-  complete() { this.event?.("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } }); }
+  complete(threadId = "thread-1") { this.notify("turn/completed", { threadId, turn: { id: "turn-1", status: "completed" } }); }
+  private notify(name: string, payload: RpcRecord) { for (const event of this.events) event(name, payload); }
 }
 
 const config: AppConfiguration = {
@@ -73,6 +78,44 @@ describe("CodexHub", () => {
     await conversation.run("Проверка", { text, toolStarted() {}, toolProgress() {}, toolFinished() {} });
     expect(text).toHaveBeenCalledWith("Готово");
     expect(transport.calls.map((call) => call.name)).toEqual(["thread/start", "turn/start"]);
+    expect(transport.closeCalls).toBe(1);
+    expect(conversation.snapshot().threadId).toBe("thread-1");
+  });
+
+  it("releases the writer after each turn and resumes the saved thread on the next turn", async () => {
+    const transport = new FakeTransport();
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1", { threadId: "thread-1", workspace: "/work" });
+    const observer = { text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {} };
+
+    await conversation.run("Первый ход", observer);
+    await conversation.run("Второй ход", observer);
+
+    expect(transport.calls.map((call) => call.name)).toEqual([
+      "thread/resume", "turn/start", "thread/resume", "turn/start",
+    ]);
+    expect(transport.closeCalls).toBe(2);
+    expect(conversation.snapshot().threadId).toBe("thread-1");
+  });
+
+  it("waits for all concurrent turns before closing the shared app-server", async () => {
+    const transport = new FakeTransport();
+    transport.autoComplete = false;
+    const hub = new CodexHub(config, transport as never);
+    const first = await hub.conversation("1");
+    const second = await hub.conversation("2");
+    const observer = { text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {} };
+
+    const firstRun = first.run("Первый", observer);
+    const secondRun = second.run("Второй", observer);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    transport.complete("thread-1");
+    await firstRun;
+    expect(transport.closeCalls).toBe(0);
+
+    transport.complete("thread-2");
+    await secondRun;
+    expect(transport.closeCalls).toBe(1);
   });
 
   it("unsubscribes before handing a thread back to Codex on Mac", async () => {
@@ -87,6 +130,7 @@ describe("CodexHub", () => {
       name: "thread/unsubscribe",
       payload: { threadId: "thread-1" },
     });
+    expect(transport.closeCalls).toBe(1);
   });
 
   it("maps command approvals to host responses", async () => {
