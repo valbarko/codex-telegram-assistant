@@ -75,8 +75,16 @@ interface TurnOpenResult {
   turn: { id: string };
 }
 
+interface RuntimeLifecycle {
+  use<T>(operation: () => Promise<T>): Promise<T>;
+  releaseWriters(): Promise<void>;
+}
+
 export class CodexHub {
   private readonly conversations = new Map<string, Conversation>();
+  private runtimeUsers = 0;
+  private closeRequested = false;
+  private runtimeClosing?: Promise<void>;
 
   constructor(
     private readonly configuration: AppConfiguration,
@@ -86,9 +94,10 @@ export class CodexHub {
   async conversation(context: string, saved?: Partial<ConversationSnapshot>): Promise<Conversation> {
     const existing = this.conversations.get(context);
     if (existing) return existing;
-    await this.transport.connect();
-    const created = new Conversation(this.transport, this.configuration, saved);
-    if (saved?.threadId) await created.resume(saved.threadId);
+    const created = new Conversation(this.transport, this.configuration, {
+      use: (operation) => this.useRuntime(operation),
+      releaseWriters: () => this.releaseWriters(),
+    }, saved);
     this.conversations.set(context, created);
     return created;
   }
@@ -110,29 +119,56 @@ export class CodexHub {
   }
 
   async threads(limit = 50, query?: string): Promise<StoredThread[]> {
-    const response = await this.transport.call<{ data?: unknown[] }>("thread/list", {
+    const response = await this.useRuntime(() => this.transport.call<{ data?: unknown[] }>("thread/list", {
       limit, archived: false, searchTerm: query || null, sortKey: "updated_at", sortDirection: "desc",
-    });
+    }));
     return (response.data ?? []).map(readStoredThread).filter((thread): thread is StoredThread => thread !== null);
   }
 
   async archive(threadId: string): Promise<void> {
-    await this.transport.call("thread/archive", { threadId });
+    await this.useRuntime(() => this.transport.call("thread/archive", { threadId }));
   }
 
   async rename(threadId: string, name: string): Promise<void> {
-    await this.transport.call("thread/name/set", { threadId, name });
+    await this.useRuntime(() => this.transport.call("thread/name/set", { threadId, name }));
   }
 
   async fork(threadId: string): Promise<string> {
-    const response = await this.transport.call<{ thread: { id: string } }>("thread/fork", { threadId });
+    const response = await this.useRuntime(() => this.transport.call<{ thread: { id: string } }>("thread/fork", { threadId }));
     return response.thread.id;
   }
 
   shutdown(): void {
     for (const conversation of this.conversations.values()) conversation.release();
     this.conversations.clear();
-    this.transport.close();
+    void this.transport.close();
+  }
+
+  private async useRuntime<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.runtimeClosing) await this.runtimeClosing;
+    this.runtimeUsers += 1;
+    try {
+      return await operation();
+    } finally {
+      this.runtimeUsers -= 1;
+      if (this.runtimeUsers === 0 && this.closeRequested) await this.closeRuntime();
+    }
+  }
+
+  private async releaseWriters(): Promise<void> {
+    this.closeRequested = true;
+    if (this.runtimeUsers === 0) await this.closeRuntime();
+  }
+
+  private async closeRuntime(): Promise<void> {
+    if (this.runtimeClosing) return this.runtimeClosing;
+    this.closeRequested = false;
+    for (const conversation of this.conversations.values()) conversation.runtimeClosed();
+    const closing = this.transport.close().finally(() => {
+      if (this.runtimeClosing === closing) this.runtimeClosing = undefined;
+    });
+    this.runtimeClosing = closing;
+    return closing;
   }
 }
 
@@ -144,10 +180,12 @@ export class Conversation {
   private profileId: string;
   private turnId?: string;
   private tokens: TokenCount = { input: 0, cached: 0, output: 0 };
+  private runtimeAttached = false;
 
   constructor(
     private readonly transport: AppServerTransport,
     private readonly configuration: AppConfiguration,
+    private readonly lifecycle: RuntimeLifecycle,
     saved?: Partial<ConversationSnapshot>,
   ) {
     this.threadId = saved?.threadId;
@@ -185,6 +223,10 @@ export class Conversation {
   }
 
   async start(workspace = this.workspace, name?: string): Promise<ConversationSnapshot> {
+    return this.lifecycle.use(() => this.startAttached(workspace, name));
+  }
+
+  private async startAttached(workspace = this.workspace, name?: string): Promise<ConversationSnapshot> {
     this.ensureIdle();
     const profile = this.profile();
     const result = await this.transport.call<ThreadOpenResult>("thread/start", {
@@ -199,6 +241,7 @@ export class Conversation {
     this.workspace = result.cwd || workspace;
     this.model = result.model || this.model;
     this.effort = result.reasoningEffort || this.effort;
+    this.runtimeAttached = true;
     const threadName = name?.trim();
     if (threadName) {
       try {
@@ -211,6 +254,10 @@ export class Conversation {
   }
 
   async resume(threadId: string): Promise<ConversationSnapshot> {
+    return this.lifecycle.use(() => this.resumeAttached(threadId));
+  }
+
+  private async resumeAttached(threadId: string): Promise<ConversationSnapshot> {
     this.ensureIdle();
     const profile = this.profile();
     const result = await this.transport.call<ThreadOpenResult>("thread/resume", {
@@ -225,68 +272,73 @@ export class Conversation {
     this.workspace = result.cwd || this.workspace;
     this.model = result.model || this.model;
     this.effort = result.reasoningEffort || this.effort;
+    this.runtimeAttached = true;
     return this.snapshot();
   }
 
   async run(input: AssistantInput, observer: TurnObserver): Promise<void> {
-    if (!this.threadId) await this.start();
-    if (this.turnId) throw new Error("A turn is already running");
-    const threadId = this.threadId!;
-    const profile = this.profile();
-    let complete!: () => void;
-    let fail!: (error: Error) => void;
-    let finished = false;
-    const result = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
-    const outputs = new Map<string, string>();
-    const settle = (error?: Error): void => {
-      if (finished) return;
-      finished = true;
-      error ? fail(error) : complete();
-    };
-    const stopListening = this.transport.listen((name, payload) => {
-      if (name === "transport/disconnected") return settle(new Error(text(payload, "message") || "app-server disconnected"));
-      if (payload.threadId !== threadId) return;
-      const eventTurn = text(payload, "turnId") || text(record(payload.turn), "id");
-      if (this.turnId && eventTurn && eventTurn !== this.turnId) return;
-      if (name === "turn/started" && eventTurn) this.turnId = eventTurn;
-      else if (name === "item/agentMessage/delta") observer.text(text(payload, "delta"));
-      else if (name === "item/started") started(record(payload.item), observer);
-      else if (name === "item/commandExecution/outputDelta") progress(payload, observer, outputs);
-      else if (name === "item/mcpToolCall/progress") observer.toolProgress(text(payload, "itemId"), text(payload, "message"));
-      else if (name === "item/completed") completed(record(payload.item), observer, outputs);
-      else if (name === "turn/plan/updated") observer.plan?.(readPlan(payload.plan));
-      else if (name === "thread/tokenUsage/updated") {
-        const usage = record(payload.tokenUsage);
-        const total = readTokens(record(usage.total));
-        const last = readTokens(record(usage.last));
-        this.tokens = total;
-        observer.usage?.(last, total);
-      } else if (name === "error" && payload.willRetry !== true) {
-        settle(new Error(text(record(payload.error), "message") || "Codex failed"));
-      } else if (name === "turn/completed") {
-        const turn = record(payload.turn);
-        const status = text(turn, "status");
-        settle(status === "failed" ? new Error(text(record(turn.error), "message") || "Codex turn failed") : undefined);
+    await this.lifecycle.use(async () => {
+      if (!this.threadId) await this.startAttached();
+      else if (!this.runtimeAttached) await this.resumeAttached(this.threadId);
+      if (this.turnId) throw new Error("A turn is already running");
+      const threadId = this.threadId!;
+      const profile = this.profile();
+      let complete!: () => void;
+      let fail!: (error: Error) => void;
+      let finished = false;
+      const result = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
+      const outputs = new Map<string, string>();
+      const settle = (error?: Error): void => {
+        if (finished) return;
+        finished = true;
+        error ? fail(error) : complete();
+      };
+      const stopListening = this.transport.listen((name, payload) => {
+        if (name === "transport/disconnected") return settle(new Error(text(payload, "message") || "app-server disconnected"));
+        if (payload.threadId !== threadId) return;
+        const eventTurn = text(payload, "turnId") || text(record(payload.turn), "id");
+        if (this.turnId && eventTurn && eventTurn !== this.turnId) return;
+        if (name === "turn/started" && eventTurn) this.turnId = eventTurn;
+        else if (name === "item/agentMessage/delta") observer.text(text(payload, "delta"));
+        else if (name === "item/started") started(record(payload.item), observer);
+        else if (name === "item/commandExecution/outputDelta") progress(payload, observer, outputs);
+        else if (name === "item/mcpToolCall/progress") observer.toolProgress(text(payload, "itemId"), text(payload, "message"));
+        else if (name === "item/completed") completed(record(payload.item), observer, outputs);
+        else if (name === "turn/plan/updated") observer.plan?.(readPlan(payload.plan));
+        else if (name === "thread/tokenUsage/updated") {
+          const usage = record(payload.tokenUsage);
+          const total = readTokens(record(usage.total));
+          const last = readTokens(record(usage.last));
+          this.tokens = total;
+          observer.usage?.(last, total);
+        } else if (name === "error" && payload.willRetry !== true) {
+          settle(new Error(text(record(payload.error), "message") || "Codex failed"));
+        } else if (name === "turn/completed") {
+          const turn = record(payload.turn);
+          const status = text(turn, "status");
+          settle(status === "failed" ? new Error(text(record(turn.error), "message") || "Codex turn failed") : undefined);
+        }
+      });
+      this.transport.answerRequestsFor(threadId, (name, payload) => this.answerHostRequest(name, payload, observer));
+      try {
+        const opened = await this.transport.call<TurnOpenResult>("turn/start", {
+          threadId,
+          input: toProtocolInput(input),
+          cwd: this.workspace,
+          model: this.model ?? null,
+          effort: this.effort ?? null,
+          approvalPolicy: profile.approvals,
+          approvalsReviewer: "user",
+        });
+        this.turnId = opened.turn.id;
+        await result;
+      } finally {
+        stopListening();
+        this.transport.answerRequestsFor(threadId);
+        this.turnId = undefined;
+        await this.lifecycle.releaseWriters();
       }
     });
-    this.transport.answerRequestsFor(threadId, (name, payload) => this.answerHostRequest(name, payload, observer));
-    try {
-      const opened = await this.transport.call<TurnOpenResult>("turn/start", {
-        threadId,
-        input: toProtocolInput(input),
-        cwd: this.workspace,
-        model: this.model ?? null,
-        effort: this.effort ?? null,
-        approvalPolicy: profile.approvals,
-        approvalsReviewer: "user",
-      });
-      this.turnId = opened.turn.id;
-      await result;
-    } finally {
-      stopListening();
-      this.transport.answerRequestsFor(threadId);
-      this.turnId = undefined;
-    }
   }
 
   async steer(input: AssistantInput): Promise<void> {
@@ -308,7 +360,15 @@ export class Conversation {
     if (this.turnId) await this.interrupt();
     this.turnId = undefined;
     this.threadId = undefined;
-    if (threadId) await this.transport.call("thread/unsubscribe", { threadId });
+    if (threadId && this.runtimeAttached) {
+      await this.lifecycle.use(() => this.transport.call("thread/unsubscribe", { threadId }));
+    }
+    this.runtimeAttached = false;
+    await this.lifecycle.releaseWriters();
+  }
+
+  runtimeClosed(): void {
+    this.runtimeAttached = false;
   }
 
   private profile(): ExecutionProfile {

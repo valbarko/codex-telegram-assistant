@@ -20,8 +20,10 @@ export class AppServerTransport {
   private readonly events = new Set<EventListener>();
   private readonly hostRequests = new Map<string, HostRequestListener>();
   private intentionalStop = false;
+  private closing?: Promise<void>;
 
   async connect(): Promise<void> {
+    if (this.closing) await this.closing;
     if (!this.connection) {
       this.connection = this.open().catch((error) => {
         this.connection = undefined;
@@ -52,12 +54,33 @@ export class AppServerTransport {
     else this.hostRequests.delete(threadId);
   }
 
-  close(): void {
+  async close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.intentionalStop = true;
-    this.child?.kill("SIGTERM");
+    const child = this.child;
     this.child = undefined;
     this.connection = undefined;
+    this.hostRequests.clear();
     this.rejectWaiting(new Error("app-server connection closed"));
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      this.intentionalStop = false;
+      return;
+    }
+    const closing = new Promise<void>((resolve, reject) => {
+      const force = setTimeout(() => child.kill("SIGKILL"), 1_500);
+      const fail = setTimeout(() => reject(new Error("app-server did not exit after SIGTERM/SIGKILL")), 5_000);
+      child.once("exit", () => {
+        clearTimeout(force);
+        clearTimeout(fail);
+        resolve();
+      });
+      child.kill("SIGTERM");
+    }).finally(() => {
+      if (this.closing === closing) this.closing = undefined;
+      this.intentionalStop = false;
+    });
+    this.closing = closing;
+    return closing;
   }
 
   private async open(): Promise<void> {
@@ -70,7 +93,9 @@ export class AppServerTransport {
       const message = data.toString("utf8").trim();
       if (message) console.error(`app-server stderr: ${message}`);
     });
-    child.once("error", (error) => this.disconnected(error));
+    child.once("error", (error) => {
+      if (!this.intentionalStop) this.disconnected(error);
+    });
     child.once("exit", (code, signal) => {
       if (!this.intentionalStop) this.disconnected(new Error(`app-server exited: ${code ?? signal ?? "unknown"}`));
     });
