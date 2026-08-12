@@ -18,7 +18,7 @@ This repository is an independent implementation with its own source structure, 
 - **Safe calendar automation:** parse common dates locally, fall back to validated Codex extraction for ambiguous phrasing, and require confirmation before creating Apple Calendar events.
 - **Personal productivity:** manage tasks, inbox captures, a FIFO Codex queue, reminders, scheduled runs, project aliases, and recently active threads.
 - **Long-term memory:** store and recall project or global context with explicit pause, export, and deletion controls.
-- **Daily reporting:** generate cross-project evening summaries with completed work, blockers, first and last interaction times, estimated active time, and long breaks.
+- **Daily reporting and content radar:** generate cross-project evening summaries, and prepare ten fact-checked morning blog ideas from explicitly allowed Telegram channels and international sources.
 - **Telegram-native formatting:** safely render Codex Markdown as headings, emphasis, code, quotes, links, and lists with plain-text fallback.
 - **Mail integrations:** read Gmail through the connected Codex app and use Apple Mail only for visible drafts.
 - **Always-on local runtime:** run through a macOS LaunchAgent without exposing an inbound network port or depending on the Codex desktop app lifecycle.
@@ -65,14 +65,95 @@ These inputs never route to commands or the owner's assistant workflows. Audio i
 - `/sessions` — recent Codex threads, sorted by activity
 - `/abort` — interrupt the current turn
 - `/remind` and `/schedule` — notification or Codex run at a later time
-- `/digest on` — утренняя сводка в 06:00 с погодой, календарём, памятными днями, темой дня для блога и задачами; межпроектный итог работы в 21:00
+- `/digest on` — утренняя сводка в 06:00 с погодой, календарём, памятными днями, тремя темами на выбор и задачами; межпроектный итог работы в 21:00
 - `/calendar`, `/event`, `/draft`, `/mac` — local Mac integrations
 - `/recall`, `/forget`, `/about_me` — recall, delete, and inspect personal memory
 - `/memory_status`, `/memory_pause`, `/memory_export` — control and export long-term memory
 - `/voice` — list spoken command labels; `/story` selects the current story cycle
 - `/summary <url>` — summarize a YouTube, RuTube, or VK Video link; a standalone supported URL starts the same flow automatically
+- `/article <мысль>` — сохранить авторское ядро в банке статей и отдельно подготовить расширенные черновики статьи, Telegram и vc.ru
 
 The persistent Telegram keyboard keeps common actions one tap away. A text sent while Codex is working steers the active turn; after it finishes, the next text starts a new turn in the same thread.
+
+## Чтение и публикация в Telegram-каналах
+
+Обычный Bot API не видит подписки личного аккаунта. Для редакционного радара
+и публикации используется отдельный локальный TDLib-клиент, авторизованный как
+личный аккаунт. Список источников для чтения по-прежнему ограничивается локальным
+списком разрешений. Публикация выполняется только в явно указанный канал и только
+после проверки права владельца или администратора `can_post_messages`.
+
+1. Создай личное Telegram API-приложение в `https://my.telegram.org` →
+   `API development tools`.
+2. Запусти `npm run telegram:connect-qr` и отсканируй появившийся QR в Telegram:
+   `Настройки` → `Устройства` → `Подключить устройство`.
+3. Если включена 2FA, пароль запрашивается отдельным скрытым системным окном.
+   Секретные значения сохраняются в Связке ключей macOS.
+4. Посмотри найденные каналы через `npm run telegram:channels` и разреши нужные
+   командой `npm run telegram:allow -- "1, 4, 7"`.
+5. Проверь подключение через `npm run telegram:status`, затем сделай
+   пробное чтение через `npm run telegram:read` и проверь право публикации через
+   `npm run telegram:access -- @channel_username`.
+
+Публичные каналы можно добавить по username и собрать выбранные номера в папку:
+
+```bash
+npm run telegram:join -- "channel_one, channel_two"
+npm run telegram:folder -- "Контент" "1, 4, 7"
+npm run telegram:folder-add -- 47 "8, 9"
+```
+
+Штатный клиент умеет проверять публикацию без отправки, публиковать сразу,
+создавать отложенную запись и читать список отложенных сообщений:
+
+```bash
+npm run telegram:post -- --channel @channel_username --text-file writing/post.md --media cover.jpg --preview
+npm run telegram:post -- --channel @channel_username --text-file writing/post.md --media video.mp4
+npm run telegram:post -- --channel @channel_username --text-file writing/post.md --media video.mp4 --at 2026-08-11T21:39:00+03:00
+npm run telegram:edit-post -- --channel @channel_username --message-id 123456 --text-file writing/post.md --preview
+npm run telegram:edit-post -- --channel @channel_username --message-id 123456 --text-file writing/post.md
+npm run telegram:scheduled -- @channel_username
+```
+
+Флаг `--preview` запускает серверную проверку Telegram без публикации. Без него
+команда создаёт настоящую публикацию. Markdown преобразуется в нативные сущности
+Telegram, поэтому сохраняются жирное выделение и кликабельные ссылки. Для фото,
+видео и документов тип вложения определяется автоматически; при необходимости
+его можно задать через `--media-kind photo|video|document`.
+
+Секретные чаты отключены, сообщения и медиа других диалогов не сохраняются,
+медиа каналов автоматически не скачиваются. Зашифрованная служебная база TDLib
+и локальный список источников находятся внутри `ASSISTANT_DATA_DIR`.
+
+В утренней сводке радар читает публикации за последние 48 часов, отбрасывает
+рекламу и повторы, а затем готовит десять коротких идей двумя сообщениями по пять.
+Telegram-пост служит только сигналом: тезис для каждой карточки отдельно
+проверяется по научной статье, систематическому обзору, клинической рекомендации
+или официальному документу. Кнопка под идеей раскрывает подробную карточку с
+ограничением, углом поста, заходом и ссылками; выбор подтверждается отдельной
+кнопкой внутри карточки. Если каналов, свежих публикаций или подтверждённых
+источников недостаточно, остаётся прежняя тема из PubMed.
+
+Международный слой читает официальные ленты и страницы девяти источников:
+
+- Stronger by Science;
+- Barbell Medicine;
+- Peter Attia;
+- Renaissance Periodization;
+- Huberman Lab;
+- Sigma Nutrition;
+- MacroFactor;
+- Behavioral Scientist;
+- Menno Henselmans.
+
+Сайт Menno Henselmans блокирует автоматическое чтение, поэтому радар использует
+официальную Atom-ленту его YouTube-канала, пропускает Shorts и сохраняет ссылки
+на исследования из описаний полноформатных выпусков.
+
+Для сайтов используется окно в 21 день: медленнее обновляющиеся источники не
+исчезают из пула, а уже отправленные материалы не повторяются. Продажи, обновления
+приложений, рецепты и продуктовые кейсы отбрасываются до редакционного отбора.
+Популярные авторы остаются источниками сигналов, а не подтверждением тезиса.
 
 ## Long-term memory
 

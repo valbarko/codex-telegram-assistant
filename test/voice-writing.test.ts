@@ -76,6 +76,9 @@ describe("voice writing", () => {
     expect(parseSpokenVoiceCommand("Пост мой первый день в новом зале")).toEqual({
       kind: "post", content: "мой первый день в новом зале", label: "пост",
     });
+    expect(parseSpokenVoiceCommand("Статья почему отдыхать иногда нужно скучно")).toEqual({
+      kind: "article", content: "почему отдыхать иногда нужно скучно", label: "статья",
+    });
     expect(parseSpokenVoiceCommand("Анонс — в четверг открытая тренировка")).toEqual({
       kind: "announcement", content: "в четверг открытая тренировка", label: "анонс",
     });
