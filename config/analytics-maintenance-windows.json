@@ -26,6 +26,31 @@
       "classification": "synthetic_qa",
       "source": "production_data_verified",
       "summary": "Синтетическая приёмка nutrition-photo под analytics_excluded/.test аккаунтом; исключать из продуктового трафика и не классифицировать как пользовательскую аварию."
+    },
+    {
+      "id": "welltravel-scanner-guard-smoke-2026-08-12",
+      "starts_at": "2026-08-12T06:09:30+03:00",
+      "ends_at": "2026-08-12T06:10:00+03:00",
+      "projects": [
+        "welltravel.club"
+      ],
+      "classification": "synthetic_qa",
+      "source": "production_data_verified",
+      "summary": "Синтетическая проверка шести scanner-guard URL: пять ответили Caddy 404, /wp-admin/setup-config.php выявил регрессию и ответил 500; исключать шесть запросов из пользовательских показателей."
+    },
+    {
+      "id": "shared-caddy-and-welltravel-guard-release-smoke-2026-08-12",
+      "starts_at": "2026-08-12T07:56:00+03:00",
+      "ends_at": "2026-08-12T07:58:00+03:00",
+      "projects": [
+        "trenervkarmane.ru",
+        "gdeklienty.ru",
+        "valbarko.ru",
+        "welltravel.club"
+      ],
+      "classification": "synthetic_qa",
+      "source": "production_data_verified",
+      "summary": "Синтетическая приёмка общего Caddy после edge-защиты WellTravel: корни проектов, ValBarko redirect/PDF/MP4 и шесть scanner-guard URL; исключать проверочные запросы из продуктовых и пользовательских показателей."
     }
   ]
 }
