@@ -7,6 +7,7 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import { Bot, InlineKeyboard, InputFile, Keyboard, type Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
+import { ArticleIdeaService, isArticleIdeaRequest, type CapturedArticleIdea } from "./article-idea.js";
 import { formatPlainTranscript, formatVoiceTranscript, structureTranscript, transcribeAudio } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
@@ -69,6 +70,7 @@ export class TelegramApplication {
   private readonly restrictedTextEditor: EphemeralTextEditor;
   private readonly mediaSummary: MediaSummaryService;
   private readonly workTaskArchive: WorkTaskArchive;
+  private readonly articleIdeas: ArticleIdeaService;
   private readonly forwardedVoiceFlushes = new Map<string, Promise<void>>();
 
   constructor(
@@ -85,6 +87,7 @@ export class TelegramApplication {
     this.restrictedTextEditor = new EphemeralTextEditor(configuration);
     this.mediaSummary = new MediaSummaryService(configuration, this.restrictedTextEditor);
     this.workTaskArchive = new WorkTaskArchive(configuration.writingArchiveDirectory);
+    this.articleIdeas = new ArticleIdeaService(configuration, hub);
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
     this.bot.api.config.use(markdownTelegramTransformer);
@@ -97,6 +100,7 @@ export class TelegramApplication {
       { command: "task", description: "Создать задачу" },
       { command: "tasks", description: "Активные задачи" },
       { command: "inbox", description: "Входящие идеи и пересылки" },
+      { command: "article", description: "Идея в Банк статей" },
       { command: "chat", description: "Новый чат без проекта" },
       { command: "new", description: "Новый проектный тред" },
       { command: "session", description: "Текущий Codex-тред" },
@@ -183,7 +187,7 @@ export class TelegramApplication {
         "<b>Основное</b>", "/home · /task · /tasks · /inbox", "",
         "<b>Codex</b>", "/chat · /new · /sessions · /session · /rename · /fork · /archive · /abort", "",
         "<b>Ассистент</b>", "/remind · /reminders · /remember · /memory · /recall · /about_me", "",
-        "<b>Голосовые тексты и видео</b>", "/voice · /story · /summary", "",
+        "<b>Голосовые тексты и видео</b>", "/voice · /story · /article · /summary", "",
         "<b>Память</b>", "/memory_status · /memory_pause · /memory_export · /forget", "",
         "<b>Mac</b>", "/calendar · /event · /draft · /mac", "",
         "<b>Автоматизация</b>", "/schedule · /digest", "",
@@ -216,6 +220,15 @@ export class TelegramApplication {
       await this.mediaSummaryMessage(ctx, sourceUrl);
     });
     this.bot.command("story", async (ctx) => this.storyCommand(ctx));
+    this.bot.command("article", async (ctx) => {
+      const content = commandArgument(ctx);
+      if (!content) {
+        await ctx.reply("После /article напишите или продиктуйте исходную мысль. Я сохраню её отдельно и добавлю расширенный черновик в Банк статей.");
+        return;
+      }
+      const sentAt = ctx.message?.date ? ctx.message.date * 1000 : Date.now();
+      await this.captureArticleIdea(ctx, content, ctx.message?.text ?? content, sentAt, "message", undefined, true);
+    });
 
     this.bot.command("chat", async (ctx) => {
       const conversation = await this.conversation(ctx);
@@ -314,6 +327,8 @@ export class TelegramApplication {
       await this.showTasks(ctx);
     });
     this.bot.callbackQuery(/^capture:(task|memory|drop):(.+)$/, async (ctx) => this.captureAction(ctx));
+    this.bot.callbackQuery(/^blog-detail:(.+)$/, async (ctx) => this.showBlogTopicDetail(ctx));
+    this.bot.callbackQuery(/^blog-topic:(.+)$/, async (ctx) => this.selectBlogTopic(ctx));
     this.bot.callbackQuery(/^alarm:delete:(.+)$/, async (ctx) => {
       await ctx.answerCallbackQuery({ text: this.database.deleteAlarm(ctx.match![1]) ? "Удалено" : "Не найдено" });
     });
@@ -551,6 +566,10 @@ export class TelegramApplication {
       await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
       return true;
     }
+    if (command.kind === "article" || (command.kind === "assistant" && isArticleIdeaRequest(command.content))) {
+      return this.captureArticleIdea(ctx, command.content, raw, sentAt, inputKind, existingProgressId,
+        command.kind === "assistant");
+    }
     if (command.kind === "assistant") {
       await clearProgress();
       const conversation = await this.conversation(ctx);
@@ -672,6 +691,44 @@ export class TelegramApplication {
     ].join("\n");
     await ctx.reply(confirmation, { parse_mode: "HTML" });
     await sendTelegramMarkdown(ctx.api, ctx.chat!.id, edited.markdown, TELEGRAM_LIMIT - 100);
+    return true;
+  }
+
+  private async captureArticleIdea(ctx: Context, authorCore: string, raw: string, sentAt: number,
+    inputKind: "message" | "voice", existingProgressId?: number, recordIncoming = false): Promise<boolean> {
+    if (!ctx.chat) return true;
+    if (recordIncoming) {
+      const conversation = await this.conversation(ctx);
+      const snapshot = conversation.snapshot();
+      await this.memory.record({
+        owner: ownerId(ctx), body: raw, role: "user", kind: inputKind, project: snapshot.workspace,
+        source: scopedMemorySource(inputKind === "voice" ? "telegram-voice" : "telegram-text", snapshot.threadId),
+      });
+    }
+    let progressId = existingProgressId;
+    if (progressId === undefined) {
+      progressId = (await ctx.reply("✍️ Сохраняю ядро и раскрываю идею…")).message_id;
+    } else {
+      await ctx.api.editMessageText(ctx.chat.id, progressId, "✍️ Сохраняю ядро и раскрываю идею…").catch(() => undefined);
+    }
+    try {
+      const saved = await this.articleIdeas.capture(contextId(ctx), authorCore, sentAt);
+      await ctx.api.deleteMessage(ctx.chat.id, progressId).catch(() => undefined);
+      await this.memory.record({
+        owner: ownerId(ctx),
+        body: `Идея статьи «${saved.title}» сохранена в Банке статей. Ядро автора: ${saved.authorCorePath}`,
+        role: "action",
+        kind: "action",
+        project: this.memoryProject(ctx),
+        source: "article-bank-capture",
+      });
+      await ctx.reply(articleIdeaConfirmation(saved), { parse_mode: "HTML" });
+    } catch (error) {
+      logInternalError("Article idea capture failed", error);
+      await ctx.api.editMessageText(ctx.chat.id, progressId,
+        "⚠️ Не удалось добавить идею в Банк статей. Исходная мысль осталась в памяти бота; повторите /article позже.")
+        .catch(() => undefined);
+    }
     return true;
   }
 
@@ -873,6 +930,49 @@ export class TelegramApplication {
       parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Удалить TG-напоминание", `alarm:delete:${alarm.id}`),
     });
     return true;
+  }
+
+  private async showBlogTopicDetail(ctx: Context): Promise<void> {
+    const sourceId = ctx.match?.[1];
+    if (!sourceId) return void await ctx.answerCallbackQuery({ text: "Тема не найдена" });
+    const topic = this.database.blogTopic(ownerId(ctx), sourceId);
+    if (!topic) return void await ctx.answerCallbackQuery({ text: "Тема уже недоступна" });
+    await ctx.answerCallbackQuery({ text: "Раскрываю идею" });
+    const rendered = renderTelegramMarkdown(topic.markdown);
+    const keyboard = new InlineKeyboard().text("✅ Выбрать эту тему", `blog-topic:${sourceId}`);
+    try {
+      await ctx.reply(rendered.html, { parse_mode: "HTML", reply_markup: keyboard });
+    } catch (error) {
+      logInternalError("Blog topic detail HTML failed", error);
+      await ctx.reply(markdownToPlainText(rendered.plain), { reply_markup: keyboard });
+    }
+  }
+
+  private async selectBlogTopic(ctx: Context): Promise<void> {
+    const sourceId = ctx.match?.[1];
+    if (!sourceId) return void await ctx.answerCallbackQuery({ text: "Тема не найдена" });
+    try {
+      const selected = this.database.selectBlogTopic(ownerId(ctx), sourceId);
+      await this.memory.record({
+        owner: ownerId(ctx),
+        body: `Выбрана тема утреннего контент-радара: ${selected.studyTitle}. Источник: ${selected.sourceUrl}`,
+        role: "action",
+        kind: "action",
+        project: this.memoryProject(ctx),
+        source: "telegram-button",
+      });
+      await ctx.answerCallbackQuery({ text: "Тема выбрана" });
+      await ctx.reply([
+        "✅ <b>Тема выбрана</b>",
+        "",
+        escape(selected.studyTitle),
+        "",
+        "Выбор сохранён. Когда захотите перейти к материалу, напишите: «готовим выбранную тему».",
+      ].join("\n"), { parse_mode: "HTML" });
+    } catch (error) {
+      logInternalError("Blog topic selection failed", error);
+      await ctx.answerCallbackQuery({ text: "Не удалось сохранить выбор" });
+    }
   }
 
   private async executePrompt(ctx: Context, prompt: string): Promise<void> {
@@ -1601,6 +1701,21 @@ function voiceModeLabel(settings: VoiceWritingSettings): string {
 }
 function styleWritingLabel(kind: "post" | "announcement" | "reply"): string {
   return ({ post: "Пост", announcement: "Анонс", reply: "Ответ" })[kind];
+}
+
+function articleIdeaConfirmation(saved: CapturedArticleIdea): string {
+  const expansion = saved.expanded
+    ? "Расширенный черновик и версии для Telegram и vc.ru подготовлены."
+    : "Ядро сохранено, но расширение пока не подготовлено — его можно повторить позже.";
+  return [
+    "<b>✅ Идея добавлена в Банк статей</b>",
+    "",
+    `<b>${escape(saved.title)}</b>`,
+    "Ядро Валентина сохранено отдельным текстом и не смешано с редакторским продолжением.",
+    expansion,
+    "",
+    `<a href="${escape(saved.bankUrl)}">Открыть карточку в Банке статей</a>`,
+  ].join("\n");
 }
 function spokenVoiceHelp(): string {
   return ["<b>🎙 Метки-команды для текста и голоса</b>", "Напишите или произнесите метку первым словом и сразу продолжайте:", "",

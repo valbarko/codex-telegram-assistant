@@ -5,15 +5,18 @@ import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex-engine.js";
-import { findDailyBlogStudy, type BlogStudy } from "./daily-blog-topic.js";
-import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
+import { findDailyBlogStudy } from "./daily-blog-topic.js";
+import { EphemeralTextEditor, formatTelegramTopicDetail, formatTelegramTopicShortlistBatches } from "./ephemeral-text-editor.js";
 import { todayCalendar, type CalendarEntry } from "./mac-bridge.js";
 import type { MemoryService } from "./memory-service.js";
 import { quietCodexPrompt } from "./prompt-policy.js";
 import { logInternalError, publicErrorMessage } from "./public-errors.js";
 import type { Alarm, AssistantDatabase, MemoryEvent, WorkItem } from "./storage.js";
-import { sendTelegramMarkdown } from "./telegram-markdown.js";
+import { markdownToPlainText, renderTelegramMarkdown, sendTelegramMarkdown } from "./telegram-markdown.js";
 import { todayInspiration } from "./today-inspiration.js";
+import { collectTelegramRadarPosts } from "./telegram-topic-radar.js";
+import { syncTelegramArticlePublications } from "./telegram-publication-sync.js";
+import { collectWebsiteRadarPosts } from "./website-topic-radar.js";
 import { countActiveWork, groupActiveWork, internalAssistantWorkspace, internalWorkThread, mergeActiveWork, type UnifiedWorkGroup } from "./work-dashboard.js";
 import { todayWeather } from "./weather.js";
 
@@ -25,8 +28,15 @@ export interface WorkJournalEntry {
 }
 
 interface PreparedBlogTopic {
-  study: BlogStudy;
-  markdown: string;
+  records: readonly {
+    sourceId: string;
+    pillar: string;
+    title: string;
+    sourceUrl: string;
+    markdown: string;
+  }[];
+  choiceMessages?: readonly string[];
+  digestMarkdown?: string;
 }
 
 interface MorningDigestResult {
@@ -37,6 +47,7 @@ interface MorningDigestResult {
 export class BackgroundScheduler {
   private timer?: NodeJS.Timeout;
   private active = false;
+  private lastPublicationSyncAt = 0;
   private readonly textEditor: EphemeralTextEditor;
 
   constructor(
@@ -64,12 +75,24 @@ export class BackgroundScheduler {
     if (this.active) return;
     this.active = true;
     try {
+      await this.syncArticlePublicationsIfDue();
       await this.deliverAlarms();
       await this.executeQueueHead();
     } catch (error) {
       console.error("Background scheduler failed", error);
     } finally {
       this.active = false;
+    }
+  }
+
+  private async syncArticlePublicationsIfDue(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastPublicationSyncAt < 10 * 60_000) return;
+    this.lastPublicationSyncAt = now;
+    try {
+      await syncTelegramArticlePublications(this.configuration);
+    } catch (error) {
+      console.error("Telegram article publication sync failed", error);
     }
   }
 
@@ -83,15 +106,21 @@ export class BackgroundScheduler {
         } else if (alarm.mode === "digest-morning") {
           const digest = await this.morningDigest(alarm.owner);
           await this.send(alarm.owner, digest.text);
-          if (digest.blogTopic) this.database.recordBlogTopic({
-            owner: alarm.owner,
-            sourceId: digest.blogTopic.study.sourceId,
-            pillar: digest.blogTopic.study.pillar,
-            studyTitle: digest.blogTopic.study.title,
-            sourceUrl: digest.blogTopic.study.sourceUrl,
-            markdown: digest.blogTopic.markdown,
-            sentAt: Date.now(),
-          });
+          if (digest.blogTopic) {
+            const sentAt = Date.now();
+            for (const record of digest.blogTopic.records) this.database.recordBlogTopic({
+              owner: alarm.owner,
+              sourceId: record.sourceId,
+              pillar: record.pillar,
+              studyTitle: record.title,
+              sourceUrl: record.sourceUrl,
+              markdown: record.markdown,
+              sentAt,
+            });
+            await this.sendBlogTopicChoices(alarm.owner, digest.blogTopic).catch((error) => {
+              console.error("Morning blog topic buttons failed", error);
+            });
+          }
         }
         else if (alarm.mode === "digest-evening") await this.sendEveningSummary(alarm.owner);
         else await this.send(alarm.owner, `⏰ ${alarm.label}`);
@@ -147,7 +176,7 @@ export class BackgroundScheduler {
     const tasks = this.database.tasks(owner, undefined, 500);
     const summaryThread = this.database.conversation(`daily-summary:${owner}`)?.threadId;
     const usedBlogSources = new Set(this.database.sentBlogTopicSourceIds(owner, Date.now() - 365 * 86_400_000));
-    const [weather, calendar, inspiration, blogStudy, threads] = await Promise.allSettled([
+    const [weather, calendar, inspiration, telegramPosts, websitePosts, blogStudy, threads] = await Promise.allSettled([
       todayWeather({
         label: this.configuration.weatherLocation,
         latitude: this.configuration.weatherLatitude,
@@ -155,20 +184,58 @@ export class BackgroundScheduler {
       }),
       within(todayCalendar(20), 10_000, "calendar"),
       within(todayInspiration(), 15_000, "daily inspiration"),
+      within(collectTelegramRadarPosts(this.configuration, { usedSourceIds: usedBlogSources }), 90_000,
+        "Telegram content radar"),
+      within(collectWebsiteRadarPosts({ usedSourceIds: usedBlogSources }), 45_000, "website content radar"),
       within(findDailyBlogStudy({ usedSourceIds: usedBlogSources }), 25_000, "daily blog study"),
       within(this.hub.threads(150), 7_000, "Codex threads"),
     ]);
     if (weather.status === "rejected") console.error("Morning weather failed", weather.reason);
     if (calendar.status === "rejected") console.error("Morning calendar failed", calendar.reason);
     if (inspiration.status === "rejected") console.error("Morning daily inspiration failed", inspiration.reason);
+    if (telegramPosts.status === "rejected") console.error("Morning Telegram content radar failed", telegramPosts.reason);
+    if (websitePosts.status === "rejected") console.error("Morning website content radar failed", websitePosts.reason);
     if (blogStudy.status === "rejected") console.error("Morning blog study failed", blogStudy.reason);
     if (threads.status === "rejected") console.error("Morning project loading failed", threads.reason);
+    const radarPosts = [
+      ...(telegramPosts.status === "fulfilled" ? telegramPosts.value : []),
+      ...(websitePosts.status === "fulfilled" ? websitePosts.value : []),
+    ];
     let blogTopic: PreparedBlogTopic | undefined;
-    if (blogStudy.status === "fulfilled" && blogStudy.value) {
+    if (radarPosts.length >= 10) {
       try {
+        const choices = await within(this.textEditor.createContentTopicShortlist(radarPosts), 425_000,
+          "content topic shortlist");
+        const byId = new Map(radarPosts.map((post) => [post.sourceId, post]));
         blogTopic = {
-          study: blogStudy.value,
-          markdown: await within(this.textEditor.createDailyBlogTopic(blogStudy.value), 185_000, "daily blog topic"),
+          records: choices.map((choice) => {
+            const post = byId.get(choice.radarSourceId)!;
+            return {
+              sourceId: choice.radarSourceId,
+              pillar: "content-radar",
+              title: choice.title,
+              sourceUrl: post.sourceUrl || choice.primarySourceUrl,
+              markdown: formatTelegramTopicDetail(choice, post),
+            };
+          }),
+          choiceMessages: formatTelegramTopicShortlistBatches(choices, radarPosts),
+        };
+      } catch (error) {
+        console.error("Morning content topic generation failed", error);
+      }
+    }
+    if (!blogTopic && blogStudy.status === "fulfilled" && blogStudy.value) {
+      try {
+        const markdown = await within(this.textEditor.createDailyBlogTopic(blogStudy.value), 185_000, "daily blog topic");
+        blogTopic = {
+          records: [{
+            sourceId: blogStudy.value.sourceId,
+            pillar: blogStudy.value.pillar,
+            title: blogStudy.value.title,
+            sourceUrl: blogStudy.value.sourceUrl,
+            markdown,
+          }],
+          digestMarkdown: markdown,
         };
       } catch (error) {
         console.error("Morning blog topic generation failed", error);
@@ -183,7 +250,7 @@ export class BackgroundScheduler {
       weather: weather.status === "fulfilled" ? weather.value : `🌦 Погода · ${this.configuration.weatherLocation}\nНе удалось получить прогноз.`,
       calendar: calendar.status === "fulfilled" ? calendar.value : undefined,
       inspiration: inspiration.status === "fulfilled" ? inspiration.value : undefined,
-      blogTopic: blogTopic?.markdown,
+      blogTopic: blogTopic?.digestMarkdown,
       groups,
       inbox,
       tasks,
@@ -249,6 +316,27 @@ export class BackgroundScheduler {
 
   private async send(owner: string, text: string): Promise<void> {
     await sendTelegramMarkdown(this.bot.api, owner, text);
+  }
+
+  private async sendBlogTopicChoices(owner: string, topic: PreparedBlogTopic): Promise<void> {
+    if (!topic.choiceMessages?.length || topic.records.length < 2) return;
+    for (let batchIndex = 0; batchIndex < topic.choiceMessages.length; batchIndex += 1) {
+      const offset = batchIndex * 5;
+      const records = topic.records.slice(offset, offset + 5);
+      const replyMarkup = {
+        inline_keyboard: records.map((record, index) => [{
+          text: `${offset + index + 1}. ${record.title.slice(0, 44)}`,
+          callback_data: `blog-detail:${record.sourceId}`,
+        }]),
+      };
+      const rendered = renderTelegramMarkdown(topic.choiceMessages[batchIndex]!);
+      try {
+        await this.bot.api.sendMessage(owner, rendered.html, { parse_mode: "HTML", reply_markup: replyMarkup });
+      } catch (error) {
+        console.error("Morning blog topic batch HTML failed; using plain text", error);
+        await this.bot.api.sendMessage(owner, markdownToPlainText(rendered.plain), { reply_markup: replyMarkup });
+      }
+    }
   }
 
   private async polishContent(source: string): Promise<string> {

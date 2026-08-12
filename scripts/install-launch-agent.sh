@@ -34,6 +34,15 @@ mkdir -p "$HOME/Library/LaunchAgents" "$logs"
 /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $logs/assistant.error.log" "$plist"
 
 launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$plist"
+for attempt in {1..5}; do
+  if launchctl bootstrap "gui/$(id -u)" "$plist"; then
+    break
+  fi
+  if [[ "$attempt" -eq 5 ]]; then
+    echo "Failed to bootstrap $label after $attempt attempts"
+    exit 1
+  fi
+  sleep 1
+done
 launchctl kickstart -k "gui/$(id -u)/$label"
 echo "Installed $label"

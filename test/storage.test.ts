@@ -159,4 +159,19 @@ describe("AssistantDatabase", () => {
     expect(database.sentBlogTopicSourceIds("1", 150)).toEqual(["222"]);
     expect(database.sentBlogTopicSourceIds("1", 0)).toEqual(["222", "111"]);
   });
+
+  it("stores the selected morning blog topic", () => {
+    database.recordBlogTopic({
+      owner: "1", sourceId: "telegram:-100:7", pillar: "content-radar", studyTitle: "Ритм белка",
+      sourceUrl: "https://t.me/source/7", markdown: "Карточка", sentAt: 100,
+    });
+
+    expect(database.selectBlogTopic("1", "telegram:-100:7", 200)).toMatchObject({
+      studyTitle: "Ритм белка", selectedAt: 200,
+    });
+    expect(database.selectedBlogTopic("1")).toMatchObject({
+      sourceId: "telegram:-100:7", selectedAt: 200,
+    });
+    expect(() => database.selectBlogTopic("1", "missing", 300)).toThrow(/not found/u);
+  });
 });

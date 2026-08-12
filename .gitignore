@@ -21,6 +21,7 @@ coverage/
 # Private/local working artifacts. The repository is public.
 output/
 outputs/
+tmp/
 .playwright-cli/
 pieter-levels-article-ru.html
 docs/article-work-sport-pareto.md

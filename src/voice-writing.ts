@@ -28,7 +28,7 @@ export interface DiaryDay {
 }
 
 export type SpokenVoiceCommandKind = "transcript" | "diary" | "story" | "post" | "announcement" | "reply"
-  | "assistant" | "calendar" | "task" | "reminder" | "inbox" | "memory";
+  | "article" | "assistant" | "calendar" | "task" | "reminder" | "inbox" | "memory";
 
 export interface SpokenVoiceCommand {
   kind: SpokenVoiceCommandKind;
@@ -45,6 +45,8 @@ const SPOKEN_LABELS: Readonly<Record<string, SpokenVoiceCommandKind>> = {
   "пост": "post",
   "анонс": "announcement",
   "ответ": "reply",
+  "статья": "article",
+  "статью": "article",
   "помощник": "assistant",
   "календарь": "calendar",
   "задача": "task",

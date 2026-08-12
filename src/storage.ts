@@ -159,6 +159,10 @@ export interface SentBlogTopic {
   sentAt: number;
 }
 
+export interface SelectedBlogTopic extends SentBlogTopic {
+  selectedAt: number;
+}
+
 export class AssistantDatabase {
   private readonly sql: Database.Database;
 
@@ -504,6 +508,28 @@ export class AssistantDatabase {
       .all(owner, since) as Array<{ source_id: string }>).map((row) => row.source_id);
   }
 
+  blogTopic(owner: string, sourceId: string): SentBlogTopic | undefined {
+    return mapSentBlogTopic(this.sql.prepare("SELECT * FROM sent_blog_topics WHERE owner=? AND source_id=?").get(owner, sourceId));
+  }
+
+  selectBlogTopic(owner: string, sourceId: string, selectedAt = Date.now()): SelectedBlogTopic {
+    const topic = this.blogTopic(owner, sourceId);
+    if (!topic) throw new Error("Blog topic not found");
+    this.sql.prepare(`INSERT INTO selected_blog_topics(owner,source_id,selected_at) VALUES(?,?,?)
+      ON CONFLICT(owner) DO UPDATE SET source_id=excluded.source_id,selected_at=excluded.selected_at`)
+      .run(owner, sourceId, selectedAt);
+    return { ...topic, selectedAt };
+  }
+
+  selectedBlogTopic(owner: string): SelectedBlogTopic | undefined {
+    const row = this.sql.prepare(`SELECT t.*,s.selected_at FROM selected_blog_topics s
+      JOIN sent_blog_topics t ON t.owner=s.owner AND t.source_id=s.source_id WHERE s.owner=?`).get(owner);
+    const topic = mapSentBlogTopic(row);
+    const record = object(row);
+    const selectedAt = record ? Number(record.selected_at) : Number.NaN;
+    return topic && Number.isFinite(selectedAt) ? { ...topic, selectedAt } : undefined;
+  }
+
   alignDailyDigests(summaryAt: number, morningAt: number, now = Date.now()): number {
     const summary = this.sql.prepare(`UPDATE alarms SET label='Итог за вчера',
       next_at=CASE WHEN next_at<=? THEN next_at ELSE ? END
@@ -569,6 +595,11 @@ export class AssistantDatabase {
         PRIMARY KEY(owner,source_id)
       );
       CREATE INDEX IF NOT EXISTS sent_blog_topic_owner_date ON sent_blog_topics(owner,sent_at);
+      CREATE TABLE IF NOT EXISTS selected_blog_topics(
+        owner TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        selected_at INTEGER NOT NULL
+      );
     `);
   }
 }
@@ -621,6 +652,19 @@ function mapMemoryEvent(row: unknown): MemoryEvent | undefined {
     id: str(r.id), owner: str(r.owner), namespace: str(r.namespace) as MemoryEvent["namespace"], project: maybe(r.project),
     role: str(r.role) as MemoryRole, kind: str(r.kind) as MemoryKind, body: str(r.body), source: maybe(r.source),
     createdAt: Number(r.created_at), deletedAt: num(r.deleted_at),
+  };
+}
+
+function mapSentBlogTopic(row: unknown): SentBlogTopic | undefined {
+  const r = object(row); if (!r) return undefined;
+  return {
+    owner: str(r.owner),
+    sourceId: str(r.source_id),
+    pillar: str(r.pillar),
+    studyTitle: str(r.study_title),
+    sourceUrl: str(r.source_url),
+    markdown: str(r.markdown),
+    sentAt: Number(r.sent_at),
   };
 }
 
