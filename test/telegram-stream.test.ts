@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { TelegramTurnView } from "../src/telegram-app.js";
+import { TelegramTurnView, telegramRunnerConstraint } from "../src/telegram-app.js";
 
 describe("TelegramTurnView", () => {
   afterEach(() => vi.useRealTimers());
@@ -104,5 +104,36 @@ describe("TelegramTurnView", () => {
     await view.fail();
 
     expect(reply).toHaveBeenCalledWith("Не\u00a0удалось выполнить запрос. Попробуйте ещё\u00a0раз.", { parse_mode: "HTML" });
+  });
+
+  it("keeps one progress message alive with elapsed time while drafts stay private", async () => {
+    vi.useFakeTimers();
+    const reply = vi.fn(async () => ({ message_id: 10 }));
+    const editMessageText = vi.fn(async () => true);
+    const activity = vi.fn();
+    const ctx = { chat: { id: 7 }, reply, api: { editMessageText } };
+    const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false, false, 9, activity);
+
+    await view.start("✍️ Выполняю задание…");
+    view.activity("item/started");
+    view.toolStarted("tool", "web search");
+    await vi.advanceTimersByTimeAsync(45_000);
+    view.pause();
+
+    expect(reply).not.toHaveBeenCalled();
+    expect(activity).toHaveBeenCalledWith("item/started");
+    expect(editMessageText).toHaveBeenLastCalledWith(7, 9,
+      expect.stringMatching(/ищу и проверяю источники[\s\S]*45 сек/u));
+  });
+});
+
+describe("telegramRunnerConstraint", () => {
+  it("keeps normal updates ordered per topic but lets health and abort bypass long work", () => {
+    expect(telegramRunnerConstraint({ chat: { id: 7 }, message: { message_thread_id: 4, text: "Задание" } } as never))
+      .toBe("chat:7:topic:4");
+    expect(telegramRunnerConstraint({ chat: { id: 7 }, message: { text: "/health" } } as never)).toBeUndefined();
+    expect(telegramRunnerConstraint({ chat: { id: 7 }, message: { text: "/abort@my_bot" } } as never)).toBeUndefined();
+    expect(telegramRunnerConstraint({ chat: { id: 7 }, callbackQuery: { data: "approve:token:once" } } as never))
+      .toBeUndefined();
   });
 });

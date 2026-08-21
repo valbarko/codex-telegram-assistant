@@ -50,6 +50,7 @@
   },
   "dependencies": {
     "@grammyjs/auto-retry": "2.0.2",
+    "@grammyjs/runner": "2.0.3",
     "@vectorize-io/hindsight-client": "0.8.5",
     "better-sqlite3": "12.11.1",
     "grammy": "1.38.2",

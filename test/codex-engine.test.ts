@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { AppConfiguration } from "../src/configuration.js";
-import { CodexHub } from "../src/codex-engine.js";
+import { CodexHub, CodexTurnInterruptedError, CodexTurnTimeoutError } from "../src/codex-engine.js";
 import type { EventListener, HostRequestListener, RpcRecord } from "../src/appserver-transport.js";
 
 class FakeTransport {
@@ -11,6 +11,8 @@ class FakeTransport {
   autoComplete = true;
   closeCalls = 0;
   threadSerial = 0;
+  resumeConflicts = 0;
+  forkFails = false;
   async connect() {}
   listen(listener: EventListener) { this.events.add(listener); return () => { this.events.delete(listener); }; }
   answerRequestsFor(_thread: string, listener?: HostRequestListener) { this.host = listener; }
@@ -19,7 +21,17 @@ class FakeTransport {
   async call<T>(name: string, payload: RpcRecord): Promise<T> {
     this.calls.push({ name, payload });
     if (name === "thread/start") return { thread: { id: `thread-${++this.threadSerial}` }, cwd: "/work", model: "gpt" } as T;
-    if (name === "thread/resume") return { thread: { id: payload.threadId }, cwd: "/work", model: "gpt" } as T;
+    if (name === "thread/resume") {
+      if (this.resumeConflicts > 0) {
+        this.resumeConflicts -= 1;
+        throw new Error(`thread ${String(payload.threadId)} already has an active writer`);
+      }
+      return { thread: { id: payload.threadId }, cwd: String(payload.cwd ?? "/work"), model: "gpt" } as T;
+    }
+    if (name === "thread/fork") {
+      if (this.forkFails) throw new Error("fork unavailable");
+      return { thread: { id: `fork-${++this.threadSerial}` }, cwd: String(payload.cwd ?? "/work"), model: "gpt" } as T;
+    }
     if (name === "turn/start") {
       const threadId = String(payload.threadId);
       queueMicrotask(() => {
@@ -31,15 +43,19 @@ class FakeTransport {
     }
     return {} as T;
   }
-  complete(threadId = "thread-1") { this.notify("turn/completed", { threadId, turn: { id: "turn-1", status: "completed" } }); }
+  complete(threadId = "thread-1", status = "completed") {
+    this.notify("turn/completed", { threadId, turn: { id: "turn-1", status } });
+  }
   private notify(name: string, payload: RpcRecord) { for (const event of this.events) event(name, payload); }
 }
 
 const config: AppConfiguration = {
   telegramToken: "x", allowedUsers: new Set([1]), transcriptionOnlyUsers: new Set(),
-  homeDirectory: "/home", dataDirectory: "/data", defaultWorkspace: "/work",
+  homeDirectory: "/home", dataDirectory: "/data", defaultWorkspace: "/work", articleBankDirectory: "/bank",
   projectAliases: {}, weatherLocation: "Москва", weatherLatitude: 55.7558, weatherLongitude: 37.6173,
   defaultModel: "gpt", defaultProfile: "review", maxUploadBytes: 1, showUsage: false,
+  assistantInactivityTimeoutMs: 5_000, assistantJobMaxAttempts: 3,
+  heartbeatFile: "/data/health.json", heartbeatIntervalMs: 15_000, watchdogStaleMs: 120_000,
   profiles: [{ id: "review", title: "Review", sandbox: "workspace-write", approvals: "on-request" }],
 };
 
@@ -96,6 +112,44 @@ describe("CodexHub", () => {
     ]);
     expect(transport.closeCalls).toBe(2);
     expect(conversation.snapshot().threadId).toBe("thread-1");
+  });
+
+  it("forks an occupied saved thread instead of leaving the Telegram job stuck", async () => {
+    const transport = new FakeTransport();
+    transport.resumeConflicts = 1;
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1", { threadId: "busy", workspace: "/bank" });
+
+    await conversation.run("Продолжить", { text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {} });
+
+    expect(transport.calls.map((call) => call.name)).toEqual(["thread/resume", "thread/fork", "turn/start"]);
+    expect(conversation.snapshot()).toMatchObject({ threadId: "fork-1", workspace: "/bank" });
+  });
+
+  it("interrupts and rejects a turn after an inactivity timeout", async () => {
+    const transport = new FakeTransport();
+    transport.autoComplete = false;
+    const hub = new CodexHub({ ...config, assistantInactivityTimeoutMs: 20 }, transport as never);
+    const conversation = await hub.conversation("1");
+
+    await expect(conversation.run("Зависни", {
+      text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {}, activity() {},
+    })).rejects.toBeInstanceOf(CodexTurnTimeoutError);
+
+    expect(transport.calls.map((call) => call.name)).toContain("turn/interrupt");
+    expect(transport.closeCalls).toBe(1);
+  });
+
+  it("does not treat an interrupted turn as successful", async () => {
+    const transport = new FakeTransport();
+    transport.autoComplete = false;
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1");
+    const running = conversation.run("Остановить", { text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {} });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    transport.complete("thread-1", "interrupted");
+
+    await expect(running).rejects.toBeInstanceOf(CodexTurnInterruptedError);
   });
 
   it("waits for all concurrent turns before closing the shared app-server", async () => {

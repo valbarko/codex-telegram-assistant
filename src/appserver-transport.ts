@@ -10,6 +10,7 @@ export type HostRequestListener = (name: string, payload: RpcRecord) => Promise<
 interface DeferredRequest {
   succeed(value: unknown): void;
   fail(error: Error): void;
+  timer: NodeJS.Timeout;
 }
 
 export class AppServerTransport {
@@ -21,6 +22,8 @@ export class AppServerTransport {
   private readonly hostRequests = new Map<string, HostRequestListener>();
   private intentionalStop = false;
   private closing?: Promise<void>;
+
+  constructor(private readonly requestTimeoutMs = 30_000) {}
 
   async connect(): Promise<void> {
     if (this.closing) await this.closing;
@@ -109,11 +112,16 @@ export class AppServerTransport {
   private send<T>(name: string, payload: RpcRecord): Promise<T> {
     const id = ++this.serial;
     return new Promise<T>((resolve, reject) => {
-      this.waiting.set(id, { succeed: resolve as (value: unknown) => void, fail: reject });
+      const timer = setTimeout(() => {
+        this.waiting.delete(id);
+        reject(new Error(`app-server request timed out: ${name}`));
+      }, this.requestTimeoutMs);
+      this.waiting.set(id, { succeed: resolve as (value: unknown) => void, fail: reject, timer });
       try {
         this.write({ id, method: name, params: payload });
       } catch (error) {
         this.waiting.delete(id);
+        clearTimeout(timer);
         reject(asError(error));
       }
     });
@@ -141,6 +149,7 @@ export class AppServerTransport {
       const deferred = this.waiting.get(message.id);
       if (!deferred) return;
       this.waiting.delete(message.id);
+      clearTimeout(deferred.timer);
       if (message.error) deferred.fail(new Error(rpcError(message.error)));
       else deferred.succeed(message.result);
       return;
@@ -157,7 +166,11 @@ export class AppServerTransport {
       const result = handler ? await handler(name, payload) : safeDefault(name);
       this.write({ id, result });
     } catch (error) {
-      this.write({ id, error: { code: -32000, message: asError(error).message } });
+      try {
+        this.write({ id, error: { code: -32000, message: asError(error).message } });
+      } catch (writeError) {
+        if (!this.intentionalStop) this.disconnected(asError(writeError));
+      }
     }
   }
 
@@ -169,7 +182,10 @@ export class AppServerTransport {
   }
 
   private rejectWaiting(error: Error): void {
-    for (const deferred of this.waiting.values()) deferred.fail(error);
+    for (const deferred of this.waiting.values()) {
+      clearTimeout(deferred.timer);
+      deferred.fail(error);
+    }
     this.waiting.clear();
   }
 }

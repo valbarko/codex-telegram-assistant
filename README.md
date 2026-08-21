@@ -6,7 +6,7 @@ This repository is an independent implementation with its own source structure, 
 
 ## Features
 
-- **Codex from Telegram:** create, resume, steer, interrupt, and hand off threads with separate contexts for chats and forum topics.
+- **Codex from Telegram:** create, resume, queue, interrupt, and hand off threads with separate contexts for chats and forum topics.
 - **Live agent interaction:** stream answers and handle command, file, user-input, and permission approvals without returning to the Mac.
 - **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
 - **Video-link summaries:** turn a standalone YouTube, RuTube, or VK Video link into a personal Russian-language summary with key ideas, useful takeaways, actions, and selected source timestamps.
@@ -22,6 +22,7 @@ This repository is an independent implementation with its own source structure, 
 - **Telegram-native formatting:** safely render Codex Markdown as headings, emphasis, code, quotes, links, and lists with plain-text fallback.
 - **Mail integrations:** read Gmail through the connected Codex app and use Apple Mail only for visible drafts.
 - **Always-on local runtime:** run through a macOS LaunchAgent without exposing an inbound network port or depending on the Codex desktop app lifecycle.
+- **Durable Codex execution:** persist Telegram requests before execution, keep intake responsive, retry transient stalls, recover interrupted jobs after restart, and deliver saved results without rerunning completed work.
 
 ## Requirements
 
@@ -73,7 +74,9 @@ These inputs never route to commands or the owner's assistant workflows. Audio i
 - `/summary <url>` — summarize a YouTube, RuTube, or VK Video link; a standalone supported URL starts the same flow automatically
 - `/article <мысль>` — сохранить авторское ядро в банке статей и отдельно подготовить расширенные черновики статьи, Telegram и vc.ru
 
-The persistent Telegram keyboard keeps common actions one tap away. A text sent while Codex is working steers the active turn; after it finishes, the next text starts a new turn in the same thread.
+The persistent Telegram keyboard keeps common actions one tap away. Codex requests are stored in SQLite before execution and processed in order. A text sent while Codex is working becomes the next durable turn instead of blocking Telegram polling or being lost during a restart.
+
+An explicit request such as `делаем в банк статей` is routed to `ARTICLE_BANK_DIR`. It is considered successful only when a changed article package contains the main, Telegram, and vc.ru variants, metadata, 4:5 and 16:9 covers, and the bank validator exits successfully.
 
 ## Чтение и публикация в Telegram-каналах
 
@@ -266,7 +269,9 @@ chmod +x scripts/*.sh
 scripts/install-launch-agent.sh
 ```
 
-The LaunchAgent starts at login and restarts after crashes. Stop and remove it with `scripts/uninstall-launch-agent.sh`.
+The installer creates two user LaunchAgents: the main bot starts at login and restarts after crashes, while a one-minute watchdog checks the atomic heartbeat file. A stale process or an active Codex job with no events beyond the configured timeout is restarted; the durable queue then resumes the job. Stop and remove both agents with `scripts/uninstall-launch-agent.sh`.
+
+`/health` reports queue depth, the active attempt, time since the last Codex event, and a bounded app-server probe. The defaults are a 7-minute inactivity timeout, three attempts with backoff, a 15-second heartbeat, and a 2-minute process-heartbeat threshold. Override them with the `ASSISTANT_*` settings documented in `.env.example`.
 
 Do not run two bots with the same Telegram token simultaneously. Stop the old service immediately before enabling this LaunchAgent.
 

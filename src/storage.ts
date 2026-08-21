@@ -142,6 +142,50 @@ export interface SavedConversation {
   changedAt: number;
 }
 
+export type AssistantJobState = "queued" | "running" | "retry_wait" | "succeeded" | "blocked" | "failed" | "cancelled";
+export type AssistantJobKind = "assistant" | "article_bank";
+
+export interface AssistantJob {
+  id: string;
+  owner: string;
+  context: string;
+  chatId: string;
+  messageThreadId?: number;
+  sourceUpdateId?: number;
+  body: string;
+  prompt: string;
+  fingerprint: string;
+  kind: AssistantJobKind;
+  workspace?: string;
+  state: AssistantJobState;
+  attempts: number;
+  maxAttempts: number;
+  nextAttemptAt: number;
+  progressMessageId?: number;
+  lastEventAt?: number;
+  errorClass?: string;
+  error?: string;
+  result?: string;
+  createdAt: number;
+  changedAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  notifiedAt?: number;
+}
+
+export interface AssistantJobEnqueueResult {
+  job: AssistantJob;
+  duplicate: boolean;
+}
+
+export interface AssistantJobCounts {
+  queued: number;
+  running: number;
+  retryWait: number;
+  blocked: number;
+  failed: number;
+}
+
 export interface SearchHit {
   type: "task" | "capture" | "memory";
   id: string;
@@ -190,6 +234,169 @@ export class AssistantDatabase {
 
   conversation(context: string): SavedConversation | undefined {
     return mapConversation(this.sql.prepare("SELECT * FROM conversations WHERE context=?").get(context));
+  }
+
+  enqueueAssistantJob(input: Pick<AssistantJob,
+    "owner" | "context" | "chatId" | "body" | "prompt" | "fingerprint" | "kind" | "maxAttempts"> &
+    Partial<Pick<AssistantJob, "messageThreadId" | "sourceUpdateId" | "workspace" | "nextAttemptAt">>): AssistantJobEnqueueResult {
+    const normalized = {
+      ...input,
+      owner: input.owner.trim(),
+      context: input.context.trim(),
+      chatId: input.chatId.trim(),
+      body: input.body.trim(),
+      prompt: input.prompt.trim(),
+      fingerprint: input.fingerprint.trim(),
+      workspace: input.workspace?.trim() || undefined,
+    };
+    if (!normalized.owner || !normalized.context || !normalized.chatId || !normalized.body ||
+      !normalized.prompt || !normalized.fingerprint || normalized.maxAttempts < 1 ||
+      (normalized.nextAttemptAt !== undefined && (!Number.isSafeInteger(normalized.nextAttemptAt) || normalized.nextAttemptAt < 0))) {
+      throw new Error("Assistant job fields are required");
+    }
+    return this.sql.transaction(() => {
+      const replayed = normalized.sourceUpdateId === undefined ? undefined
+        : mapAssistantJob(this.sql.prepare("SELECT * FROM assistant_jobs WHERE source_update_id=? LIMIT 1")
+          .get(normalized.sourceUpdateId));
+      const duplicate = replayed
+        ?? this.openAssistantJobByFingerprint(normalized.owner, normalized.context, normalized.fingerprint);
+      if (duplicate) return { job: duplicate, duplicate: true };
+      const now = Date.now();
+      const job: AssistantJob = {
+        id: randomUUID(), ...normalized, state: "queued", attempts: 0,
+        nextAttemptAt: normalized.nextAttemptAt ?? now, createdAt: now, changedAt: now,
+      };
+      this.sql.prepare(`INSERT INTO assistant_jobs(
+        id,owner,context,chat_id,message_thread_id,source_update_id,body,prompt,fingerprint,kind,workspace,state,
+        attempts,max_attempts,next_attempt_at,progress_message_id,last_event_at,error_class,error,result,
+        created_at,changed_at,started_at,finished_at,notified_at
+      ) VALUES(
+        @id,@owner,@context,@chatId,@messageThreadId,@sourceUpdateId,@body,@prompt,@fingerprint,@kind,@workspace,@state,
+        @attempts,@maxAttempts,@nextAttemptAt,NULL,NULL,NULL,NULL,NULL,@createdAt,@changedAt,NULL,NULL,NULL
+      )`).run(nullable({
+        ...job,
+        messageThreadId: job.messageThreadId,
+        sourceUpdateId: job.sourceUpdateId,
+        workspace: job.workspace,
+      }));
+      return { job, duplicate: false };
+    })();
+  }
+
+  assistantJob(id: string): AssistantJob | undefined {
+    return mapAssistantJob(this.sql.prepare("SELECT * FROM assistant_jobs WHERE id=?").get(id));
+  }
+
+  openAssistantJobByFingerprint(owner: string, context: string, fingerprint: string): AssistantJob | undefined {
+    return mapAssistantJob(this.sql.prepare(`SELECT * FROM assistant_jobs
+      WHERE owner=? AND context=? AND fingerprint=? AND state IN ('queued','running','retry_wait')
+      ORDER BY created_at DESC LIMIT 1`).get(owner, context, fingerprint));
+  }
+
+  claimAssistantJob(now = Date.now()): AssistantJob | undefined {
+    return this.sql.transaction(() => {
+      const candidate = mapAssistantJob(this.sql.prepare(`SELECT * FROM assistant_jobs
+        WHERE state IN ('queued','retry_wait') AND next_attempt_at<=?
+        ORDER BY next_attempt_at,created_at LIMIT 1`).get(now));
+      if (!candidate) return undefined;
+      const claimed = this.sql.prepare(`UPDATE assistant_jobs SET state='running',attempts=attempts+1,
+        started_at=?,last_event_at=?,changed_at=?,error_class=NULL,error=NULL,finished_at=NULL
+        WHERE id=? AND state IN ('queued','retry_wait')`).run(now, now, now, candidate.id);
+      return claimed.changes ? this.assistantJob(candidate.id) : undefined;
+    })();
+  }
+
+  nextAssistantJobAt(): number | undefined {
+    const row = this.sql.prepare(`SELECT MIN(next_attempt_at) AS next FROM assistant_jobs
+      WHERE state IN ('queued','retry_wait')`).get() as { next?: number | null } | undefined;
+    return typeof row?.next === "number" ? row.next : undefined;
+  }
+
+  releaseAssistantJob(id: string): boolean {
+    const now = Date.now();
+    return this.sql.prepare("UPDATE assistant_jobs SET next_attempt_at=?,changed_at=? WHERE id=? AND state='queued'")
+      .run(now, now, id).changes > 0;
+  }
+
+  updateAssistantJobProgressMessage(id: string, messageId: number): void {
+    this.sql.prepare("UPDATE assistant_jobs SET progress_message_id=?,changed_at=? WHERE id=?")
+      .run(messageId, Date.now(), id);
+  }
+
+  touchAssistantJob(id: string, at = Date.now()): void {
+    this.sql.prepare("UPDATE assistant_jobs SET last_event_at=?,changed_at=? WHERE id=? AND state='running'")
+      .run(at, at, id);
+  }
+
+  completeAssistantJob(id: string, result: string): boolean {
+    const now = Date.now();
+    return this.sql.prepare(`UPDATE assistant_jobs SET state='succeeded',result=?,changed_at=?,finished_at=?,
+      error_class=NULL,error=NULL,notified_at=NULL WHERE id=? AND state='running'`).run(result, now, now, id).changes > 0;
+  }
+
+  retryAssistantJob(id: string, errorClass: string, error: string, nextAttemptAt: number): boolean {
+    return this.sql.prepare(`UPDATE assistant_jobs SET state='retry_wait',next_attempt_at=?,error_class=?,error=?,changed_at=?
+      WHERE id=? AND state='running'`).run(nextAttemptAt, errorClass, error, Date.now(), id).changes > 0;
+  }
+
+  finishAssistantJob(id: string, state: "blocked" | "failed", errorClass: string, error: string): boolean {
+    const now = Date.now();
+    return this.sql.prepare(`UPDATE assistant_jobs SET state=?,error_class=?,error=?,changed_at=?,finished_at=?
+      WHERE id=? AND state='running'`).run(state, errorClass, error, now, now, id).changes > 0;
+  }
+
+  retryAssistantJobManually(id: string, owner: string, context: string): AssistantJob | undefined {
+    const now = Date.now();
+    const changed = this.sql.prepare(`UPDATE assistant_jobs SET state='queued',attempts=0,next_attempt_at=?,
+      error_class=NULL,error=NULL,result=NULL,notified_at=NULL,changed_at=?,started_at=NULL,finished_at=NULL,last_event_at=NULL
+      WHERE id=? AND owner=? AND context=? AND state IN ('blocked','failed')`).run(now, now, id, owner, context);
+    return changed.changes ? this.assistantJob(id) : undefined;
+  }
+
+  cancelAssistantJobs(context: string): number {
+    const now = Date.now();
+    return this.sql.prepare(`UPDATE assistant_jobs SET state='cancelled',changed_at=?,finished_at=?
+      WHERE context=? AND state IN ('queued','running','retry_wait')`).run(now, now, context).changes;
+  }
+
+  recoverAssistantJobs(now = Date.now()): { retried: number; failed: number } {
+    return this.sql.transaction(() => {
+      const retried = this.sql.prepare(`UPDATE assistant_jobs SET state='retry_wait',next_attempt_at=?,
+        error_class='process_restarted',error='Bot process restarted while the job was running',changed_at=?
+        WHERE state='running' AND attempts<max_attempts`).run(now, now).changes;
+      const failed = this.sql.prepare(`UPDATE assistant_jobs SET state='failed',error_class='process_restarted',
+        error='Bot process restarted after the final attempt',changed_at=?,finished_at=?
+        WHERE state='running' AND attempts>=max_attempts`).run(now, now).changes;
+      return { retried, failed };
+    })();
+  }
+
+  assistantJobCounts(): AssistantJobCounts {
+    const counts: AssistantJobCounts = { queued: 0, running: 0, retryWait: 0, blocked: 0, failed: 0 };
+    const rows = this.sql.prepare(`SELECT state,COUNT(*) AS count FROM assistant_jobs
+      WHERE state IN ('queued','running','retry_wait','blocked','failed') GROUP BY state`)
+      .all() as Array<{ state: AssistantJobState; count: number }>;
+    for (const row of rows) {
+      if (row.state === "retry_wait") counts.retryWait = row.count;
+      else if (row.state in counts) counts[row.state as keyof AssistantJobCounts] = row.count;
+    }
+    return counts;
+  }
+
+  runningAssistantJob(): AssistantJob | undefined {
+    return mapAssistantJob(this.sql.prepare("SELECT * FROM assistant_jobs WHERE state='running' ORDER BY started_at LIMIT 1").get());
+  }
+
+  pendingAssistantJobNotifications(limit = 20): AssistantJob[] {
+    return this.sql.prepare(`SELECT * FROM assistant_jobs
+      WHERE state IN ('succeeded','blocked','failed') AND notified_at IS NULL
+      ORDER BY finished_at,created_at LIMIT ?`).all(limit).map(mapAssistantJob).filter(present);
+  }
+
+  markAssistantJobNotified(id: string): boolean {
+    const now = Date.now();
+    return this.sql.prepare(`UPDATE assistant_jobs SET notified_at=?,changed_at=?
+      WHERE id=? AND state IN ('succeeded','blocked','failed') AND notified_at IS NULL`).run(now, now, id).changes > 0;
   }
 
   createTask(input: Pick<WorkItem, "owner" | "title"> & Partial<Pick<WorkItem, "prompt" | "project" | "projectLabel" | "dueAt" | "status">>): WorkItem {
@@ -555,6 +762,39 @@ export class AssistantDatabase {
   private install(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS conversations(context TEXT PRIMARY KEY, thread_id TEXT, workspace TEXT NOT NULL, model TEXT, effort TEXT, profile_id TEXT NOT NULL, changed_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS assistant_jobs(
+        id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        context TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        message_thread_id INTEGER,
+        source_update_id INTEGER,
+        body TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        workspace TEXT,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        max_attempts INTEGER NOT NULL,
+        next_attempt_at INTEGER NOT NULL,
+        progress_message_id INTEGER,
+        last_event_at INTEGER,
+        error_class TEXT,
+        error TEXT,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        changed_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER,
+        notified_at INTEGER
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS assistant_job_source_update ON assistant_jobs(source_update_id)
+        WHERE source_update_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS assistant_job_open_fingerprint ON assistant_jobs(owner,context,fingerprint)
+        WHERE state IN ('queued','running','retry_wait');
+      CREATE INDEX IF NOT EXISTS assistant_job_state_next ON assistant_jobs(state,next_attempt_at,created_at);
+      CREATE INDEX IF NOT EXISTS assistant_job_context_state ON assistant_jobs(context,state,changed_at);
       CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL, project TEXT, project_label TEXT, thread_id TEXT, due_at INTEGER, queue_order INTEGER, error TEXT, created_at INTEGER NOT NULL, changed_at INTEGER NOT NULL, finished_at INTEGER);
       CREATE INDEX IF NOT EXISTS task_owner_state ON tasks(owner,status,changed_at);
       CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY, owner TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, sender TEXT, source_time INTEGER, state TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -699,6 +939,21 @@ function mapAlarm(row: unknown): Alarm | undefined {
 function mapConversation(row: unknown): SavedConversation | undefined {
   const r = object(row); if (!r) return undefined;
   return { context: str(r.context), threadId: maybe(r.thread_id), workspace: str(r.workspace), model: maybe(r.model), effort: maybe(r.effort), profileId: str(r.profile_id), changedAt: Number(r.changed_at) };
+}
+
+function mapAssistantJob(row: unknown): AssistantJob | undefined {
+  const r = object(row); if (!r) return undefined;
+  return {
+    id: str(r.id), owner: str(r.owner), context: str(r.context), chatId: str(r.chat_id),
+    messageThreadId: num(r.message_thread_id), sourceUpdateId: num(r.source_update_id), body: str(r.body),
+    prompt: str(r.prompt), fingerprint: str(r.fingerprint), kind: str(r.kind) as AssistantJobKind,
+    workspace: maybe(r.workspace), state: str(r.state) as AssistantJobState, attempts: Number(r.attempts),
+    maxAttempts: Number(r.max_attempts), nextAttemptAt: Number(r.next_attempt_at),
+    progressMessageId: num(r.progress_message_id), lastEventAt: num(r.last_event_at),
+    errorClass: maybe(r.error_class), error: maybe(r.error), result: maybe(r.result), createdAt: Number(r.created_at),
+    changedAt: Number(r.changed_at), startedAt: num(r.started_at), finishedAt: num(r.finished_at),
+    notifiedAt: num(r.notified_at),
+  };
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {

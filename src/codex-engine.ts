@@ -35,8 +35,23 @@ export interface TurnObserver {
   toolFinished(id: string, failed: boolean): void;
   plan?(steps: readonly { text: string; done: boolean }[]): void;
   usage?(last: TokenCount, total: TokenCount): void;
+  activity?(event: string): void;
   approval?(prompt: ApprovalPrompt): Promise<ApprovalChoice>;
   userInput?(prompt: UserInputPrompt): Promise<UserInputAnswers>;
+}
+
+export class CodexTurnTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Codex stopped producing events for ${timeoutMs} ms`);
+    this.name = "CodexTurnTimeoutError";
+  }
+}
+
+export class CodexTurnInterruptedError extends Error {
+  constructor() {
+    super("Codex turn was interrupted");
+    this.name = "CodexTurnInterruptedError";
+  }
 }
 
 export interface TokenCount {
@@ -222,6 +237,11 @@ export class Conversation {
     this.effort = effort;
   }
 
+  selectWorkspace(workspace: string): void {
+    this.ensureIdle();
+    this.workspace = workspace;
+  }
+
   async start(workspace = this.workspace, name?: string): Promise<ConversationSnapshot> {
     return this.lifecycle.use(() => this.startAttached(workspace, name));
   }
@@ -276,69 +296,150 @@ export class Conversation {
     return this.snapshot();
   }
 
+  private async forkAttached(threadId: string): Promise<ConversationSnapshot> {
+    this.ensureIdle();
+    const profile = this.profile();
+    const result = await this.transport.call<ThreadOpenResult>("thread/fork", {
+      threadId,
+      cwd: this.workspace,
+      model: this.model ?? null,
+      sandbox: profile.sandbox,
+      approvalPolicy: profile.approvals,
+      approvalsReviewer: "user",
+      ephemeral: false,
+    });
+    this.threadId = result.thread.id;
+    this.workspace = result.cwd || this.workspace;
+    this.model = result.model || this.model;
+    this.effort = result.reasoningEffort || this.effort;
+    this.runtimeAttached = true;
+    return this.snapshot();
+  }
+
+  private async attachForRun(): Promise<void> {
+    if (!this.threadId) {
+      await this.startAttached();
+      return;
+    }
+    if (this.runtimeAttached) return;
+    const occupiedThreadId = this.threadId;
+    try {
+      await this.resumeAttached(occupiedThreadId);
+    } catch (error) {
+      if (!isActiveWriterConflict(error)) throw error;
+      console.warn(`Codex thread ${occupiedThreadId} has an active writer; continuing in a fork`);
+      try {
+        await this.forkAttached(occupiedThreadId);
+      } catch (forkError) {
+        console.error(`Failed to fork occupied Codex thread ${occupiedThreadId}; starting a fresh thread`, forkError);
+        await this.startAttached(this.workspace);
+      }
+    }
+  }
+
   async run(input: AssistantInput, observer: TurnObserver): Promise<void> {
     await this.lifecycle.use(async () => {
-      if (!this.threadId) await this.startAttached();
-      else if (!this.runtimeAttached) await this.resumeAttached(this.threadId);
-      if (this.turnId) throw new Error("A turn is already running");
-      const threadId = this.threadId!;
-      const profile = this.profile();
-      let complete!: () => void;
-      let fail!: (error: Error) => void;
-      let finished = false;
-      const result = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
-      const outputs = new Map<string, string>();
-      const settle = (error?: Error): void => {
-        if (finished) return;
-        finished = true;
-        error ? fail(error) : complete();
-      };
-      const stopListening = this.transport.listen((name, payload) => {
-        if (name === "transport/disconnected") return settle(new Error(text(payload, "message") || "app-server disconnected"));
-        if (payload.threadId !== threadId) return;
-        const eventTurn = text(payload, "turnId") || text(record(payload.turn), "id");
-        if (this.turnId && eventTurn && eventTurn !== this.turnId) return;
-        if (name === "turn/started" && eventTurn) this.turnId = eventTurn;
-        else if (name === "item/agentMessage/delta") observer.text(text(payload, "delta"));
-        else if (name === "item/started") started(record(payload.item), observer);
-        else if (name === "item/commandExecution/outputDelta") progress(payload, observer, outputs);
-        else if (name === "item/mcpToolCall/progress") observer.toolProgress(text(payload, "itemId"), text(payload, "message"));
-        else if (name === "item/completed") completed(record(payload.item), observer, outputs);
-        else if (name === "turn/plan/updated") observer.plan?.(readPlan(payload.plan));
-        else if (name === "thread/tokenUsage/updated") {
-          const usage = record(payload.tokenUsage);
-          const total = readTokens(record(usage.total));
-          const last = readTokens(record(usage.last));
-          this.tokens = total;
-          observer.usage?.(last, total);
-        } else if (name === "error" && payload.willRetry !== true) {
-          settle(new Error(text(record(payload.error), "message") || "Codex failed"));
-        } else if (name === "turn/completed") {
-          const turn = record(payload.turn);
-          const status = text(turn, "status");
-          settle(status === "failed" ? new Error(text(record(turn.error), "message") || "Codex turn failed") : undefined);
-        }
-      });
-      this.transport.answerRequestsFor(threadId, (name, payload) => this.answerHostRequest(name, payload, observer));
       try {
-        const opened = await this.transport.call<TurnOpenResult>("turn/start", {
+        await this.runAttached(input, observer);
+      } finally {
+        await this.lifecycle.releaseWriters();
+      }
+    });
+  }
+
+  private async runAttached(input: AssistantInput, observer: TurnObserver): Promise<void> {
+    await this.attachForRun();
+    if (this.turnId) throw new Error("A turn is already running");
+    const threadId = this.threadId!;
+    const profile = this.profile();
+    const timeoutMs = this.configuration.assistantInactivityTimeoutMs;
+    let complete!: () => void;
+    let fail!: (error: Error) => void;
+    let rejectWatchdog!: (error: Error) => void;
+    let finished = false;
+    let timer: NodeJS.Timeout | undefined;
+    const result = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
+    const watchdog = new Promise<never>((_resolve, reject) => { rejectWatchdog = reject; });
+    const outputs = new Map<string, string>();
+    const settle = (error?: Error): void => {
+      if (finished) return;
+      finished = true;
+      error ? fail(error) : complete();
+    };
+    const touch = (name: string): void => {
+      observer.activity?.(name);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const error = new CodexTurnTimeoutError(timeoutMs);
+        rejectWatchdog(error);
+        if (this.turnId) {
+          void this.transport.call("turn/interrupt", { threadId, turnId: this.turnId }).catch(() => undefined);
+        }
+      }, timeoutMs);
+    };
+    touch("turn/requested");
+    const stopListening = this.transport.listen((name, payload) => {
+      if (name === "transport/disconnected") {
+        touch(name);
+        return settle(new Error(text(payload, "message") || "app-server disconnected"));
+      }
+      if (payload.threadId !== threadId) return;
+      const eventTurn = text(payload, "turnId") || text(record(payload.turn), "id");
+      if (this.turnId && eventTurn && eventTurn !== this.turnId) return;
+      touch(name);
+      if (name === "turn/started" && eventTurn) this.turnId = eventTurn;
+      else if (name === "item/agentMessage/delta") observer.text(text(payload, "delta"));
+      else if (name === "item/started") started(record(payload.item), observer);
+      else if (name === "item/commandExecution/outputDelta") progress(payload, observer, outputs);
+      else if (name === "item/mcpToolCall/progress") observer.toolProgress(text(payload, "itemId"), text(payload, "message"));
+      else if (name === "item/completed") completed(record(payload.item), observer, outputs);
+      else if (name === "turn/plan/updated") observer.plan?.(readPlan(payload.plan));
+      else if (name === "thread/tokenUsage/updated") {
+        const usage = record(payload.tokenUsage);
+        const total = readTokens(record(usage.total));
+        const last = readTokens(record(usage.last));
+        this.tokens = total;
+        observer.usage?.(last, total);
+      } else if (name === "error" && payload.willRetry !== true) {
+        settle(new Error(text(record(payload.error), "message") || "Codex failed"));
+      } else if (name === "turn/completed") {
+        const turn = record(payload.turn);
+        const status = text(turn, "status");
+        if (status === "completed") settle();
+        else if (status === "interrupted") settle(new CodexTurnInterruptedError());
+        else settle(new Error(text(record(turn.error), "message") || `Codex turn ${status || "failed"}`));
+      }
+    });
+    this.transport.answerRequestsFor(threadId, async (name, payload) => {
+      touch(name);
+      try {
+        return await this.answerHostRequest(name, payload, observer);
+      } finally {
+        touch(`${name}/resolved`);
+      }
+    });
+    try {
+      const opened = await Promise.race([
+        this.transport.call<TurnOpenResult>("turn/start", {
           threadId,
           input: toProtocolInput(input),
           cwd: this.workspace,
           model: this.model ?? null,
           effort: this.effort ?? null,
+          sandbox: profile.sandbox,
           approvalPolicy: profile.approvals,
           approvalsReviewer: "user",
-        });
-        this.turnId = opened.turn.id;
-        await result;
-      } finally {
-        stopListening();
-        this.transport.answerRequestsFor(threadId);
-        this.turnId = undefined;
-        await this.lifecycle.releaseWriters();
-      }
-    });
+        }),
+        watchdog,
+      ]);
+      this.turnId = opened.turn.id;
+      await Promise.race([result, watchdog]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      stopListening();
+      this.transport.answerRequestsFor(threadId);
+      this.turnId = undefined;
+    }
   }
 
   async steer(input: AssistantInput): Promise<void> {
@@ -397,6 +498,11 @@ export class Conversation {
     }
     return { decision: choice };
   }
+}
+
+function isActiveWriterConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /already has an active writer/iu.test(message);
 }
 
 function readUserInput(payload: RpcRecord): UserInputPrompt {

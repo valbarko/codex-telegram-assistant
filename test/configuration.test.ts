@@ -29,6 +29,14 @@ describe("readConfiguration", () => {
     expect(config).toMatchObject({
       mediaDownloaderExecutable: "yt-dlp", ffmpegExecutable: "ffmpeg", mediaSummaryMaxDurationSeconds: 21_600,
     });
+    expect(config).toMatchObject({
+      articleBankDirectory: "/home/person/WORK/valentin-writing",
+      assistantInactivityTimeoutMs: 420_000,
+      assistantJobMaxAttempts: 3,
+      heartbeatFile: "/home/person/.local/share/codex-telegram-assistant/health.json",
+      heartbeatIntervalMs: 15_000,
+      watchdogStaleMs: 120_000,
+    });
   });
 
   it("loads a configurable weather location", () => {
@@ -50,6 +58,20 @@ describe("readConfiguration", () => {
     expect(config).toMatchObject({
       mediaDownloaderExecutable: "/opt/bin/yt-dlp", ffmpegExecutable: "/opt/bin/ffmpeg",
       mediaSummaryMaxDurationSeconds: 10_800, mediaCookiesFromBrowser: "chrome:Profile 1",
+    });
+  });
+
+  it("loads assistant recovery and watchdog settings", () => {
+    const config = readConfiguration("/tmp", {
+      TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12", HOME: "/home/person",
+      ARTICLE_BANK_DIR: "/work/articles", ASSISTANT_INACTIVITY_TIMEOUT_MS: "90000",
+      ASSISTANT_JOB_MAX_ATTEMPTS: "4", ASSISTANT_HEARTBEAT_INTERVAL_MS: "20000",
+      ASSISTANT_WATCHDOG_STALE_MS: "180000", ASSISTANT_HEARTBEAT_FILE: "/tmp/bot-health.json",
+    });
+    expect(config).toMatchObject({
+      articleBankDirectory: "/work/articles", assistantInactivityTimeoutMs: 90_000,
+      assistantJobMaxAttempts: 4, heartbeatIntervalMs: 20_000,
+      watchdogStaleMs: 180_000, heartbeatFile: "/tmp/bot-health.json",
     });
   });
 

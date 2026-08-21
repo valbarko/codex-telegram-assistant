@@ -32,6 +32,7 @@ export interface AppConfiguration {
   hindsightLiveBatchSize: number;
   hindsightLiveFlushMs: number;
   defaultWorkspace: string;
+  articleBankDirectory: string;
   projectAliases: Readonly<Record<string, string>>;
   weatherLocation: string;
   weatherLatitude: number;
@@ -48,6 +49,11 @@ export interface AppConfiguration {
   profiles: readonly ExecutionProfile[];
   maxUploadBytes: number;
   showUsage: boolean;
+  assistantInactivityTimeoutMs: number;
+  assistantJobMaxAttempts: number;
+  heartbeatFile: string;
+  heartbeatIntervalMs: number;
+  watchdogStaleMs: number;
 }
 
 export function readConfiguration(cwd = process.cwd(), environment: NodeJS.ProcessEnv = process.env): AppConfiguration {
@@ -64,6 +70,8 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
   const homeDirectory = env.HOME?.trim() || cwd;
   const defaultWorkspace = path.resolve(env.ASSISTANT_WORKSPACE?.trim() || cwd);
   const dataDirectory = path.resolve(env.ASSISTANT_DATA_DIR?.trim() || path.join(homeDirectory, ".local", "share", "codex-telegram-assistant"));
+  const heartbeatIntervalMs = parsePositiveInteger(env.ASSISTANT_HEARTBEAT_INTERVAL_MS, 15_000,
+    "ASSISTANT_HEARTBEAT_INTERVAL_MS");
   const profiles = parseProfiles(env.ASSISTANT_PROFILES_JSON);
   const defaultProfile = env.ASSISTANT_DEFAULT_PROFILE?.trim() || "default";
   if (!profiles.some((profile) => profile.id === defaultProfile)) {
@@ -104,6 +112,7 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     hindsightLiveBatchSize: parsePositiveInteger(env.HINDSIGHT_LIVE_BATCH_SIZE, 10, "HINDSIGHT_LIVE_BATCH_SIZE"),
     hindsightLiveFlushMs: parsePositiveInteger(env.HINDSIGHT_LIVE_FLUSH_MS, 5_000, "HINDSIGHT_LIVE_FLUSH_MS"),
     defaultWorkspace,
+    articleBankDirectory: path.resolve(env.ARTICLE_BANK_DIR?.trim() || path.join(homeDirectory, "WORK", "valentin-writing")),
     projectAliases: parseAliases(env.PROJECT_ALIASES_JSON || env.WORKSPACE_LABELS_JSON),
     weatherLocation: optional(env.WEATHER_LOCATION) || "Москва",
     weatherLatitude: parseCoordinate(env.WEATHER_LATITUDE, 55.7558, -90, 90, "WEATHER_LATITUDE"),
@@ -121,6 +130,13 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     profiles,
     maxUploadBytes: parseByteLimit(env.MAX_UPLOAD_BYTES || env.MAX_FILE_SIZE),
     showUsage: parseBoolean(env.SHOW_TURN_USAGE || env.SHOW_TURN_TOKEN_USAGE, false),
+    assistantInactivityTimeoutMs: parsePositiveInteger(env.ASSISTANT_INACTIVITY_TIMEOUT_MS, 7 * 60_000,
+      "ASSISTANT_INACTIVITY_TIMEOUT_MS"),
+    assistantJobMaxAttempts: parsePositiveInteger(env.ASSISTANT_JOB_MAX_ATTEMPTS, 3, "ASSISTANT_JOB_MAX_ATTEMPTS"),
+    heartbeatFile: path.resolve(env.ASSISTANT_HEARTBEAT_FILE?.trim() || path.join(dataDirectory, "health.json")),
+    heartbeatIntervalMs,
+    watchdogStaleMs: parsePositiveInteger(env.ASSISTANT_WATCHDOG_STALE_MS,
+      Math.max(120_000, heartbeatIntervalMs * 4), "ASSISTANT_WATCHDOG_STALE_MS"),
   };
 }
 
