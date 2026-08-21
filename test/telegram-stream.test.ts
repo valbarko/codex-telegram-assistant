@@ -74,10 +74,13 @@ describe("TelegramTurnView", () => {
     expect(editMessageText).toHaveBeenLastCalledWith(7, 9, "<b>Готовый ответ</b>", { parse_mode: "HTML" });
   });
 
-  it("keeps an unedited draft hidden until the final editorial pass", async () => {
-    const reply = vi.fn(async () => ({ message_id: 9 }));
+  it("sends the final editorial result as a new message before deleting progress", async () => {
+    const reply = vi.fn()
+      .mockResolvedValueOnce({ message_id: 9 })
+      .mockResolvedValueOnce({ message_id: 10 });
     const editMessageText = vi.fn(async () => true);
-    const ctx = { chat: { id: 7 }, reply, api: { editMessageText } };
+    const deleteMessage = vi.fn(async () => true);
+    const ctx = { chat: { id: 7 }, reply, api: { deleteMessage, editMessageText } };
     const view = new TelegramTurnView(ctx as never, async () => "decline", async () => ({}), false, false);
 
     await view.start();
@@ -86,9 +89,11 @@ describe("TelegramTurnView", () => {
 
     await view.finish("**Финальный ответ**");
 
-    expect(reply).toHaveBeenCalledWith("✍️ Привожу ответ в порядок…");
-    expect(editMessageText).toHaveBeenCalledOnce();
-    expect(editMessageText).toHaveBeenCalledWith(7, 9, "<b>Финальный ответ</b>", { parse_mode: "HTML" });
+    expect(reply).toHaveBeenNthCalledWith(1, "✍️ Привожу ответ в порядок…");
+    expect(reply).toHaveBeenNthCalledWith(2, "<b>Финальный ответ</b>", { parse_mode: "HTML" });
+    expect(editMessageText).not.toHaveBeenCalled();
+    expect(deleteMessage).toHaveBeenCalledWith(7, 9);
+    expect(reply.mock.invocationCallOrder[1]).toBeLessThan(deleteMessage.mock.invocationCallOrder[0]);
   });
 
   it("never exposes a system exception in a failed streamed answer", async () => {

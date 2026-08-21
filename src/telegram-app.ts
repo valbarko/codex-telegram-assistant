@@ -1570,6 +1570,7 @@ class TextOnlyObserver implements TurnObserver {
 export class TelegramTurnView implements TurnObserver {
   private answer = "";
   private messageId?: number;
+  private progressMessageId?: number;
   private lastEdit = 0;
   private timer?: NodeJS.Timeout;
   private lastUsage?: string;
@@ -1604,6 +1605,7 @@ export class TelegramTurnView implements TurnObserver {
     if (this.messageId !== undefined) return;
     const message = await this.ctx.reply("✍️ Привожу ответ в порядок…");
     this.messageId = message.message_id;
+    this.progressMessageId = message.message_id;
   }
 
   async finish(answer?: string): Promise<void> {
@@ -1649,13 +1651,22 @@ export class TelegramTurnView implements TurnObserver {
     const source = `${this.answer.trim() || (final ? "Готово" : "…")}${final && this.showUsage && this.lastUsage ? `\n\n${this.lastUsage}` : ""}`;
     const rendered = renderTelegramMarkdown(source, TELEGRAM_LIMIT - 50);
     const { html: text, plain } = rendered;
-    if (!this.messageId) {
+    const replaceProgressWithReply = final && this.progressMessageId !== undefined;
+    if (!this.messageId || replaceProgressWithReply) {
+      const progressMessageId = this.progressMessageId;
       const message = await this.ctx.reply(text, { parse_mode: "HTML" }).catch(async (error) => {
         logInternalError("Telegram formatted reply failed", error);
         return this.ctx.reply(markdownToPlainText(plain));
       });
       this.messageId = message.message_id;
       this.lastRenderedHtml = text;
+      this.progressMessageId = undefined;
+      if (progressMessageId !== undefined) {
+        await this.ctx.api.deleteMessage(this.ctx.chat!.id, progressMessageId).catch((error) => {
+          logInternalError("Telegram progress cleanup failed", error);
+          return undefined;
+        });
+      }
     } else {
       if (this.lastRenderedHtml === text) return;
       try {
