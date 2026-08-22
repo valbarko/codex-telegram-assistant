@@ -67,6 +67,5 @@ for attempt in {1..5}; do
   fi
   sleep 1
 done
-launchctl kickstart -k "gui/$(id -u)/$label"
 launchctl bootstrap "gui/$(id -u)" "$watchdog_plist"
 echo "Installed $label and $watchdog_label"
