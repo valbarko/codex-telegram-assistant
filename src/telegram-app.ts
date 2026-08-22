@@ -1,11 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
+import { run, sequentialize, type RunnerHandle } from "@grammyjs/runner";
 import { Bot, InlineKeyboard, InputFile, Keyboard, type Context } from "grammy";
 
+import { AssistantJobBlockedError, AssistantJobWorker, type AssistantJobFailure } from "./assistant-job-worker.js";
+import { articleBankExecutionPrompt, isArticleBankDeliveryRequest, snapshotArticleBank,
+  validateArticleBankDelivery } from "./article-bank-job.js";
 import type { AppConfiguration } from "./configuration.js";
 import { ArticleIdeaService, isArticleIdeaRequest, type CapturedArticleIdea } from "./article-idea.js";
 import { formatPlainTranscript, formatVoiceTranscript, structureTranscript, transcribeAudio } from "./audio.js";
@@ -21,7 +25,9 @@ import { MemoryService, scopedMemorySource, type RecallHit } from "./memory-serv
 import { normalizeCalendarTitle, parseTemporalCodexResponse, understandAlarm, type ParsedAlarm } from "./reminder-language.js";
 import { localCommandFallbackPrompt, quietCodexPrompt } from "./prompt-policy.js";
 import { logInternalError, publicErrorMessage } from "./public-errors.js";
-import { AssistantDatabase, type CapturedItem, type VoiceWritingSettings, type WorkItem } from "./storage.js";
+import type { RuntimeHealthMonitor, RuntimeHealthState } from "./runtime-health.js";
+import { AssistantDatabase, type AssistantJob, type CapturedItem, type VoiceWritingSettings,
+  type WorkItem } from "./storage.js";
 import { parseWorkTasks, taskChecklistText, taskSummary, WorkTaskArchive } from "./task-capture.js";
 import { isTranscriptionMedia, isTranscriptionText, telegramAccessMode } from "./telegram-access.js";
 import { publicTranscriptionErrorMessage, transcriptionCopyPresentation } from "./telegram-copy.js";
@@ -53,6 +59,10 @@ interface UserQuestionWaiter {
   timer: NodeJS.Timeout;
 }
 
+interface AssistantRequestMetadata {
+  body?: string;
+}
+
 export class TelegramApplication {
   readonly bot: Bot<Context>;
   private readonly pending = new Map<string, PendingInput>();
@@ -72,6 +82,9 @@ export class TelegramApplication {
   private readonly workTaskArchive: WorkTaskArchive;
   private readonly articleIdeas: ArticleIdeaService;
   private readonly forwardedVoiceFlushes = new Map<string, Promise<void>>();
+  private readonly assistantJobs: AssistantJobWorker;
+  private healthMonitor?: RuntimeHealthMonitor;
+  private runner?: RunnerHandle;
 
   constructor(
     private readonly configuration: AppConfiguration,
@@ -88,6 +101,12 @@ export class TelegramApplication {
     this.mediaSummary = new MediaSummaryService(configuration, this.restrictedTextEditor);
     this.workTaskArchive = new WorkTaskArchive(configuration.writingArchiveDirectory);
     this.articleIdeas = new ArticleIdeaService(configuration, hub);
+    this.assistantJobs = new AssistantJobWorker(database, {
+      execute: (job) => this.executeAssistantJob(job),
+      succeeded: (job, result) => this.announceAssistantSuccess(job, result),
+      retryScheduled: (job, failure, retryAt) => this.announceAssistantRetry(job, failure, retryAt),
+      terminalFailure: (job, failure) => this.announceAssistantFailure(job, failure),
+    });
     this.bot = new Bot(configuration.telegramToken);
     this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 8 }));
     this.bot.api.config.use(markdownTelegramTransformer);
@@ -138,16 +157,47 @@ export class TelegramApplication {
 
   async start(): Promise<void> {
     await this.registerCommands();
-    await this.bot.start({ drop_pending_updates: true });
+    const recovered = this.assistantJobs.start();
+    if (recovered.retried || recovered.failed) {
+      console.warn(`Recovered assistant jobs after restart: retry=${recovered.retried}, failed=${recovered.failed}`);
+    }
+    this.runner = run(this.bot, { sink: { concurrency: 8 } });
+    await this.runner.task();
+    throw new Error("Telegram runner stopped unexpectedly");
   }
 
   stop(): void {
+    this.assistantJobs.stop();
     this.forwardedVoiceBatcher.stop();
     this.restrictedForwardedVoiceBatcher.stop();
-    this.bot.stop();
+    if (this.runner) void this.runner.stop().catch((error) => console.error("Telegram runner stop failed", error));
+    else this.bot.stop();
+  }
+
+  attachHealthMonitor(monitor: RuntimeHealthMonitor): void {
+    this.healthMonitor = monitor;
+  }
+
+  runtimeHealth(): Omit<RuntimeHealthState, "updatedAt" | "startedAt" | "pid" | "lastTelegramUpdateAt"> {
+    const active = this.database.runningAssistantJob();
+    return {
+      polling: this.runner?.isRunning() ?? false,
+      inflightUpdates: this.runner?.size() ?? 0,
+      workerRunning: this.assistantJobs.isRunning(),
+      queue: this.database.assistantJobCounts(),
+      activeJob: active ? {
+        id: active.id, context: active.context, kind: active.kind, attempts: active.attempts,
+        maxAttempts: active.maxAttempts, startedAt: active.startedAt, lastEventAt: active.lastEventAt,
+      } : undefined,
+    };
   }
 
   private install(): void {
+    this.bot.use(sequentialize((ctx) => telegramRunnerConstraint(ctx)));
+    this.bot.use(async (_ctx, next) => {
+      this.healthMonitor?.telegramUpdate();
+      await next();
+    });
     this.bot.use(async (ctx, next) => {
       const access = telegramAccessMode(this.configuration, ctx.from?.id);
       if (access === "full" || (access === "transcription-only" && isTranscriptionMedia(ctx))) {
@@ -247,8 +297,9 @@ export class TelegramApplication {
       const context = contextId(ctx);
       this.cancelApprovals(context);
       this.cancelUserQuestion(context);
-      await (await this.conversation(ctx)).interrupt();
-      await ctx.reply("Текущий ход остановлен.");
+      const cancelled = this.database.cancelAssistantJobs(context);
+      await (await this.conversation(ctx)).interrupt().catch((error) => logInternalError("Codex interrupt failed", error));
+      await ctx.reply(cancelled ? "Текущий ход и задания в очереди остановлены." : "Активных заданий нет.");
     });
 
     this.bot.command("launch_profiles", async (ctx) => {
@@ -327,6 +378,7 @@ export class TelegramApplication {
       await this.showTasks(ctx);
     });
     this.bot.callbackQuery(/^capture:(task|memory|drop):(.+)$/, async (ctx) => this.captureAction(ctx));
+    this.bot.callbackQuery(/^assistant-job:retry:(.+)$/, async (ctx) => this.retryAssistantJob(ctx));
     this.bot.callbackQuery(/^blog-detail:(.+)$/, async (ctx) => this.showBlogTopicDetail(ctx));
     this.bot.callbackQuery(/^blog-topic:(.+)$/, async (ctx) => this.selectBlogTopic(ctx));
     this.bot.callbackQuery(/^alarm:delete:(.+)$/, async (ctx) => {
@@ -395,16 +447,26 @@ export class TelegramApplication {
       if (!forwarded.key && command.kind === "assistant" && command.label) {
         if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
       }
-      await this.memory.record({
+      const voiceMemory = {
         owner: ownerId(ctx),
         body: raw,
-        role: "user",
-        kind: "voice",
+        role: "user" as const,
+        kind: "voice" as const,
         project: this.memoryProject(ctx),
-        source: forwarded.key
-          ? `telegram-forwarded-voice:${sender || forwarded.key}`
-          : this.memorySource(ctx, "telegram-voice"),
-      });
+      };
+      if (forwarded.key) {
+        await this.memory.record({
+          ...voiceMemory,
+          source: `telegram-forwarded-voice:${sender || forwarded.key}`,
+        });
+      } else {
+        await this.memory.upsertExternal({
+          ...voiceMemory,
+          source: telegramUpdateMemorySource(ctx.update.update_id, "voice",
+            this.database.conversation(contextId(ctx))?.threadId),
+          sourceChangedAt: sentAt,
+        });
+      }
       if (forwarded.key) {
         const batchKey = `${contextId(ctx)}:${forwarded.key}`;
         const fragment: ForwardedVoiceFragment = {
@@ -578,21 +640,17 @@ export class TelegramApplication {
       const augmented = await this.memory.augmentPrompt(ownerId(ctx), command.content, project, {
         threadId: snapshot.threadId,
       });
-      await this.memory.record({
+      await this.memory.upsertExternal({
         owner: ownerId(ctx),
         body: raw,
         role: "user",
         kind: inputKind,
         project,
-        source: scopedMemorySource(inputKind === "voice" ? "telegram-voice" : "telegram-text", snapshot.threadId),
+        source: telegramUpdateMemorySource(ctx.update.update_id, inputKind === "voice" ? "voice" : "text", snapshot.threadId),
+        sourceChangedAt: sentAt,
       });
       const prompt = quietCodexPrompt(augmented);
-      if (snapshot.running) {
-        await conversation.steer(prompt);
-        await ctx.reply("↪️ Мысль добавлена в текущий ход.");
-      } else {
-        await this.executePrompt(ctx, prompt);
-      }
+      await this.executePrompt(ctx, prompt, { body: raw });
       return true;
     }
     if (command.kind === "task" || command.kind === "reminder" || command.kind === "inbox" || command.kind === "memory" || command.kind === "calendar") {
@@ -856,18 +914,14 @@ export class TelegramApplication {
     const snapshot = conversation.snapshot();
     const project = snapshot.workspace;
     const augmented = await this.memory.augmentPrompt(ownerId(ctx), text, project, { threadId: snapshot.threadId });
-    await this.memory.record({
+    await this.memory.upsertExternal({
       owner: ownerId(ctx), body: text, role: "user", kind: "message", project,
-      source: scopedMemorySource("telegram-text", snapshot.threadId),
+      source: telegramUpdateMemorySource(ctx.update.update_id, "text", snapshot.threadId),
+      sourceChangedAt: ctx.message?.date ? ctx.message.date * 1000 : Date.now(),
     });
     const routed = looksLikeMail(text) ? gmailPrompt(augmented)
       : quietCodexPrompt(localFallback ? localCommandFallbackPrompt(augmented) : augmented);
-    if (conversation.snapshot().running) {
-      await conversation.steer(routed);
-      await ctx.reply("↪️ Уточнение добавлено в текущий ход.");
-      return;
-    }
-    await this.executePrompt(ctx, routed);
+    await this.executePrompt(ctx, routed, { body: text });
   }
 
   private async mediaSummaryMessage(ctx: Context, sourceUrl: string): Promise<void> {
@@ -975,26 +1029,148 @@ export class TelegramApplication {
     }
   }
 
-  private async executePrompt(ctx: Context, prompt: string): Promise<void> {
-    const conversation = await this.conversation(ctx);
-    const view = new TelegramTurnView(ctx, (request) => this.askApproval(ctx, request),
-      (request) => this.askUserInput(ctx, request), this.configuration.showUsage, false);
+  private async executePrompt(ctx: Context, prompt: string, metadata: AssistantRequestMetadata = {}): Promise<void> {
+    if (!ctx.chat) return;
+    const body = metadata.body?.trim() || prompt.trim();
+    const articleBank = isArticleBankDeliveryRequest(body);
+    const result = this.database.enqueueAssistantJob({
+      owner: ownerId(ctx),
+      context: contextId(ctx),
+      chatId: String(ctx.chat.id),
+      messageThreadId: ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id,
+      sourceUpdateId: ctx.update.update_id,
+      body,
+      prompt: articleBank ? articleBankExecutionPrompt(prompt) : prompt,
+      fingerprint: assistantRequestFingerprint(body),
+      kind: articleBank ? "article_bank" : "assistant",
+      workspace: articleBank ? this.configuration.articleBankDirectory : undefined,
+      maxAttempts: this.configuration.assistantJobMaxAttempts,
+      nextAttemptAt: Date.now() + 60_000,
+    });
+    if (result.duplicate) {
+      if (result.job.sourceUpdateId !== ctx.update.update_id) {
+        await ctx.reply(result.job.state === "running" ? "Этот запрос уже выполняется." : "Этот запрос уже стоит в очереди.");
+      }
+      return;
+    }
     try {
-      await view.start();
+      const counts = this.database.assistantJobCounts();
+      const label = articleBank ? "Задание для Банка статей принято." : "Задание принято.";
+      const queued = counts.running + counts.queued + counts.retryWait;
+      const message = await ctx.reply(`${label}${queued > 1 ? ` Перед ним в очереди: ${queued - 1}.` : " Начинаю."}`);
+      this.database.updateAssistantJobProgressMessage(result.job.id, message.message_id);
+    } catch (error) {
+      logInternalError("Assistant job acknowledgement failed", error);
+    } finally {
+      this.database.releaseAssistantJob(result.job.id);
+      this.assistantJobs.notify();
+    }
+  }
+
+  private async executeAssistantJob(job: AssistantJob): Promise<string> {
+    const ctx = this.assistantJobContext(job);
+    const conversation = await this.conversationFor(job.context);
+    if (job.workspace && conversation.snapshot().workspace !== job.workspace) conversation.selectWorkspace(job.workspace);
+    const before = job.kind === "article_bank" ? await snapshotArticleBank(this.configuration.articleBankDirectory) : undefined;
+    let lastPersistedActivity = 0;
+    const view = new TelegramTurnView(
+      ctx,
+      (request) => this.askApproval(ctx, request),
+      (request) => this.askUserInput(ctx, request),
+      this.configuration.showUsage,
+      false,
+      job.progressMessageId,
+      () => {
+        if (Date.now() - lastPersistedActivity < 5_000) return;
+        lastPersistedActivity = Date.now();
+        this.database.touchAssistantJob(job.id, lastPersistedActivity);
+      },
+    );
+    const progressId = await view.start(job.attempts > 1 ? `✍️ Повторная попытка ${job.attempts}…` : "✍️ Выполняю задание…");
+    this.database.updateAssistantJobProgressMessage(job.id, progressId);
+    const prompt = job.attempts > 1 ? retryPrompt(job.prompt, job.attempts) : job.prompt;
+    try {
       await conversation.run(prompt, view);
       const answer = await this.polishAssistantResponse(view.content());
-      await view.finish(answer);
-      this.persist(ctx, conversation);
-      if (answer) {
-        const snapshot = conversation.snapshot();
-        await this.memory.record({
-          owner: ownerId(ctx), body: answer, role: "assistant", kind: "response", project: snapshot.workspace,
-          source: scopedMemorySource("codex-final", snapshot.threadId),
-        });
+      if (!answer.trim()) throw new AssistantJobBlockedError("Codex завершил ход без итогового ответа", "empty_answer");
+      if (job.kind === "article_bank") {
+        await validateArticleBankDelivery(this.configuration.articleBankDirectory, before!);
       }
+      view.pause();
+      this.persistConversation(job.context, conversation);
+      const snapshot = conversation.snapshot();
+      await this.memory.record({
+        owner: job.owner, body: answer, role: "assistant", kind: "response", project: snapshot.workspace,
+        source: scopedMemorySource("codex-final", snapshot.threadId),
+      });
+      return answer;
     } catch (error) {
-      logInternalError("Codex request failed", error);
-      await view.fail();
+      view.pause();
+      this.persistConversation(job.context, conversation);
+      logInternalError(`Assistant job ${job.id} failed`, error);
+      throw error;
+    }
+  }
+
+  private async announceAssistantSuccess(job: AssistantJob, answer: string): Promise<void> {
+    for (const chunk of telegramMarkdownChunks(answer, TELEGRAM_LIMIT - 100)) {
+      await this.bot.api.sendMessage(Number(job.chatId), chunk.html, {
+        ...telegramHtmlOptions(job.messageThreadId),
+      }).catch(async (error) => {
+        logInternalError("Telegram formatted job result failed", error);
+        await this.bot.api.sendMessage(Number(job.chatId), markdownToPlainText(chunk.plain),
+          telegramPlainOptions(job.messageThreadId));
+      });
+    }
+    if (job.progressMessageId) {
+      await this.bot.api.deleteMessage(Number(job.chatId), job.progressMessageId).catch(() => undefined);
+    }
+  }
+
+  private async announceAssistantRetry(job: AssistantJob, _failure: AssistantJobFailure, retryAt: number): Promise<void> {
+    const seconds = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
+    await this.updateAssistantJobMessage(job, `⚠️ Codex перестал отвечать. Автоматически повторю через ${seconds} сек.`);
+  }
+
+  private async announceAssistantFailure(job: AssistantJob, failure: AssistantJobFailure): Promise<void> {
+    const reason = assistantFailureReason(failure);
+    const keyboard = new InlineKeyboard().text("🔄 Повторить", `assistant-job:retry:${job.id}`);
+    const message = await this.bot.api.sendMessage(Number(job.chatId),
+      `⚠️ Не удалось завершить задание. ${reason}\n\nЗапрос сохранён — после устранения причины его можно повторить.`, {
+        ...telegramPlainOptions(job.messageThreadId), reply_markup: keyboard,
+      });
+    if (job.progressMessageId && job.progressMessageId !== message.message_id) {
+      await this.bot.api.deleteMessage(Number(job.chatId), job.progressMessageId).catch(() => undefined);
+    }
+    this.database.updateAssistantJobProgressMessage(job.id, message.message_id);
+  }
+
+  private async updateAssistantJobMessage(job: AssistantJob, text: string): Promise<void> {
+    if (job.progressMessageId) {
+      const edited = await this.bot.api.editMessageText(Number(job.chatId), job.progressMessageId, text).then(() => true)
+        .catch(() => false);
+      if (edited) return;
+    }
+    const message = await this.bot.api.sendMessage(Number(job.chatId), text, telegramPlainOptions(job.messageThreadId));
+    this.database.updateAssistantJobProgressMessage(job.id, message.message_id);
+  }
+
+  private async retryAssistantJob(ctx: Context): Promise<void> {
+    const id = ctx.match?.[1];
+    const job = id ? this.database.retryAssistantJobManually(id, ownerId(ctx), contextId(ctx)) : undefined;
+    if (!job) {
+      await ctx.answerCallbackQuery({ text: "Запрос уже выполняется или недоступен" });
+      return;
+    }
+    const messageId = ctx.callbackQuery?.message?.message_id;
+    if (messageId) this.database.updateAssistantJobProgressMessage(job.id, messageId);
+    try {
+      await ctx.answerCallbackQuery({ text: "Запрос снова поставлен в очередь" });
+      if (ctx.callbackQuery?.message) await ctx.editMessageText("⏳ Запрос снова поставлен в очередь…");
+    } catch (error) {
+      logInternalError("Assistant retry acknowledgement failed", error);
+    } finally {
+      this.assistantJobs.notify();
     }
   }
 
@@ -1029,7 +1205,7 @@ export class TelegramApplication {
     const keyboard = new InlineKeyboard();
     options.forEach((label, index) => keyboard.text(label, `question:${token}:${index}`).row());
     if (question.isOther) keyboard.text("Другой ответ ✍️", `question:${token}:other`);
-    const timeout = Math.min(Math.max(autoResolutionMs ?? 10 * 60_000, 5_000), 10 * 60_000);
+    const timeout = Math.min(Math.max(autoResolutionMs ?? 5 * 60_000, 5_000), 5 * 60_000);
     const answer = new Promise<string[]>((settle) => {
       const timer = setTimeout(() => this.finishUserQuestion(token, []), timeout);
       this.userQuestions.set(token, {
@@ -1082,7 +1258,7 @@ export class TelegramApplication {
       .text("✅ Один раз", `approve:${token}:once`).text("🔁 На сессию", `approve:${token}:session`).row()
       .text("⛔ Отклонить", `approve:${token}:decline`).text("✖️ Отменить", `approve:${token}:cancel`);
     return new Promise<ApprovalChoice>((settle) => {
-      const timer = setTimeout(() => { this.approvals.delete(token); settle("decline"); }, 10 * 60_000);
+      const timer = setTimeout(() => { this.approvals.delete(token); settle("decline"); }, 5 * 60_000);
       this.approvals.set(token, { context: contextId(ctx), settle, timer });
       void ctx.reply(approvalCard(prompt), { parse_mode: "HTML", reply_markup: keyboard }).catch(() => {
         clearTimeout(timer); this.approvals.delete(token); settle("decline");
@@ -1091,19 +1267,41 @@ export class TelegramApplication {
   }
 
   private async conversation(ctx: Context): Promise<Conversation> {
-    const key = contextId(ctx);
-    const saved = this.database.conversation(key);
-    return this.hub.conversation(key, saved ? {
+    return this.conversationFor(contextId(ctx));
+  }
+
+  private async conversationFor(context: string): Promise<Conversation> {
+    const saved = this.database.conversation(context);
+    return this.hub.conversation(context, saved ? {
       threadId: saved.threadId, workspace: saved.workspace, model: saved.model, effort: saved.effort, profileId: saved.profileId,
     } : undefined);
   }
 
   private persist(ctx: Context, conversation: Conversation): void {
+    this.persistConversation(contextId(ctx), conversation);
+  }
+
+  private persistConversation(context: string, conversation: Conversation): void {
     const snapshot = conversation.snapshot();
     this.database.saveConversation({
-      context: contextId(ctx), threadId: snapshot.threadId, workspace: snapshot.workspace,
+      context, threadId: snapshot.threadId, workspace: snapshot.workspace,
       model: snapshot.model, effort: snapshot.effort, profileId: snapshot.profileId,
     });
+  }
+
+  private assistantJobContext(job: AssistantJob): Context {
+    const chatId = Number(job.chatId);
+    const topic = telegramPlainOptions(job.messageThreadId);
+    return {
+      chat: { id: chatId },
+      from: { id: Number(job.owner) },
+      message: job.messageThreadId ? { message_thread_id: job.messageThreadId } : undefined,
+      api: this.bot.api,
+      reply: (text: string, options: Record<string, unknown> = {}) => this.bot.api.sendMessage(chatId, text, {
+        ...topic,
+        ...options,
+      } as never),
+    } as unknown as Context;
   }
 
   private async showHome(ctx: Context): Promise<void> {
@@ -1491,12 +1689,22 @@ export class TelegramApplication {
 
   private async health(ctx: Context): Promise<void> {
     const started = Date.now();
+    const state = this.runtimeHealth();
+    const active = state.activeJob;
+    const queue = state.queue.queued + state.queue.retryWait;
+    const details = [
+      state.polling ? `✅ Telegram: polling работает · обработчиков ${state.inflightUpdates}` : "❌ Telegram: polling остановлен",
+      `📥 Очередь Codex: ${queue}`,
+      active
+        ? `▶️ Задание: ${active.kind} · попытка ${active.attempts}/${active.maxAttempts} · без событий ${formatDuration(Date.now() - (active.lastEventAt ?? active.startedAt ?? Date.now()))}`
+        : "✅ Активного задания нет",
+    ];
     try {
-      await this.hub.threads(1);
-      await ctx.reply(`✅ Telegram: работает\n✅ Codex app-server: работает\n⏱ ${Date.now() - started} мс`);
+      await withTimeout(this.hub.threads(1), 5_000, "Codex health check timed out");
+      await ctx.reply([...details, "✅ Codex app-server: отвечает", `⏱ ${Date.now() - started} мс`].join("\n"));
     } catch (error) {
       logInternalError("Health check failed", error);
-      await ctx.reply(`⚠️ Telegram: работает\n❌ ${publicErrorMessage("health")}`);
+      await ctx.reply([...details, `❌ ${publicErrorMessage("health")}`].join("\n"));
     }
   }
 
@@ -1538,14 +1746,14 @@ export class TelegramApplication {
     return this.database.conversation(contextId(ctx))?.workspace;
   }
 
-  private memorySource(ctx: Context, source: string): string {
-    return scopedMemorySource(source, this.database.conversation(contextId(ctx))?.threadId);
-  }
-
   private async rememberIncoming(ctx: Context, body: string, kind: "message" | "action" = "message"): Promise<void> {
-    await this.memory.record({
+    const sentAt = ctx.message?.date ? ctx.message.date * 1000 : Date.now();
+    await this.memory.upsertExternal({
       owner: ownerId(ctx), body, role: kind === "action" ? "action" : "user", kind,
-      project: this.memoryProject(ctx), source: this.memorySource(ctx, "telegram-text"),
+      project: this.memoryProject(ctx),
+      source: telegramUpdateMemorySource(ctx.update.update_id, "text",
+        this.database.conversation(contextId(ctx))?.threadId),
+      sourceChangedAt: sentAt,
     });
   }
 
@@ -1578,6 +1786,11 @@ export class TelegramTurnView implements TurnObserver {
   private needsFlush = false;
   private finalRequested = false;
   private lastRenderedHtml?: string;
+  private progressTicker?: NodeJS.Timeout;
+  private readonly startedAt = Date.now();
+  private progressStage = "готовлю ответ";
+  private lastProgressRefresh = Date.now();
+  private lastActivityAt = Date.now();
 
   constructor(
     private readonly ctx: Context,
@@ -1585,39 +1798,73 @@ export class TelegramTurnView implements TurnObserver {
     readonly userInput: (prompt: UserInputPrompt) => Promise<UserInputAnswers>,
     private readonly showUsage: boolean,
     private readonly publishDrafts = true,
-  ) {}
+    initialProgressMessageId?: number,
+    private readonly onActivity: (event: string) => void = () => undefined,
+  ) {
+    this.messageId = initialProgressMessageId;
+    this.progressMessageId = initialProgressMessageId;
+  }
 
   text(delta: string): void {
     this.answer += delta;
     if (this.publishDrafts) this.schedule();
   }
-  toolStarted(_id: string, _label: string): void {}
+  toolStarted(_id: string, label: string): void {
+    this.progressStage = progressStage(label);
+    void this.refreshProgress();
+  }
   toolProgress(_id: string, _delta: string): void {}
-  toolFinished(_id: string, _failed: boolean): void {}
-  plan(_steps: readonly { text: string; done: boolean }[]): void {}
+  toolFinished(_id: string, failed: boolean): void {
+    this.progressStage = failed ? "ищу безопасный обход" : "проверяю результат";
+  }
+  plan(_steps: readonly { text: string; done: boolean }[]): void {
+    this.progressStage = "двигаюсь по плану";
+  }
+  activity(event: string): void {
+    this.lastActivityAt = Date.now();
+    this.onActivity(event);
+  }
   usage(last: { input: number; cached: number; output: number }): void {
     this.lastUsage = `in ${last.input} · cached ${last.cached} · out ${last.output}`;
   }
 
   content(): string { return this.answer.trim(); }
 
-  async start(): Promise<void> {
-    if (this.messageId !== undefined) return;
-    const message = await this.ctx.reply("✍️ Привожу ответ в порядок…");
+  async start(text = "✍️ Привожу ответ в порядок…"): Promise<number> {
+    if (this.messageId !== undefined) {
+      const edited = await this.ctx.api.editMessageText(this.ctx.chat!.id, this.messageId, text).then(() => true)
+        .catch(() => false);
+      if (edited) {
+        this.lastProgressRefresh = Date.now();
+        this.startProgressTicker();
+        return this.messageId;
+      }
+    }
+    const message = await this.ctx.reply(text);
     this.messageId = message.message_id;
     this.progressMessageId = message.message_id;
+    this.lastProgressRefresh = Date.now();
+    this.startProgressTicker();
+    return message.message_id;
   }
 
   async finish(answer?: string): Promise<void> {
     this.cancelTimer();
+    this.stopProgressTicker();
     if (answer !== undefined) this.answer = answer;
     await this.requestFlush(true);
   }
 
   async fail(): Promise<void> {
     this.cancelTimer();
+    this.stopProgressTicker();
     this.answer = publicErrorMessage("request");
     await this.requestFlush(true);
+  }
+
+  pause(): void {
+    this.cancelTimer();
+    this.stopProgressTicker();
   }
 
   private schedule(): void {
@@ -1627,6 +1874,32 @@ export class TelegramTurnView implements TurnObserver {
       this.timer = undefined;
       void this.requestFlush().catch((error) => console.error("Telegram stream update failed", error));
     }, delay);
+  }
+
+  private startProgressTicker(): void {
+    if (this.progressTicker) return;
+    this.progressTicker = setInterval(() => { void this.refreshProgress(); }, 45_000);
+    this.progressTicker.unref?.();
+  }
+
+  private stopProgressTicker(): void {
+    if (this.progressTicker) clearInterval(this.progressTicker);
+    this.progressTicker = undefined;
+  }
+
+  private async refreshProgress(): Promise<void> {
+    if (this.publishDrafts || this.progressMessageId === undefined) return;
+    if (Date.now() - this.lastProgressRefresh < 30_000) return;
+    const silentFor = Date.now() - this.lastActivityAt;
+    const status = silentFor >= 3 * 60_000
+      ? `⏳ Нет новых событий ${formatDuration(silentFor)}; продолжаю следить`
+      : `✍️ Выполняю задание…\nЭтап: ${this.progressStage}`;
+    const text = `${status}\nПрошло: ${formatDuration(Date.now() - this.startedAt)}`;
+    await this.ctx.api.editMessageText(this.ctx.chat!.id, this.progressMessageId, text).catch((error) => {
+      if (!/message is not modified/i.test(errorMessage(error))) logInternalError("Telegram progress update failed", error);
+      return undefined;
+    });
+    this.lastProgressRefresh = Date.now();
   }
 
   private requestFlush(final = false): Promise<void> {
@@ -1748,6 +2021,19 @@ function taskIcon(status: WorkItem["status"]): string { return ({ todo: "⚪", q
 function approvalCard(prompt: ApprovalPrompt): string { return [`<b>⚠️ Требуется подтверждение: ${escape(prompt.category)}</b>`, prompt.command ? `<code>${escape(prompt.command)}</code>` : "", prompt.directory ? `Папка: <code>${escape(prompt.directory)}</code>` : "", prompt.root ? `Доступ: <code>${escape(prompt.root)}</code>` : "", prompt.reason ? `Причина: ${escape(prompt.reason)}` : ""].filter(Boolean).join("\n\n"); }
 function approvalResult(choice: ApprovalChoice): string { return ({ accept: "Разрешено один раз", acceptForSession: "Разрешено на сессию", decline: "Отклонено", cancel: "Ход отменён" })[choice]; }
 function contextId(ctx: Context): string { const chat = ctx.chat?.id; if (!chat) throw new Error("Telegram chat is missing"); const topic = ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id; return topic ? `${chat}:${topic}` : String(chat); }
+export function telegramRunnerConstraint(ctx: Context): string | undefined {
+  const command = ctx.message?.text?.trim() ?? "";
+  const callback = ctx.callbackQuery?.data ?? "";
+  if (/^\/(?:health|abort)(?:@\w+)?(?:\s|$)/iu.test(command)) return undefined;
+  if (/^(?:approve:|question:)/u.test(callback)) return undefined;
+  const chat = ctx.chat?.id;
+  if (!chat) return ctx.from?.id ? `user:${ctx.from.id}` : undefined;
+  const topic = ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id;
+  return topic ? `chat:${chat}:topic:${topic}` : `chat:${chat}`;
+}
+export function telegramUpdateMemorySource(updateId: number, kind: "text" | "voice", threadId?: string): string {
+  return scopedMemorySource(`telegram-update:${updateId}:${kind}`, threadId);
+}
 function ownerId(ctx: Context): string { if (!ctx.chat) throw new Error("Telegram chat is missing"); return String(ctx.chat.id); }
 function escape(value: string): string { return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }
 function oneLine(value: string, limit: number): string { const text = value.replace(/\s+/g, " ").trim(); return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`; }
@@ -1799,6 +2085,54 @@ function telegramHtmlOptions(messageThreadId?: number): { parse_mode: "HTML"; me
 }
 function telegramPlainOptions(messageThreadId?: number): { message_thread_id?: number } {
   return messageThreadId ? { message_thread_id: messageThreadId } : {};
+}
+export function assistantRequestFingerprint(value: string): string {
+  const normalized = value.normalize("NFKC").trim().replace(/\s+/gu, " ").toLocaleLowerCase("ru-RU");
+  return createHash("sha256").update(normalized).digest("hex");
+}
+function retryPrompt(prompt: string, attempt: number): string {
+  return [
+    prompt,
+    "",
+    `СЛУЖЕБНЫЙ КОНТРАКТ ПОВТОРА (попытка ${attempt}): предыдущий запуск прервался.`,
+    "Сначала проверь уже выполненные действия и существующие файлы. Продолжай идемпотентно, не создавай дубли и не повторяй необратимые внешние действия без проверки состояния.",
+  ].join("\n");
+}
+function assistantFailureReason(failure: AssistantJobFailure): string {
+  if (failure.errorClass === "permission") return "Нет доступа на запись в нужную рабочую папку.";
+  if (failure.errorClass === "authentication") return "Требуется восстановить авторизацию Codex.";
+  if (failure.errorClass === "article_no_changes") return "В Банке статей не появилось сохранённых изменений.";
+  if (failure.errorClass === "article_incomplete") return "Пакет статьи остался неполным: обязательные тексты или обложки не прошли проверку.";
+  if (failure.errorClass === "article_validation") return "Пакет статьи не прошёл проверку Банка статей.";
+  if (failure.errorClass === "article_bank_unavailable") return "Каталог Банка статей недоступен.";
+  if (failure.errorClass === "empty_answer") return "Codex завершил ход без итогового ответа.";
+  if (failure.errorClass === "timeout") return "После нескольких попыток Codex продолжал зависать без событий.";
+  if (failure.errorClass === "transport" || failure.errorClass === "active_writer") return "Связь с Codex не восстановилась после повторов.";
+  return "Ошибка не относится к безопасно повторяемым — нужен просмотр журнала.";
+}
+function progressStage(label: string): string {
+  if (/web search/iu.test(label)) return "ищу и проверяю источники";
+  if (/image|imagegen/iu.test(label)) return "готовлю изображение";
+  if (/mcp:/iu.test(label)) return "работаю с подключённым инструментом";
+  return "выполняю рабочий шаг";
+}
+function formatDuration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes ? `${minutes} мин ${remainder} сек` : `${remainder} сек`;
+}
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 function commandArgument(ctx: Context): string { return ctx.message?.text?.replace(/^\/\w+(?:@\w+)?\s*/i, "").trim() || ""; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

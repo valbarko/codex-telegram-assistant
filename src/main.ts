@@ -5,6 +5,7 @@ import { readConfiguration } from "./configuration.js";
 import { CodexHub } from "./codex-engine.js";
 import { HindsightKnowledgeService } from "./hindsight-service.js";
 import { MemoryService } from "./memory-service.js";
+import { RuntimeHealthMonitor } from "./runtime-health.js";
 import { BackgroundScheduler } from "./scheduler.js";
 import { AssistantDatabase } from "./storage.js";
 import { TelegramApplication } from "./telegram-app.js";
@@ -23,6 +24,9 @@ const appleNotes = new AppleNotesImporter({
 }, memory);
 for (const event of database.reportExcludedMemoryEvents()) await memory.forget(event.owner, event.id);
 const telegram = new TelegramApplication(configuration, hub, database, memory);
+const health = new RuntimeHealthMonitor(configuration.heartbeatFile, configuration.heartbeatIntervalMs,
+  () => telegram.runtimeHealth());
+telegram.attachHealthMonitor(health);
 const scheduler = new BackgroundScheduler(configuration, database, hub, telegram.bot, memory);
 
 let stopping = false;
@@ -32,6 +36,7 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`Stopping after ${signal}`);
   appleNotes.stop();
   scheduler.stop();
+  health.stop();
   telegram.stop();
   hub.shutdown();
   await hindsight.flush().catch((error) => console.error("Hindsight final flush failed", error));
@@ -44,6 +49,7 @@ process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
 
 console.log("Codex Telegram Assistant starting");
 console.log(`Data: ${configuration.dataDirectory}`);
+health.start();
 scheduler.start();
 void appleNotes.start()
   .then((result) => { if (result) console.log(formatAppleNotesImportResult(result)); })

@@ -15,7 +15,7 @@ The application is a private-by-default Telegram client for a local Codex instal
 - List, resume, rename, archive, and fork stored Codex threads.
 - Stream assistant text, plan changes, command progress, file changes, MCP calls, and final token usage.
 - Interrupt an active turn.
-- Treat a new Telegram message during an active turn as steering input for that turn.
+- Persist a new Telegram message received during an active turn and process it as the next ordered turn.
 - Present command, file, and permission approvals in Telegram with decisions for one action, the session, decline, or cancellation.
 - Transfer a thread to the Mac by activating Codex and copying a resume command.
 
@@ -74,6 +74,10 @@ The application is a private-by-default Telegram client for a local Codex instal
 ## Operational requirements
 
 - Run under a user LaunchAgent on macOS and restart after crashes or login.
+- Persist assistant requests before execution and recover interrupted `running` jobs after a process restart.
+- Keep Telegram polling independent from long Codex turns so `/health` and `/abort` remain responsive.
+- Retry only classified transient failures with bounded backoff; surface permission, authentication, and postcondition failures without blind retries.
+- Write a local heartbeat and use a separate LaunchAgent watchdog for stale-process and stale-active-job recovery.
 - Do not depend on the Codex desktop app remaining open.
 - Preserve thread/task state across process restarts.
 - Provide a health command and backend/version diagnostics.

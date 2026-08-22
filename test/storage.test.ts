@@ -34,6 +34,56 @@ describe("AssistantDatabase", () => {
     expect(database.conversation("1:42")).toMatchObject({ threadId: "thr", workspace: "/work", profileId: "review" });
   });
 
+  it("persists assistant jobs before execution and suppresses replayed Telegram updates", () => {
+    const input = {
+      owner: "1", context: "1:42", chatId: "1", messageThreadId: 42, sourceUpdateId: 900,
+      body: "Сделай статью", prompt: "Подготовь пакет", fingerprint: "article", kind: "article_bank" as const,
+      workspace: "/bank", maxAttempts: 3,
+    };
+    const first = database.enqueueAssistantJob(input);
+    const replay = database.enqueueAssistantJob({ ...input, body: "Повтор из Telegram" });
+    const sameOpenRequest = database.enqueueAssistantJob({ ...input, sourceUpdateId: 901 });
+
+    expect(first).toMatchObject({ duplicate: false, job: { state: "queued", attempts: 0 } });
+    expect(replay).toMatchObject({ duplicate: true, job: { id: first.job.id } });
+    expect(sameOpenRequest).toMatchObject({ duplicate: true, job: { id: first.job.id } });
+
+    const running = database.claimAssistantJob(first.job.createdAt + 1);
+    expect(running).toMatchObject({ id: first.job.id, state: "running", attempts: 1 });
+    database.touchAssistantJob(first.job.id, 12_345);
+    expect(database.completeAssistantJob(first.job.id, "Готово")).toBe(true);
+    expect(database.assistantJob(first.job.id)).toMatchObject({ state: "succeeded", result: "Готово", lastEventAt: 12_345 });
+    expect(database.pendingAssistantJobNotifications()).toHaveLength(1);
+    expect(database.markAssistantJobNotified(first.job.id)).toBe(true);
+    expect(database.pendingAssistantJobNotifications()).toEqual([]);
+  });
+
+  it("recovers interrupted jobs and allows an explicit retry after a terminal failure", () => {
+    const created = database.enqueueAssistantJob({
+      owner: "1", context: "1", chatId: "1", body: "Проверка", prompt: "Проверка", fingerprint: "check",
+      kind: "assistant", maxAttempts: 2,
+    }).job;
+    database.claimAssistantJob(created.createdAt + 1);
+    expect(database.recoverAssistantJobs(created.createdAt + 2)).toEqual({ retried: 1, failed: 0 });
+    const second = database.claimAssistantJob(created.createdAt + 3)!;
+    expect(second).toMatchObject({ state: "running", attempts: 2 });
+    expect(database.finishAssistantJob(second.id, "failed", "transport", "offline")).toBe(true);
+    expect(database.retryAssistantJobManually(second.id, "1", "1")).toMatchObject({ state: "queued", attempts: 0 });
+  });
+
+  it("holds a new job until its Telegram acknowledgement is stored, then releases it", () => {
+    const now = Date.now();
+    const created = database.enqueueAssistantJob({
+      owner: "1", context: "1", chatId: "1", body: "Проверка", prompt: "Проверка", fingerprint: "held",
+      kind: "assistant", maxAttempts: 3, nextAttemptAt: now + 60_000,
+    }).job;
+
+    expect(database.claimAssistantJob(now)).toBeUndefined();
+    database.updateAssistantJobProgressMessage(created.id, 42);
+    expect(database.releaseAssistantJob(created.id)).toBe(true);
+    expect(database.claimAssistantJob(Date.now())).toMatchObject({ id: created.id, progressMessageId: 42, state: "running" });
+  });
+
   it("persists the voice-writing mode per Telegram context", () => {
     expect(database.voiceWritingSettings("1:42", "1")).toMatchObject({ mode: "transcript" });
     database.setVoiceWritingSettings({ context: "1:42", owner: "1", mode: "diary" });
