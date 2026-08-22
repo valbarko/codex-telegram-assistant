@@ -52,6 +52,29 @@ describe("MemoryService", () => {
     expect(await service.recall("1", "сохранять")).toEqual([]);
   });
 
+  it("deduplicates a replayed Telegram update but preserves an intentional repeated message", async () => {
+    const service = new MemoryService(folder, "memsearch", database, async () => "");
+    const input = {
+      owner: "1",
+      body: "Одинаковый текст",
+      role: "user" as const,
+      kind: "message" as const,
+      sourceChangedAt: 1_000,
+    };
+
+    const first = await service.upsertExternal({ ...input, source: "telegram-update:100:text;thread=thread-1" });
+    const replay = await service.upsertExternal({ ...input, source: "telegram-update:100:text;thread=thread-1" });
+    const repeated = await service.upsertExternal({
+      ...input, source: "telegram-update:101:text;thread=thread-1", sourceChangedAt: 2_000,
+    });
+    await service.flush("1");
+
+    expect(first?.status).toBe("created");
+    expect(replay).toMatchObject({ status: "unchanged", event: { id: first?.event.id } });
+    expect(repeated).toMatchObject({ status: "created", event: { body: "Одинаковый текст" } });
+    expect(database.memoryEvents("1")).toHaveLength(2);
+  });
+
   it("uses the matched MemSearch chunk instead of the beginning of a large archive document", async () => {
     let eventId = "";
     const service = new MemoryService(folder, "memsearch", database, async (_executable, args) => {

@@ -307,6 +307,7 @@ export class Conversation {
       approvalPolicy: profile.approvals,
       approvalsReviewer: "user",
       ephemeral: false,
+      excludeTurns: true,
     });
     this.threadId = result.thread.id;
     this.workspace = result.cwd || this.workspace;

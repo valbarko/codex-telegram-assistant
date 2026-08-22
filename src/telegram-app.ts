@@ -447,16 +447,26 @@ export class TelegramApplication {
       if (!forwarded.key && command.kind === "assistant" && command.label) {
         if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
       }
-      await this.memory.record({
+      const voiceMemory = {
         owner: ownerId(ctx),
         body: raw,
-        role: "user",
-        kind: "voice",
+        role: "user" as const,
+        kind: "voice" as const,
         project: this.memoryProject(ctx),
-        source: forwarded.key
-          ? `telegram-forwarded-voice:${sender || forwarded.key}`
-          : this.memorySource(ctx, "telegram-voice"),
-      });
+      };
+      if (forwarded.key) {
+        await this.memory.record({
+          ...voiceMemory,
+          source: `telegram-forwarded-voice:${sender || forwarded.key}`,
+        });
+      } else {
+        await this.memory.upsertExternal({
+          ...voiceMemory,
+          source: telegramUpdateMemorySource(ctx.update.update_id, "voice",
+            this.database.conversation(contextId(ctx))?.threadId),
+          sourceChangedAt: sentAt,
+        });
+      }
       if (forwarded.key) {
         const batchKey = `${contextId(ctx)}:${forwarded.key}`;
         const fragment: ForwardedVoiceFragment = {
@@ -636,7 +646,7 @@ export class TelegramApplication {
         role: "user",
         kind: inputKind,
         project,
-        source: scopedMemorySource(`telegram-update:${ctx.update.update_id}:${inputKind === "voice" ? "voice" : "text"}`, snapshot.threadId),
+        source: telegramUpdateMemorySource(ctx.update.update_id, inputKind === "voice" ? "voice" : "text", snapshot.threadId),
         sourceChangedAt: sentAt,
       });
       const prompt = quietCodexPrompt(augmented);
@@ -906,7 +916,7 @@ export class TelegramApplication {
     const augmented = await this.memory.augmentPrompt(ownerId(ctx), text, project, { threadId: snapshot.threadId });
     await this.memory.upsertExternal({
       owner: ownerId(ctx), body: text, role: "user", kind: "message", project,
-      source: scopedMemorySource(`telegram-update:${ctx.update.update_id}:text`, snapshot.threadId),
+      source: telegramUpdateMemorySource(ctx.update.update_id, "text", snapshot.threadId),
       sourceChangedAt: ctx.message?.date ? ctx.message.date * 1000 : Date.now(),
     });
     const routed = looksLikeMail(text) ? gmailPrompt(augmented)
@@ -1736,14 +1746,14 @@ export class TelegramApplication {
     return this.database.conversation(contextId(ctx))?.workspace;
   }
 
-  private memorySource(ctx: Context, source: string): string {
-    return scopedMemorySource(source, this.database.conversation(contextId(ctx))?.threadId);
-  }
-
   private async rememberIncoming(ctx: Context, body: string, kind: "message" | "action" = "message"): Promise<void> {
-    await this.memory.record({
+    const sentAt = ctx.message?.date ? ctx.message.date * 1000 : Date.now();
+    await this.memory.upsertExternal({
       owner: ownerId(ctx), body, role: kind === "action" ? "action" : "user", kind,
-      project: this.memoryProject(ctx), source: this.memorySource(ctx, "telegram-text"),
+      project: this.memoryProject(ctx),
+      source: telegramUpdateMemorySource(ctx.update.update_id, "text",
+        this.database.conversation(contextId(ctx))?.threadId),
+      sourceChangedAt: sentAt,
     });
   }
 
@@ -2020,6 +2030,9 @@ export function telegramRunnerConstraint(ctx: Context): string | undefined {
   if (!chat) return ctx.from?.id ? `user:${ctx.from.id}` : undefined;
   const topic = ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id;
   return topic ? `chat:${chat}:topic:${topic}` : `chat:${chat}`;
+}
+export function telegramUpdateMemorySource(updateId: number, kind: "text" | "voice", threadId?: string): string {
+  return scopedMemorySource(`telegram-update:${updateId}:${kind}`, threadId);
 }
 function ownerId(ctx: Context): string { if (!ctx.chat) throw new Error("Telegram chat is missing"); return String(ctx.chat.id); }
 function escape(value: string): string { return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }

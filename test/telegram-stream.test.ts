@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { TelegramTurnView, telegramRunnerConstraint } from "../src/telegram-app.js";
+import { TelegramTurnView, telegramRunnerConstraint, telegramUpdateMemorySource } from "../src/telegram-app.js";
 
 describe("TelegramTurnView", () => {
   afterEach(() => vi.useRealTimers());
@@ -135,5 +135,12 @@ describe("telegramRunnerConstraint", () => {
     expect(telegramRunnerConstraint({ chat: { id: 7 }, message: { text: "/abort@my_bot" } } as never)).toBeUndefined();
     expect(telegramRunnerConstraint({ chat: { id: 7 }, callbackQuery: { data: "approve:token:once" } } as never))
       .toBeUndefined();
+  });
+
+  it("deduplicates a replayed update without suppressing a separate repeated message", () => {
+    const first = telegramUpdateMemorySource(100, "text", "thread-1");
+    expect(telegramUpdateMemorySource(100, "text", "thread-1")).toBe(first);
+    expect(telegramUpdateMemorySource(101, "text", "thread-1")).not.toBe(first);
+    expect(telegramUpdateMemorySource(100, "voice", "thread-1")).not.toBe(first);
   });
 });

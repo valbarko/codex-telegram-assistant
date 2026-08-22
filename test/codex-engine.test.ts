@@ -12,6 +12,7 @@ class FakeTransport {
   closeCalls = 0;
   threadSerial = 0;
   resumeConflicts = 0;
+  resumeError?: Error;
   forkFails = false;
   async connect() {}
   listen(listener: EventListener) { this.events.add(listener); return () => { this.events.delete(listener); }; }
@@ -22,6 +23,11 @@ class FakeTransport {
     this.calls.push({ name, payload });
     if (name === "thread/start") return { thread: { id: `thread-${++this.threadSerial}` }, cwd: "/work", model: "gpt" } as T;
     if (name === "thread/resume") {
+      if (this.resumeError) {
+        const error = this.resumeError;
+        this.resumeError = undefined;
+        throw error;
+      }
       if (this.resumeConflicts > 0) {
         this.resumeConflicts -= 1;
         throw new Error(`thread ${String(payload.threadId)} already has an active writer`);
@@ -123,7 +129,38 @@ describe("CodexHub", () => {
     await conversation.run("Продолжить", { text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {} });
 
     expect(transport.calls.map((call) => call.name)).toEqual(["thread/resume", "thread/fork", "turn/start"]);
+    expect(transport.calls[1]?.payload.excludeTurns).toBe(true);
     expect(conversation.snapshot()).toMatchObject({ threadId: "fork-1", workspace: "/bank" });
+  });
+
+  it("starts a fresh thread when an occupied saved thread cannot be forked", async () => {
+    const transport = new FakeTransport();
+    transport.resumeConflicts = 1;
+    transport.forkFails = true;
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1", { threadId: "busy", workspace: "/bank" });
+
+    await conversation.run("Продолжить", { text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {} });
+
+    expect(transport.calls.map((call) => call.name)).toEqual([
+      "thread/resume", "thread/fork", "thread/start", "turn/start",
+    ]);
+    expect(conversation.snapshot()).toMatchObject({ threadId: "thread-1" });
+  });
+
+  it("does not mask unrelated resume failures", async () => {
+    const transport = new FakeTransport();
+    transport.resumeError = new Error("no rollout found");
+    const hub = new CodexHub(config, transport as never);
+    const conversation = await hub.conversation("1", { threadId: "missing", workspace: "/work" });
+
+    await expect(conversation.run("Продолжить", {
+      text() {}, toolStarted() {}, toolProgress() {}, toolFinished() {},
+    })).rejects.toThrow("no rollout found");
+
+    expect(transport.calls.map((call) => call.name)).toEqual(["thread/resume"]);
+    expect(transport.closeCalls).toBe(1);
+    expect(conversation.snapshot().threadId).toBe("missing");
   });
 
   it("interrupts and rejects a turn after an inactivity timeout", async () => {
