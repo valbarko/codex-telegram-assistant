@@ -49,9 +49,18 @@ describe("Telegram channel reader", () => {
           entities: [{ offset: 0, length: 12, type: { _: "textEntityTypeTextUrl", url: "https://doi.org/10.1/test" } }],
         },
       },
-      interaction_info: { view_count: 500, forward_count: 12 },
+      interaction_info: {
+        view_count: 500,
+        forward_count: 12,
+        reply_info: { reply_count: 3 },
+        reactions: { reactions: [{ total_count: 7 }, { total_count: 5 }] },
+      },
     })).toMatchObject({
-      links: ["https://doi.org/10.1/test", "https://example.org/paper"], views: 500, forwards: 12,
+      links: ["https://doi.org/10.1/test", "https://example.org/paper"],
+      views: 500,
+      forwards: 12,
+      reactions: 12,
+      replies: 3,
     });
   });
 

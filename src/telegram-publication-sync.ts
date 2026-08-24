@@ -34,6 +34,8 @@ export interface TelegramArticlePublication {
   url: string;
   views?: number;
   forwards?: number;
+  reactions?: number;
+  replies?: number;
 }
 
 export interface TelegramPublicationSnapshot {
@@ -58,6 +60,7 @@ export async function syncTelegramArticlePublications(
   if (!credentials || !state || !articles.length) return undefined;
   const channels = ownPublicationChannels(state.allowedChannels);
   if (!channels.length) return undefined;
+  const explicitPublications = await loadExplicitTelegramPublications(articleBankRoot, articles);
 
   const reader = new TelegramChannelReader(credentials, readerDirectory);
   const detected: TelegramArticlePublication[] = [];
@@ -66,10 +69,12 @@ export async function syncTelegramArticlePublications(
     for (const channel of channels) {
       const messages = await reader.readRecentFresh(channel, 100);
       for (const message of messages) {
-        const article = matchTelegramPublication(articles, message.text);
-        if (!article || !channel.username) continue;
+        if (!channel.username) continue;
         const url = await reader.messageLink(message)
           || `https://t.me/${channel.username.replace(/^@/u, "")}/${message.messageId}`;
+        const article = explicitPublications.get(normalizedPublicUrl(url))
+          || matchTelegramPublication(articles, message.text);
+        if (!article) continue;
         detected.push(publicationRecord(article, channel, message, url));
       }
     }
@@ -134,6 +139,52 @@ async function loadArticleReferences(root: string): Promise<ArticleReference[]> 
   return articles.filter((article): article is ArticleReference => Boolean(article));
 }
 
+async function loadExplicitTelegramPublications(
+  root: string,
+  articles: readonly ArticleReference[],
+): Promise<Map<string, ArticleReference>> {
+  try {
+    const journal = await readFile(path.join(root, "data", "publication-log.jsonl"), "utf8");
+    return explicitTelegramPublicationMap(journal, articles);
+  } catch {
+    return new Map();
+  }
+}
+
+export function explicitTelegramPublicationMap(
+  journal: string,
+  articles: readonly ArticleReference[],
+): Map<string, ArticleReference> {
+  const bySlug = new Map(articles.map((article) => [article.slug, article]));
+  const result = new Map<string, ArticleReference>();
+  for (const line of journal.split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as unknown;
+      if (!event || typeof event !== "object") continue;
+      const value = event as Record<string, unknown>;
+      if (value.channel !== "telegram" || !["published", "edited"].includes(String(value.event))) continue;
+      const article = bySlug.get(typeof value.article_slug === "string" ? value.article_slug : "");
+      const url = typeof value.url === "string" ? normalizedPublicUrl(value.url) : "";
+      if (article && url) result.set(url, article);
+    } catch {
+      // A malformed legacy journal line must not block later valid records.
+    }
+  }
+  return result;
+}
+
+function normalizedPublicUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    url.search = "";
+    return url.toString().replace(/\/$/u, "");
+  } catch {
+    return "";
+  }
+}
+
 function ownPublicationChannels(channels: readonly TelegramChannel[]): TelegramChannel[] {
   return OWN_CHANNELS.flatMap((configured) => {
     const channel = channels.find((candidate) => {
@@ -160,6 +211,8 @@ function publicationRecord(
     url,
     ...(message.views === undefined ? {} : { views: message.views }),
     ...(message.forwards === undefined ? {} : { forwards: message.forwards }),
+    ...(message.reactions === undefined ? {} : { reactions: message.reactions }),
+    ...(message.replies === undefined ? {} : { replies: message.replies }),
   };
 }
 
@@ -184,7 +237,8 @@ async function loadSnapshot(file: string): Promise<TelegramPublicationSnapshot |
 function publicationFingerprint(snapshot: TelegramPublicationSnapshot | undefined): string {
   if (!snapshot) return "";
   return JSON.stringify(snapshot.publications.map((item) => [
-    item.article_slug, item.channel_username, item.message_id, item.published_at, item.url, item.views, item.forwards,
+    item.article_slug, item.channel_username, item.message_id, item.published_at, item.url,
+    item.views, item.forwards, item.reactions, item.replies,
   ]));
 }
 
