@@ -4,6 +4,7 @@ import path from "node:path";
 import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
+import { syncContentAnalytics, syncMetrikaAnalytics, syncSearchAnalytics } from "./content-analytics-sync.js";
 import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex-engine.js";
 import { findDailyBlogStudy } from "./daily-blog-topic.js";
 import { EphemeralTextEditor, formatTelegramTopicDetail, formatTelegramTopicShortlistBatches } from "./ephemeral-text-editor.js";
@@ -48,6 +49,9 @@ export class BackgroundScheduler {
   private timer?: NodeJS.Timeout;
   private active = false;
   private lastPublicationSyncAt = 0;
+  private lastContentAnalyticsSyncAt = 0;
+  private lastSearchAnalyticsSyncAt = 0;
+  private lastMetrikaAnalyticsSyncAt = 0;
   private readonly textEditor: EphemeralTextEditor;
 
   constructor(
@@ -76,6 +80,9 @@ export class BackgroundScheduler {
     this.active = true;
     try {
       await this.syncArticlePublicationsIfDue();
+      await this.syncContentAnalyticsIfDue();
+      await this.syncSearchAnalyticsIfDue();
+      await this.syncMetrikaAnalyticsIfDue();
       await this.deliverAlarms();
       await this.executeQueueHead();
     } catch (error) {
@@ -93,6 +100,39 @@ export class BackgroundScheduler {
       await syncTelegramArticlePublications(this.configuration);
     } catch (error) {
       console.error("Telegram article publication sync failed", error);
+    }
+  }
+
+  private async syncContentAnalyticsIfDue(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastContentAnalyticsSyncAt < 60 * 60_000) return;
+    this.lastContentAnalyticsSyncAt = now;
+    try {
+      await syncContentAnalytics();
+    } catch (error) {
+      console.error("Content analytics sync failed", error);
+    }
+  }
+
+  private async syncSearchAnalyticsIfDue(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastSearchAnalyticsSyncAt < 24 * 60 * 60_000) return;
+    this.lastSearchAnalyticsSyncAt = now;
+    try {
+      await syncSearchAnalytics();
+    } catch (error) {
+      console.error("Search analytics sync failed", error);
+    }
+  }
+
+  private async syncMetrikaAnalyticsIfDue(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastMetrikaAnalyticsSyncAt < 24 * 60 * 60_000) return;
+    this.lastMetrikaAnalyticsSyncAt = now;
+    try {
+      await syncMetrikaAnalytics();
+    } catch (error) {
+      console.error("Metrika analytics sync failed", error);
     }
   }
 

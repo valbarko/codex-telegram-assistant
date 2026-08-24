@@ -27,6 +27,8 @@ export interface TelegramChannelMessage {
   links?: readonly string[];
   views?: number;
   forwards?: number;
+  reactions?: number;
+  replies?: number;
 }
 
 export type TelegramPostMediaKind = "photo" | "video" | "document";
@@ -123,7 +125,12 @@ interface TdMessage {
   chat_id?: unknown;
   date?: unknown;
   content?: Record<string, unknown>;
-  interaction_info?: { view_count?: unknown; forward_count?: unknown };
+  interaction_info?: {
+    view_count?: unknown;
+    forward_count?: unknown;
+    reply_info?: { reply_count?: unknown };
+    reactions?: { reactions?: unknown };
+  };
 }
 
 interface TdFormattedText {
@@ -839,6 +846,14 @@ export function extractTelegramChannelMessage(message: TdMessage): TelegramChann
   const links = [...new Set(content.links)].filter((link) => /^https?:\/\//iu.test(link));
   const views = numeric(message.interaction_info?.view_count) || undefined;
   const forwards = numeric(message.interaction_info?.forward_count) || undefined;
+  const reactions = array(message.interaction_info?.reactions?.reactions)
+    .map((reaction) => numeric(
+      typeof reaction === "object" && reaction !== null && "total_count" in reaction
+        ? reaction.total_count
+        : undefined,
+    ))
+    .reduce((total, count) => total + count, 0) || undefined;
+  const replies = numeric(message.interaction_info?.reply_info?.reply_count) || undefined;
   return {
     chatId,
     messageId,
@@ -847,6 +862,8 @@ export function extractTelegramChannelMessage(message: TdMessage): TelegramChann
     ...(links.length ? { links } : {}),
     ...(views ? { views } : {}),
     ...(forwards ? { forwards } : {}),
+    ...(reactions ? { reactions } : {}),
+    ...(replies ? { replies } : {}),
   };
 }
 
