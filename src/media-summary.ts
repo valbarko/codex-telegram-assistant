@@ -49,7 +49,8 @@ interface MediaInfo {
 }
 
 type MediaSummaryConfiguration = Pick<AppConfiguration,
-  "dataDirectory" | "defaultModel" | "mediaDownloaderExecutable" | "ffmpegExecutable" | "mediaSummaryMaxDurationSeconds"
+  "dataDirectory" | "defaultModel" | "mediaDownloaderExecutable" | "ffmpegExecutable" | "fluidAudioExecutable"
+  | "mediaSummaryMaxDurationSeconds"
   | "mediaCookiesFromBrowser" | "mediaCookiesFile" | "whisperPython" | "whisperModel">;
 
 type ProgressCallback = (progress: MediaSummaryProgress) => void | Promise<void>;
@@ -115,41 +116,59 @@ export class MediaSummaryService {
           const mediaPath = await this.download(normalizedUrl, directory);
           checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "downloaded", mediaPath }, persistent);
         }
-        if (!checkpoint.chunks.length || checkpoint.chunks.some((chunk) => !existsSync(chunk))) {
-          await progress({ stage: "prepare" });
-          const chunks = await this.splitAudio(checkpoint.mediaPath!, directory);
-          const existingParts = checkpoint.transcriptParts;
-          checkpoint = this.saveCheckpoint({
-            ...checkpoint,
-            stage: "prepared",
-            chunks,
-            transcriptParts: chunks.map((_, index) => existingParts[index] ?? null),
-          }, persistent);
-        }
-        const pending = checkpoint.chunks.map((file, index) => ({ file, index }))
-          .filter(({ index }) => !checkpoint!.transcriptParts[index]);
-        if (pending.length) {
+
+        if (shouldUseFluidAudio(checkpoint.chunks, checkpoint.transcriptParts)) {
           checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "transcribing" }, persistent);
-          await progress({ stage: "transcribe", current: pending[0]!.index + 1, total: checkpoint.chunks.length });
-          await transcribeAudioBatchDetailed(pending.map(({ file }) => file), {
-            language: null,
-            python: this.configuration.whisperPython,
-            model: this.configuration.whisperModel,
-            onResult: async (result, pendingIndex) => {
-              const originalIndex = pending[pendingIndex]!.index;
-              const parts = [...checkpoint!.transcriptParts];
-              parts[originalIndex] = formatTimestampedTranscript(result, originalIndex * CHUNK_SECONDS);
-              checkpoint = this.saveCheckpoint({ ...checkpoint!, stage: "transcribing", transcriptParts: parts }, persistent);
-              const next = pending[pendingIndex + 1];
-              if (next) await progress({ stage: "transcribe", current: next.index + 1, total: checkpoint!.chunks.length });
-            },
-          });
-          checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "transcribed" }, persistent);
+          await progress({ stage: "transcribe", current: 1, total: 1 });
+          try {
+            const result = await this.transcribeWithFluidAudio(checkpoint.mediaPath!, directory);
+            checkpoint = this.saveCheckpoint({
+              ...checkpoint,
+              stage: "transcribed",
+              transcriptParts: [formatTimestampedTranscript(result)],
+            }, persistent);
+          } catch (error) {
+            console.warn("FluidAudio transcription failed; falling back to MLX Whisper", error);
+          }
+        }
+
+        if (checkpoint.chunks.length || !hasTranscript(checkpoint.transcriptParts)) {
+          if (!checkpoint.chunks.length || checkpoint.chunks.some((chunk) => !existsSync(chunk))) {
+            await progress({ stage: "prepare" });
+            const chunks = await this.splitAudio(checkpoint.mediaPath!, directory);
+            const existingParts = checkpoint.transcriptParts;
+            checkpoint = this.saveCheckpoint({
+              ...checkpoint,
+              stage: "prepared",
+              chunks,
+              transcriptParts: chunks.map((_, index) => existingParts[index] ?? null),
+            }, persistent);
+          }
+          const pending = checkpoint.chunks.map((file, index) => ({ file, index }))
+            .filter(({ index }) => !checkpoint!.transcriptParts[index]);
+          if (pending.length) {
+            checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "transcribing" }, persistent);
+            await progress({ stage: "transcribe", current: pending[0]!.index + 1, total: checkpoint.chunks.length });
+            await transcribeAudioBatchDetailed(pending.map(({ file }) => file), {
+              language: null,
+              python: this.configuration.whisperPython,
+              model: this.configuration.whisperModel,
+              onResult: async (result, pendingIndex) => {
+                const originalIndex = pending[pendingIndex]!.index;
+                const parts = [...checkpoint!.transcriptParts];
+                parts[originalIndex] = formatTimestampedTranscript(result, originalIndex * CHUNK_SECONDS);
+                checkpoint = this.saveCheckpoint({ ...checkpoint!, stage: "transcribing", transcriptParts: parts }, persistent);
+                const next = pending[pendingIndex + 1];
+                if (next) await progress({ stage: "transcribe", current: next.index + 1, total: checkpoint!.chunks.length });
+              },
+            });
+            checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "transcribed" }, persistent);
+          }
         }
       }
 
       const transcript = checkpoint.transcriptParts.filter((part): part is string => Boolean(part)).join("\n");
-      if (!transcript.trim()) throw new Error("Whisper не вернул текст из видео");
+      if (!transcript.trim()) throw new Error("Распознавание не вернуло текст из видео");
       await progress({ stage: "summarize" });
       const markdown = await this.editor.summarizeMediaTranscript({
         title: checkpoint.title,
@@ -252,6 +271,14 @@ export class MediaSummaryService {
     return chunks;
   }
 
+  private async transcribeWithFluidAudio(mediaFile: string, directory: string): Promise<AudioTranscript> {
+    const outputFile = path.join(directory, "fluid-transcript.json");
+    await rm(outputFile, { force: true });
+    await this.command(this.configuration.fluidAudioExecutable, fluidAudioArguments(mediaFile, outputFile),
+      "FluidAudio не удалось распознать аудио");
+    return parseFluidAudioTranscript(JSON.parse(await readFile(outputFile, "utf8")));
+  }
+
   private async command(executable: string, args: readonly string[], label: string): Promise<{ stdout: string; stderr: string }> {
     try {
       return await execute(executable, [...args], { timeout: COMMAND_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
@@ -311,6 +338,24 @@ export function formatTimestampedTranscript(result: AudioTranscript, offsetSecon
   return result.segments.map((segment) => `[${formatTimestamp(offsetSeconds + segment.start)}] ${segment.text}`).join("\n");
 }
 
+export function fluidAudioArguments(mediaFile: string, outputFile: string): string[] {
+  return ["transcribe", mediaFile, "--model-version", "v3", "--language", "ru", "--output-json", outputFile];
+}
+
+export function parseFluidAudioTranscript(value: unknown): AudioTranscript {
+  if (!value || typeof value !== "object") throw new Error("FluidAudio вернул некорректный результат");
+  const parsed = value as { text?: unknown; wordTimings?: unknown };
+  if (typeof parsed.text !== "string" || !parsed.text.trim()) throw new Error("FluidAudio вернул пустой текст");
+  const words = Array.isArray(parsed.wordTimings)
+    ? parsed.wordTimings.map(parseFluidAudioWord).filter((item): item is FluidAudioWord => Boolean(item))
+    : [];
+  return { text: parsed.text.trim(), segments: groupFluidAudioWords(words) };
+}
+
+export function shouldUseFluidAudio(chunks: readonly string[], transcriptParts: readonly (string | null)[]): boolean {
+  return chunks.length === 0 && !hasTranscript(transcriptParts);
+}
+
 export function formatTimestamp(value: number): string {
   const seconds = Math.max(0, Math.floor(value));
   const hours = Math.floor(seconds / 3600);
@@ -365,6 +410,44 @@ function availableCaptionLanguages(value: unknown): string[] {
       return typeof candidate.url === "string" || typeof candidate.data === "string";
     }))
     .map(([language]) => language);
+}
+
+interface FluidAudioWord {
+  word: string;
+  start: number;
+  end: number;
+}
+
+function parseFluidAudioWord(value: unknown): FluidAudioWord | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  const word = typeof item.word === "string" ? item.word.replace(/\s+/gu, " ").trim() : "";
+  const start = typeof item.startTime === "number" && Number.isFinite(item.startTime) ? Math.max(0, item.startTime) : undefined;
+  const end = typeof item.endTime === "number" && Number.isFinite(item.endTime) ? Math.max(start ?? 0, item.endTime) : undefined;
+  return word && start !== undefined && end !== undefined ? { word, start, end } : undefined;
+}
+
+function groupFluidAudioWords(words: readonly FluidAudioWord[]): AudioTranscript["segments"] {
+  const result: Array<{ start: number; end: number; text: string }> = [];
+  let group: FluidAudioWord[] = [];
+  const flush = (): void => {
+    if (!group.length) return;
+    const text = group.map((item) => item.word).join(" ")
+      .replace(/\s+([,.;:!?…])/gu, "$1").replace(/([«([{])\s+/gu, "$1").replace(/\s+([»\])}])/gu, "$1");
+    result.push({ start: group[0]!.start, end: group.at(-1)!.end, text });
+    group = [];
+  };
+  for (const word of words) {
+    group.push(word);
+    const duration = word.end - group[0]!.start;
+    if ((/[.!?…][»"')\]}]*$/u.test(word.word) && duration >= 4) || duration >= 30 || group.length >= 60) flush();
+  }
+  flush();
+  return result;
+}
+
+function hasTranscript(parts: readonly (string | null)[]): boolean {
+  return parts.some((part) => Boolean(part?.trim()));
 }
 
 function preferredCaptionLanguage(languages: readonly string[], automatic: boolean): string {

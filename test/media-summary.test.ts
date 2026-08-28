@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { mediaPartSummaryPrompt, mediaSummaryPrompt } from "../src/ephemeral-text-editor.js";
-import { formatTimestamp, formatTimestampedTranscript, MEDIA_FORMAT_SELECTOR, parseCaptionTranscript,
-  parseSupportedMediaUrl, selectCaptionTrack } from "../src/media-summary.js";
+import { fluidAudioArguments, formatTimestamp, formatTimestampedTranscript, MEDIA_FORMAT_SELECTOR, parseCaptionTranscript,
+  parseFluidAudioTranscript, parseSupportedMediaUrl, selectCaptionTrack, shouldUseFluidAudio } from "../src/media-summary.js";
 
 describe("parseSupportedMediaUrl", () => {
   it.each([
@@ -86,6 +86,42 @@ describe("timestamped media transcript", () => {
 
   it("falls back to the full text when Whisper returned no segments", () => {
     expect(formatTimestampedTranscript({ text: "Текст", segments: [] }, 1800)).toBe("[00:30:00] Текст");
+  });
+});
+
+describe("FluidAudio primary transcription", () => {
+  it("pins Parakeet v3 with Russian decoding and a JSON result", () => {
+    expect(fluidAudioArguments("/tmp/source.m4a", "/tmp/result.json")).toEqual([
+      "transcribe", "/tmp/source.m4a", "--model-version", "v3", "--language", "ru", "--output-json", "/tmp/result.json",
+    ]);
+  });
+
+  it("converts word timings into bounded timestamped segments", () => {
+    const transcript = parseFluidAudioTranscript({
+      text: "Первый тезис. Второй важный тезис.",
+      wordTimings: [
+        { word: "Первый", startTime: 1.2, endTime: 2, confidence: 0.9 },
+        { word: "тезис.", startTime: 2, endTime: 5.3, confidence: 0.9 },
+        { word: "Второй", startTime: 7, endTime: 8, confidence: 0.9 },
+        { word: "важный", startTime: 8, endTime: 9, confidence: 0.9 },
+        { word: "тезис.", startTime: 9, endTime: 12, confidence: 0.9 },
+      ],
+    });
+    expect(formatTimestampedTranscript(transcript)).toBe([
+      "[00:00:01] Первый тезис.",
+      "[00:00:07] Второй важный тезис.",
+    ].join("\n"));
+  });
+
+  it("uses the full text if FluidAudio supplies no valid word timings", () => {
+    expect(formatTimestampedTranscript(parseFluidAudioTranscript({ text: "Готовый текст", wordTimings: [] })))
+      .toBe("[00:00:00] Готовый текст");
+  });
+
+  it("keeps MLX Whisper selected after fallback chunks have been checkpointed", () => {
+    expect(shouldUseFluidAudio([], [])).toBe(true);
+    expect(shouldUseFluidAudio(["/tmp/chunk-0000.mka"], [])).toBe(false);
+    expect(shouldUseFluidAudio([], ["[00:00:00] Уже готово"])).toBe(false);
   });
 });
 

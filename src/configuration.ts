@@ -39,6 +39,7 @@ export interface AppConfiguration {
   weatherLongitude: number;
   mediaDownloaderExecutable: string;
   ffmpegExecutable: string;
+  fluidAudioExecutable: string;
   mediaSummaryMaxDurationSeconds: number;
   mediaCookiesFromBrowser?: string;
   mediaCookiesFile?: string;
@@ -119,6 +120,7 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     weatherLongitude: parseCoordinate(env.WEATHER_LONGITUDE, 37.6173, -180, 180, "WEATHER_LONGITUDE"),
     mediaDownloaderExecutable: optional(env.MEDIA_DOWNLOADER_BIN) || "yt-dlp",
     ffmpegExecutable: optional(env.FFMPEG_BIN) || "ffmpeg",
+    fluidAudioExecutable: optional(env.FLUIDAUDIO_BIN) || path.join(dataDirectory, "bin", "fluidaudiocli"),
     mediaSummaryMaxDurationSeconds: parsePositiveInteger(env.MEDIA_SUMMARY_MAX_DURATION_SECONDS, 6 * 60 * 60,
       "MEDIA_SUMMARY_MAX_DURATION_SECONDS"),
     mediaCookiesFromBrowser,

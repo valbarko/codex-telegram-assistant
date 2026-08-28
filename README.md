@@ -33,7 +33,7 @@ This repository is an independent implementation with its own source structure, 
 - MemSearch with local ONNX embeddings (`uv tool install "memsearch[onnx]"`)
 - Optional Hindsight knowledge layer: a Docker runtime, ChatGPT Plus/Pro, and a dedicated Codex login
 - Optional voice support: Python with `mlx-whisper`
-- Optional video-link summaries: `yt-dlp` and `ffmpeg` (`brew install yt-dlp ffmpeg`)
+- Optional video-link summaries: `yt-dlp`, `ffmpeg` (`brew install yt-dlp ffmpeg`), and the pinned FluidAudio CLI
 
 ## Local setup
 
@@ -229,7 +229,7 @@ Install the local transcription dependency in a dedicated Python environment and
 
 An unlabelled voice message is a plain transcription. The bot returns sender/date metadata, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward.
 
-A standalone YouTube, RuTube, or VK Video URL starts the private media-summary flow. The durable job first uses real author or automatic captions when the source provides them. Otherwise `yt-dlp` selects an audio-only stream (or the smallest low-resolution stream containing audio), extracts the existing audio codec without a FLAC conversion, and `ffmpeg` splits it into lossless 30-minute Matroska chunks. One resident MLX Whisper process handles all unfinished chunks, detects the language once, and checkpoints every completed transcript part. A bot or Mac restart therefore resumes from the downloaded file or the first unfinished chunk instead of starting over. Only the finished summary is added to assistant memory; temporary media and the raw transcript are removed after Telegram delivery, while a failed job retains its checkpoint for an explicit retry. Use `/summary <url>` when you want to make the intent explicit.
+A standalone YouTube, RuTube, or VK Video URL starts the private media-summary flow. Install the pinned FluidAudio CLI once with `npm run fluid-audio:install`. The durable job first uses real author or automatic captions when the source provides them. Otherwise `yt-dlp` selects an audio-only stream (or the smallest low-resolution stream containing audio) and FluidAudio Parakeet v3 transcribes the original audio directly with timestamped words. It uses Apple Neural Engine acceleration and avoids an application-level split or audio conversion. If FluidAudio is unavailable or rejects a recording, `ffmpeg` splits the original codec into lossless 30-minute Matroska chunks and one resident MLX Whisper process handles all unfinished chunks. Completed transcript parts and fallback chunks are checkpointed, so a bot or Mac restart resumes without repeating finished work. Only the finished summary is added to assistant memory; temporary media and the raw transcript are removed after Telegram delivery, while a failed job retains its checkpoint for an explicit retry. Use `/summary <url>` when you want to make the intent explicit.
 
 YouTube may require a browser check even for public videos. Authentication is opt-in: set either `MEDIA_COOKIES_FROM_BROWSER=chrome` (or another browser supported by `yt-dlp`) or `MEDIA_COOKIES_FILE=/absolute/path/to/cookies.txt`. The browser option allows `yt-dlp` to read that browser's cookies, so it is never enabled implicitly. A dedicated cookies file is preferable for an always-on background service.
 
