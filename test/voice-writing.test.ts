@@ -76,6 +76,12 @@ describe("voice writing", () => {
     expect(parseSpokenVoiceCommand("Пост мой первый день в новом зале")).toEqual({
       kind: "post", content: "мой первый день в новом зале", label: "пост",
     });
+    expect(parseSpokenVoiceCommand("Блог. Ну, я сначала хотел сказать одно, а потом передумал")).toEqual({
+      kind: "blog", content: "Ну, я сначала хотел сказать одно, а потом передумал", label: "блог",
+    });
+    expect(parseSpokenVoiceCommand("Блок. Это не метка нового режима")).toEqual({
+      kind: "transcript", content: "Блок. Это не метка нового режима",
+    });
     expect(parseSpokenVoiceCommand("Статья почему отдыхать иногда нужно скучно")).toEqual({
       kind: "article", content: "почему отдыхать иногда нужно скучно", label: "статья",
     });

@@ -241,7 +241,7 @@ export class TelegramApplication {
         "<b>Память</b>", "/memory_status · /memory_pause · /memory_export · /forget", "",
         "<b>Mac</b>", "/calendar · /event · /draft · /mac", "",
         "<b>Автоматизация</b>", "/schedule · /digest", "",
-        "Начните текст или голосовое с метки «помощник», «пост», «анонс», «ответ», «дневник», «календарь» и т. п. Без метки голосовое просто расшифруется.",
+        "Начните текст или голосовое с метки «помощник», «блог», «пост», «анонс», «ответ», «дневник», «календарь» и т. п. Без метки голосовое просто расшифруется.",
       ].join("\n"), { parse_mode: "HTML", reply_markup: persistentKeyboard() });
     });
 
@@ -444,7 +444,7 @@ export class TelegramApplication {
         return;
       }
       const command = parseSpokenVoiceCommand(raw);
-      if (!forwarded.key && command.kind === "assistant" && command.label) {
+      if (!forwarded.key && (command.kind === "assistant" || command.kind === "blog") && command.label) {
         if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
       }
       const voiceMemory = {
@@ -626,6 +626,15 @@ export class TelegramApplication {
     if (command.kind === "transcript") {
       await clearProgress();
       await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
+      return true;
+    }
+    if (command.kind === "blog") {
+      let progressId = existingProgressId;
+      if (progressId === undefined) progressId = (await ctx.reply("✍️ Оформляю текст для Telegram…")).message_id;
+      else await ctx.api.editMessageText(ctx.chat!.id, progressId, "✍️ Оформляю текст для Telegram…").catch(() => undefined);
+      const edited = await this.formatBlogText(command.content);
+      await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, edited, TELEGRAM_LIMIT - 100);
       return true;
     }
     if (command.kind === "article" || (command.kind === "assistant" && isArticleIdeaRequest(command.content))) {
@@ -822,6 +831,15 @@ export class TelegramApplication {
     }
   }
 
+  private async formatBlogText(source: string): Promise<string> {
+    try {
+      return await this.restrictedTextEditor.formatBlogText(source);
+    } catch (error) {
+      logInternalError("Blog text editing failed; using deterministic formatting", error);
+      return formatPlainTranscript(source);
+    }
+  }
+
   private async formatSourceText(source: string): Promise<string> {
     try {
       return await this.restrictedTextEditor.formatText(source);
@@ -896,7 +914,9 @@ export class TelegramApplication {
     if (labeled.label) {
       const action = labeled.kind === "calendar" || labeled.kind === "task" || labeled.kind === "reminder"
         || labeled.kind === "inbox" || labeled.kind === "memory";
-      if (labeled.kind !== "assistant") await this.rememberIncoming(ctx, text, action ? "action" : "message");
+      if (labeled.kind !== "assistant" && labeled.kind !== "blog") {
+        await this.rememberIncoming(ctx, text, action ? "action" : "message");
+      }
       const sender = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = ctx.message?.date ? ctx.message.date * 1000 : Date.now();
       if (await this.handleLabeledCommand(ctx, labeled, text, sentAt, sender, undefined, "message")) return;
@@ -2004,6 +2024,7 @@ function articleIdeaConfirmation(saved: CapturedArticleIdea): string {
 function spokenVoiceHelp(): string {
   return ["<b>🎙 Метки-команды для текста и голоса</b>", "Напишите или произнесите метку первым словом и сразу продолжайте:", "",
     "<b>Помощник</b> — отправить мысль в выбранную задачу Codex и получить ответ в её контексте",
+    "<b>Блог</b> — причесать текст для Telegram, разбить на абзацы и выделить главные мысли",
     "<b>Пост</b> — оформить публикацию в вашем стиле",
     "<b>Анонс</b> — сделать короткий анонс в вашем стиле",
     "<b>Ответ</b> — подготовить короткий ответ в вашем стиле",
