@@ -12,7 +12,7 @@ import { TelegramApplication } from "./telegram-app.js";
 
 const configuration = readConfiguration();
 const database = new AssistantDatabase(path.join(configuration.dataDirectory, "assistant.sqlite"));
-database.alignDailyDigests(nextLocalTime(6, 0), nextLocalTime(6, 0));
+database.alignDailyDigests(nextLocalTime(21, 0), nextLocalTime(6, 0));
 const hub = new CodexHub(configuration);
 const hindsight = new HindsightKnowledgeService(configuration);
 const memory = new MemoryService(configuration.dataDirectory, configuration.memsearchExecutable, database, undefined, hindsight);

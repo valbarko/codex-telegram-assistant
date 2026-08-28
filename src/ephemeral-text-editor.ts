@@ -83,17 +83,30 @@ export class EphemeralTextEditor {
     const batches = contentTopicMaterialBatches(posts);
     const results = await Promise.allSettled(batches.map(async (batch, index) => {
       const targetCount = Math.min(CONTENT_TOPIC_BATCH_SIZE, batch.length);
-      const result = await runEphemeralCodex(telegramTopicShortlistPrompt(batch, targetCount), this.configuration.defaultModel,
-        7 * 60_000, `Подготовка тем контент-радара · группа ${index + 1}`,
-        telegramTopicShortlistSchema(batch, targetCount));
-      return normalizeTelegramTopicShortlist(result, batch, targetCount);
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          const result = await runEphemeralCodex(telegramTopicShortlistPrompt(batch, targetCount), this.configuration.defaultModel,
+            7 * 60_000, `Подготовка тем контент-радара · группа ${index + 1}`,
+            telegramTopicShortlistSchema(batch, targetCount));
+          return normalizeTelegramTopicShortlist(result, batch, targetCount);
+        } catch (error) {
+          lastError = error;
+          if (attempt < 2) console.error(`Content radar topic group ${index + 1} failed; retrying`, error);
+        }
+      }
+      throw lastError;
     }));
     for (const result of results) {
       if (result.status === "rejected") console.error("Content radar topic group failed", result.reason);
     }
     const combined = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
-    if (combined.length < CONTENT_TOPIC_BATCH_SIZE) throw new Error("Контент-радар не собрал даже пять независимых тем");
-    return combined.slice(0, CONTENT_TOPIC_COUNT);
+    const used = new Set(combined.map((topic) => topic.radarSourceId));
+    const fallback = fallbackTelegramTopicChoices(posts.filter((post) => !used.has(post.sourceId)),
+      CONTENT_TOPIC_COUNT - combined.length);
+    const shortlist = [...combined, ...fallback].slice(0, CONTENT_TOPIC_COUNT);
+    if (shortlist.length < CONTENT_TOPIC_COUNT) throw new Error("Контент-радар не собрал десять независимых тем");
+    return shortlist;
   }
 
   async formatForwardedVoices(fragments: readonly ForwardedVoiceFragment[]): Promise<string> {
@@ -301,7 +314,7 @@ export function formatTelegramTopicShortlistBatches(
     const first = offset + 1;
     const last = offset + batch.length;
     batches.push([
-      `🧠 **${topics.length} идей · ${first}–${last}**`,
+      `🧠 **${topics.length} идей для блога · ${first}–${last}**`,
       "",
       ...batch.flatMap((topic, index) => [
         `**${offset + index + 1}. ${plain(topic.title, 100)}**`,
@@ -313,6 +326,47 @@ export function formatTelegramTopicShortlistBatches(
     ].join("\n"));
   }
   return batches;
+}
+
+export function fallbackTelegramTopicChoices(
+  posts: readonly ContentRadarPost[],
+  requestedCount: number,
+): TelegramTopicChoice[] {
+  const ordered = [...posts].sort((left, right) => Number(right.sourceTitle === "PubMed") - Number(left.sourceTitle === "PubMed"));
+  return ordered.flatMap((post) => {
+    const primarySourceUrl = fallbackPrimarySource(post);
+    if (!primarySourceUrl) return [];
+    const sentences = post.text.replace(/\s+/gu, " ").trim().split(/(?<=[.!?])\s+/u);
+    const title = plain((sentences[0] ?? post.sourceTitle).replace(/[.!?\s]+$/u, ""), 100);
+    if (!title) return [];
+    const summary = plain(sentences.slice(1, 3).join(" "), 280)
+      || "Свежий источник даёт повод спокойно разобрать практический вывод без громких обещаний.";
+    return [{
+      radarSourceId: post.sourceId,
+      title,
+      summary,
+      caveat: "Вывод нужно ограничить дизайном, выборкой и условиями исходного исследования.",
+      angle: "Разобрать, что показал источник, кому применим результат и чего он не доказывает.",
+      hook: "Сильный заголовок исследования ещё не означает универсальное правило",
+      primarySourceUrl,
+      primarySourceLabel: /pubmed\.ncbi\.nlm\.nih\.gov/iu.test(primarySourceUrl) ? "PubMed" : post.sourceTitle,
+    }];
+  }).slice(0, Math.max(0, requestedCount));
+}
+
+function fallbackPrimarySource(post: ContentRadarPost): string | undefined {
+  const candidates = [
+    ...(post.sourceTitle === "PubMed" ? [post.sourceUrl] : []),
+    ...(post.links ?? []),
+  ].filter((value): value is string => Boolean(value));
+  return candidates.find((value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && !/(?:^|\.)(?:t\.me|telegram\.me)$/iu.test(url.hostname);
+    } catch {
+      return false;
+    }
+  });
 }
 
 export function formatTelegramTopicDetail(topic: TelegramTopicChoice, post: ContentRadarPost): string {

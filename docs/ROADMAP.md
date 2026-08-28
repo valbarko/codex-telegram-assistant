@@ -49,9 +49,11 @@ The plan should contain:
 - today's weather: temperature, precipitation, and wind;
 - calendar events in chronological order;
 - overdue tasks, tasks due today, and the three highest priorities;
-- today's client sessions and preparation or follow-up actions;
-- schedule conflicts and useful free windows;
-- buttons to refresh the plan, add a task, and open the day on the Mac.
+- a concise project overview and only evidence-backed recommendations for today;
+- one short public-availability status for the owned services, without logs or infrastructure jargon.
+
+Send the daily blog topic and the ten-item content shortlist after the plan as
+separate messages. The plan must not wait for the slower research workflow.
 
 The digest is an aggregator: failure of weather, calendar, tasks, or client data must not prevent the remaining sections from being delivered. A failed source is represented by one concise status line.
 
@@ -61,7 +63,8 @@ The digest is an aggregator: failure of weather, calendar, tasks, or client data
 2. Add a read-only connector to the client database for richer context such as the next contact, missed sessions, payment follow-ups, and important dates.
 3. Use Calendar as a fallback whenever the client connector is unavailable.
 
-Telegram output must contain only the minimum working context. Health information and detailed private client notes must not appear in the morning plan.
+Telegram output must contain only the minimum working context. Detailed server
+diagnostics and private client notes must not appear in the morning plan.
 
 ## Later product improvements
 

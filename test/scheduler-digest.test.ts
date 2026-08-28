@@ -101,7 +101,10 @@ describe("dailySummaryPrompt", () => {
       weather: "🌦 Погода · Москва\nясно · +18…+27 °C",
       calendar: [{ title: "Тренировка", start: "15 июля 10:00", calendar: "Работа" }],
       inspiration: "📌 **Сегодня · среда, 15 июля**\n\n**Памятные дни и поводы для блога**\n\n- День полезного дела",
-      blogTopic: "🧠 **Тема дня для блога**\n\n**Почему мышцы не обязаны болеть**\n\nКороткое объяснение.\n\n**О чём написать:** о крепатуре.\n\n**Заход для поста:** «Боль не равна эффективности».\n\n[Исследование](https://pubmed.ncbi.nlm.nih.gov/1/)",
+      systems: { services: [
+        { label: "ТВК", url: "https://trenervkarmane.ru/", ok: true, status: 200 },
+        { label: "ГМК", url: "https://gdeklienty.ru/", ok: true, status: 200 },
+      ] },
       groups, inbox: 2, tasks: [], now: Date.parse("2026-07-15T09:00:00+03:00"),
     });
 
@@ -109,13 +112,13 @@ describe("dailySummaryPrompt", () => {
     expect(text).toContain("**+18…+27 °C**");
     expect(text).toContain("Тренировка");
     expect(text).toContain("Памятные дни и поводы для блога");
-    expect(text).toContain("Тема дня для блога");
-    expect(text).toContain("Боль не равна эффективности");
-    expect(text).toContain("Активно: **2 темы** в **2 проектах**");
-    expect(text).toContain("❓ **Нужен ответ · КЛИЕНТЫ** — Ответить Анне");
-    expect(text).toContain("**ТРЕНЕР · 1** — отчёты.");
-    expect(text).toContain("**КЛИЕНТЫ · 1** — ответить Анне.");
-    expect(text).not.toContain("3 главных приоритета");
+    expect(text).not.toContain("Тема дня для блога");
+    expect(text).toContain("В работе: **2 проекта** и **2 темы**");
+    expect(text).toContain("Дать ответ по проекту КЛИЕНТЫ: Ответить Анне.");
+    expect(text).toContain("**ТРЕНЕР:** отчёты.");
+    expect(text).toContain("**КЛИЕНТЫ:** ответить Анне.");
+    expect(text).toContain("все **2 публичных проекта** отвечают");
+    expect(text).toContain("**Что стоит сделать сегодня**");
   });
 
   it("shows only evidence-backed urgent work instead of recent threads as priorities", () => {
@@ -133,10 +136,10 @@ describe("dailySummaryPrompt", () => {
     const text = morningDigestText({ weather: "🌦 Погода · Москва\nясно · +20 °C", calendar: [], groups, inbox: 0, tasks, now });
 
     expect(text).toContain("Требуют внимания: **2**");
-    expect(text).toContain("🔴 **Просрочено · КЛИЕНТЫ** — Ответить Анне");
-    expect(text).toContain("❓ **Нужен ответ · КЛИЕНТЫ** — Согласовать макет");
-    const important = text.split("**Самое важное**")[1]?.split("**Проекты**")[0] ?? "";
-    expect(important).not.toContain("Недавняя тема");
+    const recommendations = text.split("**Что стоит сделать сегодня**")[1] ?? "";
+    expect(recommendations).toContain("Закрыть просроченное по проекту КЛИЕНТЫ: Ответить Анне.");
+    expect(recommendations).toContain("Дать ответ по проекту КЛИЕНТЫ: Согласовать макет.");
+    expect(recommendations).not.toContain("Недавняя тема");
   });
 
   it("keeps all project journals, normalizes aliases and reports the activity period honestly", () => {

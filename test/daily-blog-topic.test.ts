@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { blogTopicPillarForDate, findDailyBlogStudy, parsePubMedArticles } from "../src/daily-blog-topic.js";
+import { blogTopicPillarForDate, findDailyBlogStudies, findDailyBlogStudy,
+  parsePubMedArticles } from "../src/daily-blog-topic.js";
 
 const abstract = "Resistance training produced a measurable change in muscle function in healthy adults. "
   + "The randomized protocol compared two loading strategies and reported the size of the effect, adherence, and adverse events. "
@@ -55,5 +56,24 @@ describe("daily blog topic research", () => {
 
     expect(result[0]?.title).toBe("Training load and muscle & recovery adaptation");
     expect(result[0]?.abstract).toContain("sample was small");
+  });
+
+  it("collects enough unused studies for the separate daily shortlist", async () => {
+    const second = pubmedXml.match(/<PubmedArticle>[\s\S]*<\/PubmedArticle>/u)?.[0]
+      ?.replace("222", "333")
+      .replace("Training load and <i>muscle</i> adaptation", "Sleep and <i>muscle</i> recovery") ?? "";
+    const batch = pubmedXml.replace("</PubmedArticleSet>", `${second}</PubmedArticleSet>`);
+    const requester = vi.fn(async (url: string | URL | Request) => String(url).includes("esearch.fcgi")
+      ? new Response(JSON.stringify({ esearchresult: { idlist: ["222", "333"] } }), { status: 200 })
+      : new Response(batch, { status: 200 }));
+
+    const studies = await findDailyBlogStudies({
+      now: Date.parse("2026-08-09T06:00:00+03:00"),
+      limit: 2,
+      requester: requester as typeof fetch,
+      wait: async () => undefined,
+    });
+
+    expect(studies.map((study) => study.sourceId)).toEqual(["222", "333"]);
   });
 });

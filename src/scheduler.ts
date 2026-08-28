@@ -6,7 +6,8 @@ import type { Bot, Context } from "grammy";
 import type { AppConfiguration } from "./configuration.js";
 import { syncContentAnalytics, syncMetrikaAnalytics, syncSearchAnalytics } from "./content-analytics-sync.js";
 import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex-engine.js";
-import { findDailyBlogStudy } from "./daily-blog-topic.js";
+import type { ContentRadarPost } from "./content-radar.js";
+import { findDailyBlogStudies, type BlogStudy } from "./daily-blog-topic.js";
 import { EphemeralTextEditor, formatTelegramTopicDetail, formatTelegramTopicShortlistBatches } from "./ephemeral-text-editor.js";
 import { todayCalendar, type CalendarEntry } from "./mac-bridge.js";
 import type { MemoryService } from "./memory-service.js";
@@ -20,6 +21,7 @@ import { syncTelegramArticlePublications } from "./telegram-publication-sync.js"
 import { collectWebsiteRadarPosts } from "./website-topic-radar.js";
 import { countActiveWork, groupActiveWork, internalAssistantWorkspace, internalWorkThread, mergeActiveWork, type UnifiedWorkGroup } from "./work-dashboard.js";
 import { todayWeather } from "./weather.js";
+import { checkPublicServices, formatSystemHealth, type SystemHealthSummary } from "./system-health.js";
 
 export interface WorkJournalEntry {
   project: string;
@@ -28,21 +30,26 @@ export interface WorkJournalEntry {
   result: string;
 }
 
+interface PreparedBlogTopicRecord {
+  sourceId: string;
+  pillar: string;
+  title: string;
+  sourceUrl: string;
+  markdown: string;
+}
+
 interface PreparedBlogTopic {
-  records: readonly {
-    sourceId: string;
-    pillar: string;
-    title: string;
-    sourceUrl: string;
-    markdown: string;
-  }[];
+  records: readonly PreparedBlogTopicRecord[];
   choiceMessages?: readonly string[];
-  digestMarkdown?: string;
 }
 
 interface MorningDigestResult {
   text: string;
-  blogTopic?: PreparedBlogTopic;
+}
+
+interface MorningBlogContent {
+  dailyTopic?: PreparedBlogTopicRecord;
+  shortlist?: PreparedBlogTopic;
 }
 
 export class BackgroundScheduler {
@@ -146,18 +153,29 @@ export class BackgroundScheduler {
         } else if (alarm.mode === "digest-morning") {
           const digest = await this.morningDigest(alarm.owner);
           await this.send(alarm.owner, digest.text);
-          if (digest.blogTopic) {
+          const blog = await this.morningBlogContent(alarm.owner).catch((error) => {
+            console.error("Morning blog content failed", error);
+            return undefined;
+          });
+          if (blog) {
             const sentAt = Date.now();
-            for (const record of digest.blogTopic.records) this.database.recordBlogTopic({
-              owner: alarm.owner,
-              sourceId: record.sourceId,
-              pillar: record.pillar,
-              studyTitle: record.title,
-              sourceUrl: record.sourceUrl,
-              markdown: record.markdown,
-              sentAt,
+            const records = [blog.dailyTopic, ...(blog.shortlist?.records ?? [])]
+              .filter((record): record is PreparedBlogTopicRecord => Boolean(record));
+            for (const record of new Map(records.map((record) => [record.sourceId, record])).values()) {
+              this.database.recordBlogTopic({
+                owner: alarm.owner,
+                sourceId: record.sourceId,
+                pillar: record.pillar,
+                studyTitle: record.title,
+                sourceUrl: record.sourceUrl,
+                markdown: record.markdown,
+                sentAt,
+              });
+            }
+            if (blog.dailyTopic) await this.sendDailyBlogTopic(alarm.owner, blog.dailyTopic).catch((error) => {
+              console.error("Morning daily blog topic failed", error);
             });
-            await this.sendBlogTopicChoices(alarm.owner, digest.blogTopic).catch((error) => {
+            if (blog.shortlist) await this.sendBlogTopicChoices(alarm.owner, blog.shortlist).catch((error) => {
               console.error("Morning blog topic buttons failed", error);
             });
           }
@@ -215,8 +233,7 @@ export class BackgroundScheduler {
     const inbox = this.database.captures(owner, "new", 100).length;
     const tasks = this.database.tasks(owner, undefined, 500);
     const summaryThread = this.database.conversation(`daily-summary:${owner}`)?.threadId;
-    const usedBlogSources = new Set(this.database.sentBlogTopicSourceIds(owner, Date.now() - 365 * 86_400_000));
-    const [weather, calendar, inspiration, telegramPosts, websitePosts, blogStudy, threads] = await Promise.allSettled([
+    const [weather, calendar, inspiration, threads, systems] = await Promise.allSettled([
       todayWeather({
         label: this.configuration.weatherLocation,
         latitude: this.configuration.weatherLatitude,
@@ -224,78 +241,93 @@ export class BackgroundScheduler {
       }),
       within(todayCalendar(20), 10_000, "calendar"),
       within(todayInspiration(), 15_000, "daily inspiration"),
-      within(collectTelegramRadarPosts(this.configuration, { usedSourceIds: usedBlogSources }), 90_000,
-        "Telegram content radar"),
-      within(collectWebsiteRadarPosts({ usedSourceIds: usedBlogSources }), 45_000, "website content radar"),
-      within(findDailyBlogStudy({ usedSourceIds: usedBlogSources }), 25_000, "daily blog study"),
       within(this.hub.threads(150), 7_000, "Codex threads"),
+      within(checkPublicServices(), 20_000, "public services"),
     ]);
     if (weather.status === "rejected") console.error("Morning weather failed", weather.reason);
     if (calendar.status === "rejected") console.error("Morning calendar failed", calendar.reason);
     if (inspiration.status === "rejected") console.error("Morning daily inspiration failed", inspiration.reason);
-    if (telegramPosts.status === "rejected") console.error("Morning Telegram content radar failed", telegramPosts.reason);
-    if (websitePosts.status === "rejected") console.error("Morning website content radar failed", websitePosts.reason);
-    if (blogStudy.status === "rejected") console.error("Morning blog study failed", blogStudy.reason);
     if (threads.status === "rejected") console.error("Morning project loading failed", threads.reason);
-    const radarPosts = [
-      ...(telegramPosts.status === "fulfilled" ? telegramPosts.value : []),
-      ...(websitePosts.status === "fulfilled" ? websitePosts.value : []),
-    ];
-    let blogTopic: PreparedBlogTopic | undefined;
-    if (radarPosts.length >= 10) {
-      try {
-        const choices = await within(this.textEditor.createContentTopicShortlist(radarPosts), 425_000,
-          "content topic shortlist");
-        const byId = new Map(radarPosts.map((post) => [post.sourceId, post]));
-        blogTopic = {
-          records: choices.map((choice) => {
-            const post = byId.get(choice.radarSourceId)!;
-            return {
-              sourceId: choice.radarSourceId,
-              pillar: "content-radar",
-              title: choice.title,
-              sourceUrl: post.sourceUrl || choice.primarySourceUrl,
-              markdown: formatTelegramTopicDetail(choice, post),
-            };
-          }),
-          choiceMessages: formatTelegramTopicShortlistBatches(choices, radarPosts),
-        };
-      } catch (error) {
-        console.error("Morning content topic generation failed", error);
-      }
-    }
-    if (!blogTopic && blogStudy.status === "fulfilled" && blogStudy.value) {
-      try {
-        const markdown = await within(this.textEditor.createDailyBlogTopic(blogStudy.value), 185_000, "daily blog topic");
-        blogTopic = {
-          records: [{
-            sourceId: blogStudy.value.sourceId,
-            pillar: blogStudy.value.pillar,
-            title: blogStudy.value.title,
-            sourceUrl: blogStudy.value.sourceUrl,
-            markdown,
-          }],
-          digestMarkdown: markdown,
-        };
-      } catch (error) {
-        console.error("Morning blog topic generation failed", error);
-      }
-    }
+    if (systems.status === "rejected") console.error("Morning public services failed", systems.reason);
     const excluded = new Set(summaryThread ? [summaryThread] : []);
     const visibleThreads = threads.status === "fulfilled" ? recentProjectThreads(threads.value.filter((thread) =>
       !generatedWorkspace(thread.workspace) && !internalAssistantWorkspace(thread.workspace, this.configuration.dataDirectory)
       && !internalWorkThread(thread))) : [];
     const groups = groupActiveWork(mergeActiveWork(tasks, visibleThreads, this.configuration.projectAliases, excluded));
-    const text = await this.polishContent(morningDigestText({
+    const text = morningDigestText({
       weather: weather.status === "fulfilled" ? weather.value : `🌦 Погода · ${this.configuration.weatherLocation}\nНе удалось получить прогноз.`,
       calendar: calendar.status === "fulfilled" ? calendar.value : undefined,
       inspiration: inspiration.status === "fulfilled" ? inspiration.value : undefined,
-      blogTopic: blogTopic?.digestMarkdown,
+      systems: systems.status === "fulfilled" ? systems.value : undefined,
       groups,
       inbox,
       tasks,
-    }));
-    return { text, blogTopic };
+    });
+    return { text };
+  }
+
+  private async morningBlogContent(owner: string): Promise<MorningBlogContent> {
+    const usedBlogSources = new Set(this.database.sentBlogTopicSourceIds(owner, Date.now() - 90 * 86_400_000));
+    const [telegramPosts, websitePosts, blogStudies] = await Promise.allSettled([
+      within(collectTelegramRadarPosts(this.configuration, { usedSourceIds: usedBlogSources }), 90_000,
+        "Telegram content radar"),
+      within(collectWebsiteRadarPosts({ usedSourceIds: usedBlogSources }), 45_000, "website content radar"),
+      within(findDailyBlogStudies({ usedSourceIds: usedBlogSources, limit: 18 }), 45_000, "daily blog studies"),
+    ]);
+    if (telegramPosts.status === "rejected") console.error("Morning Telegram content radar failed", telegramPosts.reason);
+    if (websitePosts.status === "rejected") console.error("Morning website content radar failed", websitePosts.reason);
+    if (blogStudies.status === "rejected") console.error("Morning blog studies failed", blogStudies.reason);
+
+    const studies = blogStudies.status === "fulfilled" ? blogStudies.value : [];
+    const dailyStudy = studies[0];
+    const radarPosts: ContentRadarPost[] = [
+      ...(telegramPosts.status === "fulfilled" ? telegramPosts.value : []),
+      ...(websitePosts.status === "fulfilled" ? websitePosts.value : []),
+      ...studies.slice(1).map(blogStudyRadarPost),
+    ];
+    const [dailyResult, shortlistResult] = await Promise.allSettled([
+      dailyStudy
+        ? within(this.textEditor.createDailyBlogTopic(dailyStudy), 185_000, "daily blog topic")
+        : Promise.resolve(undefined),
+      radarPosts.length >= 10
+        ? within(this.textEditor.createContentTopicShortlist(radarPosts), 15 * 60_000, "content topic shortlist")
+        : Promise.resolve(undefined),
+    ]);
+
+    let dailyTopic: PreparedBlogTopicRecord | undefined;
+    if (dailyResult.status === "fulfilled" && dailyResult.value && dailyStudy) {
+      dailyTopic = {
+        sourceId: dailyStudy.sourceId,
+        pillar: dailyStudy.pillar,
+        title: blogTopicTitle(dailyResult.value, dailyStudy.title),
+        sourceUrl: dailyStudy.sourceUrl,
+        markdown: dailyResult.value,
+      };
+    } else if (dailyResult.status === "rejected") {
+      console.error("Morning daily blog topic generation failed", dailyResult.reason);
+    }
+
+    let shortlist: PreparedBlogTopic | undefined;
+    if (shortlistResult.status === "fulfilled" && shortlistResult.value?.length) {
+      const byId = new Map(radarPosts.map((post) => [post.sourceId, post]));
+      const choices = shortlistResult.value;
+      shortlist = {
+        records: choices.map((choice) => {
+          const post = byId.get(choice.radarSourceId)!;
+          return {
+            sourceId: choice.radarSourceId,
+            pillar: "content-radar",
+            title: choice.title,
+            sourceUrl: post.sourceUrl || choice.primarySourceUrl,
+            markdown: formatTelegramTopicDetail(choice, post),
+          };
+        }),
+        choiceMessages: formatTelegramTopicShortlistBatches(choices, radarPosts),
+      };
+    } else if (shortlistResult.status === "rejected") {
+      console.error("Morning content topic generation failed", shortlistResult.reason);
+    }
+    return { dailyTopic, shortlist };
   }
 
   private async sendEveningSummary(owner: string): Promise<void> {
@@ -312,7 +344,7 @@ export class BackgroundScheduler {
     const dryDigest = localDailyDigest(tasks, events, this.configuration.projectAliases, journal);
     const completionEvidence = dailyCompletionEvidence(tasks, journal, this.configuration.projectAliases);
     const digest = await this.polishDailyDigest(owner, dryDigest, completionEvidence);
-    await this.send(owner, await this.polishContent(dailyReport(digest, since)));
+    await this.send(owner, dailyReport(digest, since));
   }
 
   private async polishDailyDigest(owner: string, dryDigest: string, completionEvidence: string): Promise<string> {
@@ -358,6 +390,22 @@ export class BackgroundScheduler {
     await sendTelegramMarkdown(this.bot.api, owner, text);
   }
 
+  private async sendDailyBlogTopic(owner: string, topic: PreparedBlogTopicRecord): Promise<void> {
+    const replyMarkup = {
+      inline_keyboard: [[{
+        text: "👍 Готовь статью",
+        callback_data: `blog-article:${topic.sourceId}`,
+      }]],
+    };
+    const rendered = renderTelegramMarkdown(topic.markdown);
+    try {
+      await this.bot.api.sendMessage(owner, rendered.html, { parse_mode: "HTML", reply_markup: replyMarkup });
+    } catch (error) {
+      console.error("Morning daily blog topic HTML failed; using plain text", error);
+      await this.bot.api.sendMessage(owner, markdownToPlainText(rendered.plain), { reply_markup: replyMarkup });
+    }
+  }
+
   private async sendBlogTopicChoices(owner: string, topic: PreparedBlogTopic): Promise<void> {
     if (!topic.choiceMessages?.length || topic.records.length < 2) return;
     for (let batchIndex = 0; batchIndex < topic.choiceMessages.length; batchIndex += 1) {
@@ -398,7 +446,7 @@ export interface MorningDigestInput {
   weather: string;
   calendar?: readonly CalendarEntry[];
   inspiration?: string;
-  blogTopic?: string;
+  systems?: SystemHealthSummary;
   groups: readonly UnifiedWorkGroup[];
   inbox: number;
   tasks: readonly WorkItem[];
@@ -427,11 +475,22 @@ export function morningDigestText(input: MorningDigestInput): string {
   const projectLines = input.groups.map((group) => {
     const topics = group.items.slice(0, 3).map((item) => morningTopic(item.title));
     const more = group.items.length > 3 ? `; ещё ${group.items.length - 3}` : "";
-    return `- **${group.label} · ${group.items.length}** — ${topics.join("; ")}${more}.`;
+    return `- **${group.label}:** ${topics.join("; ")}${more}.`;
   });
-  const attentionLines = attention.slice(0, 3).map(({ item, reason, icon }) =>
-    `- ${icon} **${reason} · ${item.projectLabel}** — ${digestText(item.title, 110)}`);
-  if (attention.length > 3) attentionLines.push(`- Ещё требуют внимания: **${attention.length - 3}**`);
+  const failedServices = input.systems?.services.filter((service) => !service.ok) ?? [];
+  const recommendations = [
+    ...(failedServices.length ? [`Проверить доступность: ${failedServices.map((service) => service.label).join(", ")}.`] : []),
+    ...attention.map(({ item, reason }) => reason === "Просрочено"
+      ? `Закрыть просроченное по проекту ${item.projectLabel}: ${digestText(item.title, 100)}.`
+      : reason === "Сегодня"
+        ? `Не откладывать задачу на сегодня по проекту ${item.projectLabel}: ${digestText(item.title, 100)}.`
+        : `Дать ответ по проекту ${item.projectLabel}: ${digestText(item.title, 100)}.`),
+    ...(input.inbox ? [`Разобрать ${countLabel(input.inbox, "запись", "записи", "записей")} во входящих.`] : []),
+    ...(!attention.length && !input.inbox ? input.groups.flatMap((group) => group.items
+      .filter((item) => item.status === "running")
+      .slice(0, 1)
+      .map((item) => `Продвинуть ${group.label}: ${digestText(item.title, 100)}.`)) : []),
+  ].filter((value, index, values) => values.indexOf(value) === index).slice(0, 3);
   const calendarLines = input.calendar === undefined
     ? ["**🗓 Сегодня · Apple Calendar**", "", "Не удалось прочитать системный календарь."]
     : input.calendar.length
@@ -445,19 +504,28 @@ export function morningDigestText(input: MorningDigestInput): string {
     ...calendarLines,
     "",
     ...(input.inspiration ? [input.inspiration, ""] : []),
-    ...(input.blogTopic ? [input.blogTopic, ""] : []),
     "**Главное**",
     "",
-    `Активно: **${countLabel(items.length, "тема", "темы", "тем")}** в **${countLabel(input.groups.length, "проекте", "проектах", "проектах")}**`,
-    `Требуют внимания: **${attention.length}** · очередь: **${counts.queued}** · инбокс: **${input.inbox}**`,
-    "",
-    "**Самое важное**",
-    "",
-    ...(attentionLines.length ? attentionLines : ["Срочных задач и ожидающих ответа **нет**."]),
+    `В работе: **${countLabel(input.groups.length, "проект", "проекта", "проектов")}** и **${countLabel(items.length, "тема", "темы", "тем")}**.`,
+    attention.length
+      ? `Требуют внимания: **${attention.length}**.`
+      : "Срочных задач и ожидающих ответа **нет**.",
+    ...(counts.queued ? [`В очереди на выполнение: **${counts.queued}**.`] : []),
+    ...(input.inbox ? [`Во входящих: **${input.inbox}**.`] : []),
     "",
     "**Проекты**",
     "",
     ...(projectLines.length ? projectLines : ["Активных тем по проектам нет."]),
+    "",
+    "**Системы**",
+    "",
+    ...formatSystemHealth(input.systems),
+    "",
+    "**Что стоит сделать сегодня**",
+    "",
+    ...(recommendations.length
+      ? recommendations.map((recommendation, index) => `${index + 1}. ${recommendation}`)
+      : ["Выбрать один главный результат дня и не распыляться."]),
   ].join("\n");
 }
 
@@ -858,6 +926,24 @@ function formatWeatherBlock(value: string): string {
     "**$1**",
   ));
   return [`**${digestText(first, 120)}**`, "", ...detail].join("\n");
+}
+function blogStudyRadarPost(study: BlogStudy): ContentRadarPost {
+  return {
+    sourceId: study.sourceId,
+    sourceKind: "website",
+    sourceRole: "evidence",
+    sourceTitle: "PubMed",
+    publishedAt: study.year ? Date.UTC(study.year, 0, 1) : Date.now(),
+    text: `${study.title}. ${study.abstract}`,
+    links: [study.sourceUrl],
+    sourceUrl: study.sourceUrl,
+  };
+}
+function blogTopicTitle(markdown: string, fallback: string): string {
+  const lines = markdown.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const header = lines.findIndex((line) => line.includes("Тема дня для блога"));
+  const title = lines.slice(header + 1).map((line) => line.match(/^\*\*([^*]+)\*\*$/u)?.[1]?.trim()).find(Boolean);
+  return title || fallback;
 }
 function morningTopic(value: string): string {
   const text = digestText(value, 80)
