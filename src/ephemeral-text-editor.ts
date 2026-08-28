@@ -8,7 +8,8 @@ import { codexExecutable } from "./appserver-transport.js";
 import type { ContentRadarPost } from "./content-radar.js";
 import type { BlogStudy } from "./daily-blog-topic.js";
 import type { ForwardedVoiceFragment } from "./forwarded-voice.js";
-import { finalResponseStylePrompt, personalTextEditingPrompt, StyleReferenceLibrary } from "./style-writing.js";
+import { blogTextEditingPrompt, finalResponseStylePrompt, personalTextEditingPrompt,
+  StyleReferenceLibrary } from "./style-writing.js";
 
 const EDITOR_TIMEOUT_MS = 3 * 60_000;
 const MEDIA_SUMMARY_TIMEOUT_MS = 10 * 60_000;
@@ -60,6 +61,11 @@ export class EphemeralTextEditor {
   async formatPersonalText(source: string): Promise<string> {
     const context = await this.styleReferences().context("reply", source);
     return runEphemeralCodex(personalTextEditingPrompt(source, context), this.configuration.defaultModel);
+  }
+
+  async formatBlogText(source: string): Promise<string> {
+    const context = await this.styleReferences().context("post", source);
+    return runEphemeralCodex(blogTextEditingPrompt(source, context), this.configuration.defaultModel);
   }
 
   async polishAssistantResponse(source: string): Promise<string> {
