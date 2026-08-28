@@ -18,6 +18,7 @@ export interface BlogStudy {
 
 export interface DailyBlogStudyOptions {
   now?: number;
+  limit?: number;
   usedSourceIds?: ReadonlySet<string>;
   requester?: typeof fetch;
   wait?: (milliseconds: number) => Promise<void>;
@@ -52,25 +53,34 @@ const PILLARS: readonly { id: BlogTopicPillar; label: string; query: string }[] 
 ] as const;
 
 export async function findDailyBlogStudy(options: DailyBlogStudyOptions = {}): Promise<BlogStudy | undefined> {
+  return (await findDailyBlogStudies({ ...options, limit: 1 }))[0];
+}
+
+export async function findDailyBlogStudies(options: DailyBlogStudyOptions = {}): Promise<BlogStudy[]> {
   const now = options.now ?? Date.now();
   const requester = options.requester ?? fetch;
   const wait = options.wait ?? delay;
+  const limit = Math.max(1, Math.min(options.limit ?? 18, 36));
   const pillar = blogTopicPillarForDate(now);
   const ids = await searchPubMed(pillar.query, requester, wait);
   const unused = ids.filter((id) => !options.usedSourceIds?.has(id));
-  if (!unused.length) return undefined;
+  if (!unused.length) return [];
 
+  const result: BlogStudy[] = [];
   for (let offset = 0; offset < unused.length; offset += PUBMED_BATCH_SIZE) {
     const studies = await fetchPubMedStudies(unused.slice(offset, offset + PUBMED_BATCH_SIZE), requester, wait);
-    const study = studies.find((candidate) => candidate.abstract.length >= 240);
-    if (study) return {
-      ...study,
-      pillar: pillar.id,
-      pillarLabel: pillar.label,
-      sourceUrl: `https://pubmed.ncbi.nlm.nih.gov/${study.sourceId}/`,
-    };
+    for (const study of studies) {
+      if (study.abstract.length < 240) continue;
+      result.push({
+        ...study,
+        pillar: pillar.id,
+        pillarLabel: pillar.label,
+        sourceUrl: `https://pubmed.ncbi.nlm.nih.gov/${study.sourceId}/`,
+      });
+      if (result.length >= limit) return result;
+    }
   }
-  return undefined;
+  return result;
 }
 
 export function blogTopicPillarForDate(now: number): (typeof PILLARS)[number] {

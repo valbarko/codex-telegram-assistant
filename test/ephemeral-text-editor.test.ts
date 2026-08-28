@@ -4,6 +4,7 @@ import {
   cleanEditedText,
   contentTopicMaterialBatches,
   dailyBlogTopicPrompt,
+  fallbackTelegramTopicChoices,
   formatTelegramTopicDetail,
   formatTelegramTopicShortlistBatches,
   normalizeDailyBlogTopic,
@@ -105,8 +106,8 @@ describe("ephemeral text editor prompts", () => {
     expect(prompt).toContain("Первые 10 должны быть самыми сильными");
     expect(topics).toHaveLength(10);
     expect(batches).toHaveLength(2);
-    expect(batches[0]).toContain("🧠 **10 идей · 1–5**");
-    expect(batches[1]).toContain("🧠 **10 идей · 6–10**");
+    expect(batches[0]).toContain("🧠 **10 идей для блога · 1–5**");
+    expect(batches[1]).toContain("🧠 **10 идей для блога · 6–10**");
     expect(batches[1]).toContain("**10. Тема 10**");
     expect(detail).toContain("**Ограничение:** Выборка невелика");
     expect(detail).toContain("[Сигнал: Канал 1](https://t.me/channel1/1)");
@@ -166,6 +167,27 @@ describe("ephemeral text editor prompts", () => {
 
     expect(batches.map((batch) => batch.length)).toEqual([5, 5]);
     expect(new Set(batches.flat().map((post) => post.sourceId)).size).toBe(10);
+  });
+
+  it("can fill a failed AI batch from unused PubMed materials", () => {
+    const posts = Array.from({ length: 5 }, (_, index): ContentRadarPost => ({
+      sourceId: String(index + 1),
+      sourceKind: "website",
+      sourceRole: "evidence",
+      sourceTitle: "PubMed",
+      publishedAt: Date.now(),
+      text: `Исследование ${index + 1}. Короткий проверяемый вывод для будущего материала.`,
+      sourceUrl: `https://pubmed.ncbi.nlm.nih.gov/${index + 1}/`,
+    }));
+
+    const topics = fallbackTelegramTopicChoices(posts, 5);
+
+    expect(topics).toHaveLength(5);
+    expect(topics[0]).toMatchObject({
+      title: "Исследование 1",
+      primarySourceLabel: "PubMed",
+      primarySourceUrl: "https://pubmed.ncbi.nlm.nih.gov/1/",
+    });
   });
 });
 

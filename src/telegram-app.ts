@@ -380,6 +380,7 @@ export class TelegramApplication {
     this.bot.callbackQuery(/^capture:(task|memory|drop):(.+)$/, async (ctx) => this.captureAction(ctx));
     this.bot.callbackQuery(/^assistant-job:retry:(.+)$/, async (ctx) => this.retryAssistantJob(ctx));
     this.bot.callbackQuery(/^blog-detail:(.+)$/, async (ctx) => this.showBlogTopicDetail(ctx));
+    this.bot.callbackQuery(/^blog-article:(.+)$/, async (ctx) => this.prepareBlogArticle(ctx));
     this.bot.callbackQuery(/^blog-topic:(.+)$/, async (ctx) => this.selectBlogTopic(ctx));
     this.bot.callbackQuery(/^alarm:delete:(.+)$/, async (ctx) => {
       await ctx.answerCallbackQuery({ text: this.database.deleteAlarm(ctx.match![1]) ? "Удалено" : "Не найдено" });
@@ -1013,7 +1014,7 @@ export class TelegramApplication {
     if (!topic) return void await ctx.answerCallbackQuery({ text: "Тема уже недоступна" });
     await ctx.answerCallbackQuery({ text: "Раскрываю идею" });
     const rendered = renderTelegramMarkdown(topic.markdown);
-    const keyboard = new InlineKeyboard().text("✅ Выбрать эту тему", `blog-topic:${sourceId}`);
+    const keyboard = new InlineKeyboard().text("👍 Готовь статью", `blog-article:${sourceId}`);
     try {
       await ctx.reply(rendered.html, { parse_mode: "HTML", reply_markup: keyboard });
     } catch (error) {
@@ -1046,6 +1047,40 @@ export class TelegramApplication {
     } catch (error) {
       logInternalError("Blog topic selection failed", error);
       await ctx.answerCallbackQuery({ text: "Не удалось сохранить выбор" });
+    }
+  }
+
+  private async prepareBlogArticle(ctx: Context): Promise<void> {
+    const sourceId = ctx.match?.[1];
+    if (!sourceId) return void await ctx.answerCallbackQuery({ text: "Тема не найдена" });
+    try {
+      const selected = this.database.selectBlogTopic(ownerId(ctx), sourceId);
+      await this.memory.record({
+        owner: ownerId(ctx),
+        body: `Одобрена подготовка статьи по теме: ${selected.studyTitle}. Источник: ${selected.sourceUrl}`,
+        role: "action",
+        kind: "action",
+        project: this.memoryProject(ctx),
+        source: "telegram-button",
+      });
+      await ctx.answerCallbackQuery({ text: "Готовлю статью" });
+      const prompt = [
+        "Подготовь и сохрани в Банк статей полный публикационный пакет по выбранной теме.",
+        "Сделай содержательную статью для читателя, а не пересказ редакционной карточки. Проверь факты и первоисточники, не преувеличивай выводы исследования.",
+        "Не выдумывай личный опыт Валентина, клиентов или биографические подробности. Для голоса и оформления следуй инструкциям Банка статей.",
+        "",
+        `Тема: ${selected.studyTitle}`,
+        `Исходный источник: ${selected.sourceUrl}`,
+        "",
+        "Редакционная карточка:",
+        selected.markdown,
+      ].join("\n");
+      await this.executePrompt(ctx, prompt, {
+        body: `Готовим и сохраняем статью в Банк статей: ${selected.studyTitle}`,
+      });
+    } catch (error) {
+      logInternalError("Blog article preparation failed", error);
+      await ctx.answerCallbackQuery({ text: "Не удалось запустить подготовку" }).catch(() => undefined);
     }
   }
 
