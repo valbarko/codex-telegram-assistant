@@ -143,7 +143,7 @@ export interface SavedConversation {
 }
 
 export type AssistantJobState = "queued" | "running" | "retry_wait" | "succeeded" | "blocked" | "failed" | "cancelled";
-export type AssistantJobKind = "assistant" | "article_bank";
+export type AssistantJobKind = "assistant" | "article_bank" | "media_summary";
 
 export interface AssistantJob {
   id: string;
@@ -184,6 +184,22 @@ export interface AssistantJobCounts {
   retryWait: number;
   blocked: number;
   failed: number;
+}
+
+export type MediaJobStage = "queued" | "inspected" | "downloaded" | "prepared" | "transcribing" | "transcribed";
+
+export interface MediaJobCheckpoint {
+  jobId: string;
+  sourceUrl: string;
+  stage: MediaJobStage;
+  title?: string;
+  durationSeconds?: number;
+  captionLanguage?: string;
+  mediaPath?: string;
+  chunks: string[];
+  transcriptParts: Array<string | null>;
+  createdAt: number;
+  changedAt: number;
 }
 
 export interface SearchHit {
@@ -285,6 +301,46 @@ export class AssistantDatabase {
 
   assistantJob(id: string): AssistantJob | undefined {
     return mapAssistantJob(this.sql.prepare("SELECT * FROM assistant_jobs WHERE id=?").get(id));
+  }
+
+  mediaJobCheckpoint(jobId: string): MediaJobCheckpoint | undefined {
+    return mapMediaJobCheckpoint(this.sql.prepare("SELECT * FROM media_job_checkpoints WHERE job_id=?").get(jobId));
+  }
+
+  saveMediaJobCheckpoint(value: Omit<MediaJobCheckpoint, "createdAt" | "changedAt">): MediaJobCheckpoint {
+    const existing = this.mediaJobCheckpoint(value.jobId);
+    const now = Date.now();
+    const checkpoint: MediaJobCheckpoint = {
+      ...value,
+      chunks: [...value.chunks],
+      transcriptParts: [...value.transcriptParts],
+      createdAt: existing?.createdAt ?? now,
+      changedAt: now,
+    };
+    this.sql.prepare(`INSERT INTO media_job_checkpoints(
+      job_id,source_url,stage,title,duration_seconds,caption_language,media_path,chunks_json,transcript_parts_json,
+      created_at,changed_at
+    ) VALUES(
+      @jobId,@sourceUrl,@stage,@title,@durationSeconds,@captionLanguage,@mediaPath,@chunksJson,@transcriptPartsJson,
+      @createdAt,@changedAt
+    ) ON CONFLICT(job_id) DO UPDATE SET
+      source_url=excluded.source_url,stage=excluded.stage,title=excluded.title,
+      duration_seconds=excluded.duration_seconds,caption_language=excluded.caption_language,
+      media_path=excluded.media_path,chunks_json=excluded.chunks_json,
+      transcript_parts_json=excluded.transcript_parts_json,changed_at=excluded.changed_at`).run(nullable({
+      ...checkpoint,
+      title: checkpoint.title,
+      durationSeconds: checkpoint.durationSeconds,
+      captionLanguage: checkpoint.captionLanguage,
+      mediaPath: checkpoint.mediaPath,
+      chunksJson: JSON.stringify(checkpoint.chunks),
+      transcriptPartsJson: JSON.stringify(checkpoint.transcriptParts),
+    }));
+    return checkpoint;
+  }
+
+  deleteMediaJobCheckpoint(jobId: string): boolean {
+    return this.sql.prepare("DELETE FROM media_job_checkpoints WHERE job_id=?").run(jobId).changes > 0;
   }
 
   openAssistantJobByFingerprint(owner: string, context: string, fingerprint: string): AssistantJob | undefined {
@@ -795,6 +851,20 @@ export class AssistantDatabase {
         WHERE state IN ('queued','running','retry_wait');
       CREATE INDEX IF NOT EXISTS assistant_job_state_next ON assistant_jobs(state,next_attempt_at,created_at);
       CREATE INDEX IF NOT EXISTS assistant_job_context_state ON assistant_jobs(context,state,changed_at);
+      CREATE TABLE IF NOT EXISTS media_job_checkpoints(
+        job_id TEXT PRIMARY KEY,
+        source_url TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        title TEXT,
+        duration_seconds REAL,
+        caption_language TEXT,
+        media_path TEXT,
+        chunks_json TEXT NOT NULL,
+        transcript_parts_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        changed_at INTEGER NOT NULL,
+        FOREIGN KEY(job_id) REFERENCES assistant_jobs(id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL, project TEXT, project_label TEXT, thread_id TEXT, due_at INTEGER, queue_order INTEGER, error TEXT, created_at INTEGER NOT NULL, changed_at INTEGER NOT NULL, finished_at INTEGER);
       CREATE INDEX IF NOT EXISTS task_owner_state ON tasks(owner,status,changed_at);
       CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY, owner TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, sender TEXT, source_time INTEGER, state TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -954,6 +1024,45 @@ function mapAssistantJob(row: unknown): AssistantJob | undefined {
     changedAt: Number(r.changed_at), startedAt: num(r.started_at), finishedAt: num(r.finished_at),
     notifiedAt: num(r.notified_at),
   };
+}
+
+function mapMediaJobCheckpoint(row: unknown): MediaJobCheckpoint | undefined {
+  const r = object(row); if (!r) return undefined;
+  const chunks = parseStringArray(r.chunks_json);
+  const transcriptParts = parseNullableStringArray(r.transcript_parts_json);
+  return {
+    jobId: str(r.job_id),
+    sourceUrl: str(r.source_url),
+    stage: str(r.stage) as MediaJobStage,
+    title: maybe(r.title),
+    durationSeconds: num(r.duration_seconds),
+    captionLanguage: maybe(r.caption_language),
+    mediaPath: maybe(r.media_path),
+    chunks,
+    transcriptParts,
+    createdAt: Number(r.created_at),
+    changedAt: Number(r.changed_at),
+  };
+}
+
+function parseStringArray(value: unknown): string[] {
+  try {
+    const parsed: unknown = JSON.parse(str(value));
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseNullableStringArray(value: unknown): Array<string | null> {
+  try {
+    const parsed: unknown = JSON.parse(str(value));
+    return Array.isArray(parsed)
+      ? parsed.map((item) => typeof item === "string" ? item : null)
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {

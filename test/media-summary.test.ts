@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { mediaPartSummaryPrompt, mediaSummaryPrompt } from "../src/ephemeral-text-editor.js";
-import { formatTimestamp, formatTimestampedTranscript, parseSupportedMediaUrl } from "../src/media-summary.js";
+import { formatTimestamp, formatTimestampedTranscript, MEDIA_FORMAT_SELECTOR, parseCaptionTranscript,
+  parseSupportedMediaUrl, selectCaptionTrack } from "../src/media-summary.js";
 
 describe("parseSupportedMediaUrl", () => {
   it.each([
@@ -22,6 +23,49 @@ describe("parseSupportedMediaUrl", () => {
     "https://user:password@youtube.com/watch?v=abc123",
   ])("rejects text or an unsafe/unsupported URL: %s", (source) => {
     expect(parseSupportedMediaUrl(source)).toBeUndefined();
+  });
+});
+
+describe("efficient media input", () => {
+  it("requests audio-only or the smallest practical video fallback", () => {
+    expect(MEDIA_FORMAT_SELECTOR).toBe("bestaudio[abr<=96]/bestaudio/best[height<=144]/best[height<=240]/best");
+    expect(MEDIA_FORMAT_SELECTOR).not.toContain("bestvideo");
+  });
+
+  it("uses a real manual caption track before automatic captions and ignores empty language entries", () => {
+    expect(selectCaptionTrack({
+      subtitles: {
+        en: [],
+        ru: [{ ext: "vtt", url: "https://example.test/manual" }],
+      },
+      automatic_captions: {
+        "ru-orig": [{ ext: "json3", url: "https://example.test/auto" }],
+      },
+    })).toEqual({ language: "ru", automatic: false });
+    expect(selectCaptionTrack({ subtitles: { ru: [] }, automatic_captions: { ru: [] } })).toBeUndefined();
+  });
+
+  it("converts JSON3 captions to timestamped text and collapses rolling duplicates", () => {
+    const transcript = parseCaptionTranscript(JSON.stringify({ events: [
+      { tStartMs: 1_200, segs: [{ utf8: "Первый" }] },
+      { tStartMs: 2_000, segs: [{ utf8: "Первый тезис" }] },
+      { tStartMs: 11_000, segs: [{ utf8: "Второй &amp; важный" }] },
+    ] }), "json3");
+    expect(transcript).toBe("[00:00:01] Первый тезис\n[00:00:11] Второй & важный");
+  });
+
+  it("converts WebVTT captions without cue metadata", () => {
+    const transcript = parseCaptionTranscript([
+      "WEBVTT",
+      "",
+      "00:00:03.000 --> 00:00:05.000 align:start position:0%",
+      "<c>Текст первой реплики</c>",
+      "",
+      "2",
+      "00:01:04.500 --> 00:01:07.000",
+      "Вторая реплика",
+    ].join("\n"), "vtt");
+    expect(transcript).toBe("[00:00:03] Текст первой реплики\n[00:01:04] Вторая реплика");
   });
 });
 

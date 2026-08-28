@@ -1,17 +1,19 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { transcribeAudioDetailed, type AudioTranscript } from "./audio.js";
+import { transcribeAudioBatchDetailed, type AudioTranscript } from "./audio.js";
 import type { AppConfiguration } from "./configuration.js";
 import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
+import type { AssistantDatabase, MediaJobCheckpoint } from "./storage.js";
 
 const execute = promisify(execFile);
 const CHUNK_SECONDS = 30 * 60;
 const COMMAND_TIMEOUT_MS = 30 * 60_000;
+export const MEDIA_FORMAT_SELECTOR = "bestaudio[abr<=96]/bestaudio/best[height<=144]/best[height<=240]/best";
 
 const SUPPORTED_MEDIA_HOSTS = [
   "youtube.com",
@@ -35,13 +37,19 @@ export interface MediaSummaryResult {
   markdown: string;
 }
 
+export interface MediaCaptionTrack {
+  language: string;
+  automatic: boolean;
+}
+
 interface MediaInfo {
   title?: string;
   durationSeconds?: number;
+  caption?: MediaCaptionTrack;
 }
 
 type MediaSummaryConfiguration = Pick<AppConfiguration,
-  "defaultModel" | "mediaDownloaderExecutable" | "ffmpegExecutable" | "mediaSummaryMaxDurationSeconds"
+  "dataDirectory" | "defaultModel" | "mediaDownloaderExecutable" | "ffmpegExecutable" | "mediaSummaryMaxDurationSeconds"
   | "mediaCookiesFromBrowser" | "mediaCookiesFile" | "whisperPython" | "whisperModel">;
 
 type ProgressCallback = (progress: MediaSummaryProgress) => void | Promise<void>;
@@ -49,47 +57,117 @@ type ProgressCallback = (progress: MediaSummaryProgress) => void | Promise<void>
 export class MediaSummaryService {
   private readonly editor: EphemeralTextEditor;
 
-  constructor(private readonly configuration: MediaSummaryConfiguration, editor?: EphemeralTextEditor) {
+  constructor(private readonly configuration: MediaSummaryConfiguration,
+    private readonly database?: AssistantDatabase, editor?: EphemeralTextEditor) {
     this.editor = editor ?? new EphemeralTextEditor(configuration);
   }
 
-  async summarize(sourceUrl: string, progress: ProgressCallback = () => undefined): Promise<MediaSummaryResult> {
+  async summarize(sourceUrl: string, progress: ProgressCallback = () => undefined,
+    jobId?: string): Promise<MediaSummaryResult> {
     const normalizedUrl = parseSupportedMediaUrl(sourceUrl);
     if (!normalizedUrl) throw new Error("Поддерживаются ссылки YouTube, RuTube и VK Видео");
-    const directory = await mkdtemp(path.join(os.tmpdir(), "codex-media-summary-"));
+    const persistent = Boolean(jobId && this.database);
+    const directory = persistent ? this.jobDirectory(jobId!) : await mkdtemp(path.join(os.tmpdir(), "codex-media-summary-"));
+    await mkdir(directory, { recursive: true });
+    let checkpoint = persistent ? this.database!.mediaJobCheckpoint(jobId!) : undefined;
+    if (checkpoint && checkpoint.sourceUrl !== normalizedUrl) throw new Error("Сохранённая медиазадача относится к другой ссылке");
+    checkpoint ??= this.saveCheckpoint({
+      jobId: jobId ?? path.basename(directory),
+      sourceUrl: normalizedUrl,
+      stage: "queued",
+      chunks: [],
+      transcriptParts: [],
+    }, persistent);
     try {
-      await progress({ stage: "inspect" });
-      const info = await this.inspect(normalizedUrl);
-      if (info.durationSeconds && info.durationSeconds > this.configuration.mediaSummaryMaxDurationSeconds) {
-        throw new Error(`Видео длиннее допустимого лимита ${formatDuration(this.configuration.mediaSummaryMaxDurationSeconds)}`);
+      if (checkpoint.stage === "queued") {
+        await progress({ stage: "inspect" });
+        const inspected = await this.inspect(normalizedUrl);
+        if (inspected.durationSeconds && inspected.durationSeconds > this.configuration.mediaSummaryMaxDurationSeconds) {
+          throw new Error(`Видео длиннее допустимого лимита ${formatDuration(this.configuration.mediaSummaryMaxDurationSeconds)}`);
+        }
+        checkpoint = this.saveCheckpoint({
+          ...checkpoint,
+          stage: "inspected",
+          title: inspected.title,
+          durationSeconds: inspected.durationSeconds,
+          captionLanguage: inspected.caption?.language,
+        }, persistent);
       }
-      await progress({ stage: "download" });
-      const mediaFile = await this.download(normalizedUrl, directory);
-      await progress({ stage: "prepare" });
-      const chunks = await this.splitAudio(mediaFile, directory);
-      const transcriptParts: string[] = [];
-      for (let index = 0; index < chunks.length; index += 1) {
-        await progress({ stage: "transcribe", current: index + 1, total: chunks.length });
-        const result = await transcribeAudioDetailed(chunks[index]!, {
-          language: null,
-          python: this.configuration.whisperPython,
-          model: this.configuration.whisperModel,
-        });
-        transcriptParts.push(formatTimestampedTranscript(result, index * CHUNK_SECONDS));
+
+      if (checkpoint.captionLanguage && !checkpoint.transcriptParts[0]) {
+        await progress({ stage: "download" });
+        try {
+          const transcript = await this.downloadCaption(normalizedUrl, checkpoint.captionLanguage, directory);
+          checkpoint = this.saveCheckpoint({
+            ...checkpoint,
+            stage: "transcribed",
+            transcriptParts: [transcript],
+          }, persistent);
+        } catch (error) {
+          console.warn("Caption download failed; falling back to audio transcription", error);
+          checkpoint = this.saveCheckpoint({ ...checkpoint, captionLanguage: undefined }, persistent);
+        }
       }
-      const transcript = transcriptParts.filter(Boolean).join("\n");
+
+      if (!checkpoint.captionLanguage) {
+        if (!checkpoint.mediaPath || !existsSync(checkpoint.mediaPath)) {
+          await progress({ stage: "download" });
+          const mediaPath = await this.download(normalizedUrl, directory);
+          checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "downloaded", mediaPath }, persistent);
+        }
+        if (!checkpoint.chunks.length || checkpoint.chunks.some((chunk) => !existsSync(chunk))) {
+          await progress({ stage: "prepare" });
+          const chunks = await this.splitAudio(checkpoint.mediaPath!, directory);
+          const existingParts = checkpoint.transcriptParts;
+          checkpoint = this.saveCheckpoint({
+            ...checkpoint,
+            stage: "prepared",
+            chunks,
+            transcriptParts: chunks.map((_, index) => existingParts[index] ?? null),
+          }, persistent);
+        }
+        const pending = checkpoint.chunks.map((file, index) => ({ file, index }))
+          .filter(({ index }) => !checkpoint!.transcriptParts[index]);
+        if (pending.length) {
+          checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "transcribing" }, persistent);
+          await progress({ stage: "transcribe", current: pending[0]!.index + 1, total: checkpoint.chunks.length });
+          await transcribeAudioBatchDetailed(pending.map(({ file }) => file), {
+            language: null,
+            python: this.configuration.whisperPython,
+            model: this.configuration.whisperModel,
+            onResult: async (result, pendingIndex) => {
+              const originalIndex = pending[pendingIndex]!.index;
+              const parts = [...checkpoint!.transcriptParts];
+              parts[originalIndex] = formatTimestampedTranscript(result, originalIndex * CHUNK_SECONDS);
+              checkpoint = this.saveCheckpoint({ ...checkpoint!, stage: "transcribing", transcriptParts: parts }, persistent);
+              const next = pending[pendingIndex + 1];
+              if (next) await progress({ stage: "transcribe", current: next.index + 1, total: checkpoint!.chunks.length });
+            },
+          });
+          checkpoint = this.saveCheckpoint({ ...checkpoint, stage: "transcribed" }, persistent);
+        }
+      }
+
+      const transcript = checkpoint.transcriptParts.filter((part): part is string => Boolean(part)).join("\n");
       if (!transcript.trim()) throw new Error("Whisper не вернул текст из видео");
       await progress({ stage: "summarize" });
       const markdown = await this.editor.summarizeMediaTranscript({
-        title: info.title,
+        title: checkpoint.title,
         url: normalizedUrl,
-        durationSeconds: info.durationSeconds,
+        durationSeconds: checkpoint.durationSeconds,
         transcript,
       });
-      return { title: info.title, durationSeconds: info.durationSeconds, markdown };
+      return { title: checkpoint.title, durationSeconds: checkpoint.durationSeconds, markdown };
     } finally {
-      await rm(directory, { recursive: true, force: true });
+      if (!persistent) await rm(directory, { recursive: true, force: true });
     }
+  }
+
+  async cleanup(jobId: string): Promise<void> {
+    if (!this.database) return;
+    const directory = this.jobDirectory(jobId);
+    await rm(directory, { recursive: true, force: true });
+    this.database.deleteMediaJobCheckpoint(jobId);
   }
 
   private async inspect(sourceUrl: string): Promise<MediaInfo> {
@@ -107,7 +185,7 @@ export class MediaSummaryService {
     const title = typeof parsed.title === "string" ? parsed.title.trim() || undefined : undefined;
     const durationSeconds = typeof parsed.duration === "number" && Number.isFinite(parsed.duration) && parsed.duration > 0
       ? parsed.duration : undefined;
-    return { title, durationSeconds };
+    return { title, durationSeconds, caption: selectCaptionTrack(parsed) };
   }
 
   private async download(sourceUrl: string, directory: string): Promise<string> {
@@ -117,9 +195,9 @@ export class MediaSummaryService {
       "--no-mark-watched",
       "--no-warnings",
       "--no-progress",
+      "--format", MEDIA_FORMAT_SELECTOR,
       "--extract-audio",
-      "--audio-format", "m4a",
-      "--audio-quality", "5",
+      "--audio-format", "best",
       "--output", outputTemplate,
       "--print", "after_move:%(filepath)s",
       ...this.authenticationArguments(),
@@ -133,18 +211,42 @@ export class MediaSummaryService {
     return resolved;
   }
 
+  private async downloadCaption(sourceUrl: string, language: string, directory: string): Promise<string> {
+    const outputTemplate = path.join(directory, "captions.%(ext)s");
+    await this.command(this.configuration.mediaDownloaderExecutable, [
+      "--skip-download",
+      "--no-playlist",
+      "--no-mark-watched",
+      "--no-warnings",
+      "--write-subs",
+      "--write-auto-subs",
+      "--sub-langs", language,
+      "--sub-format", "json3/vtt/srt/best",
+      "--output", outputTemplate,
+      ...this.authenticationArguments(),
+      sourceUrl,
+    ], "Не удалось скачать субтитры");
+    const names = (await readdir(directory)).filter((name) => name.startsWith("captions.") && /\.(?:json3|vtt|srt)$/iu.test(name));
+    const name = names.sort((left, right) => captionFormatRank(left) - captionFormatRank(right))[0];
+    if (!name) throw new Error("yt-dlp не создал файл субтитров");
+    const file = path.join(directory, name);
+    const transcript = parseCaptionTranscript(await readFile(file, "utf8"), path.extname(file).slice(1));
+    if (!transcript.trim()) throw new Error("Субтитры не содержат текста");
+    return transcript;
+  }
+
   private async splitAudio(mediaFile: string, directory: string): Promise<string[]> {
     const chunksDirectory = path.join(directory, "chunks");
-    await mkdir(chunksDirectory);
-    const target = path.join(chunksDirectory, "chunk-%04d.flac");
+    await mkdir(chunksDirectory, { recursive: true });
+    const target = path.join(chunksDirectory, "chunk-%04d.mka");
     await this.command(this.configuration.ffmpegExecutable, [
       "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
       "-i", mediaFile,
-      "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac",
+      "-map", "0:a:0", "-vn", "-c:a", "copy",
       "-f", "segment", "-segment_time", String(CHUNK_SECONDS), "-reset_timestamps", "1",
       target,
     ], "Не удалось подготовить аудио");
-    const chunks = (await readdir(chunksDirectory)).filter((name) => /^chunk-\d{4}\.flac$/.test(name)).sort()
+    const chunks = (await readdir(chunksDirectory)).filter((name) => /^chunk-\d{4}\.mka$/.test(name)).sort()
       .map((name) => path.join(chunksDirectory, name));
     if (!chunks.length) throw new Error("ffmpeg не создал аудиофрагменты");
     return chunks;
@@ -173,6 +275,21 @@ export class MediaSummaryService {
     if (this.configuration.mediaCookiesFromBrowser) return ["--cookies-from-browser", this.configuration.mediaCookiesFromBrowser];
     return [];
   }
+
+  private saveCheckpoint(checkpoint: Omit<MediaJobCheckpoint, "createdAt" | "changedAt"> | MediaJobCheckpoint,
+    persistent: boolean): MediaJobCheckpoint {
+    if (persistent) {
+      const { createdAt: _createdAt, changedAt: _changedAt, ...value } = checkpoint as MediaJobCheckpoint;
+      return this.database!.saveMediaJobCheckpoint(value);
+    }
+    const now = Date.now();
+    return { ...checkpoint, createdAt: "createdAt" in checkpoint ? checkpoint.createdAt : now, changedAt: now };
+  }
+
+  private jobDirectory(jobId: string): string {
+    if (!/^[0-9a-f-]{36}$/iu.test(jobId)) throw new Error("Некорректный идентификатор медиазадачи");
+    return path.join(this.configuration.dataDirectory, "media-jobs", jobId);
+  }
 }
 
 export function parseSupportedMediaUrl(value: string): string | undefined {
@@ -200,6 +317,104 @@ export function formatTimestamp(value: number): string {
   const minutes = Math.floor((seconds % 3600) / 60);
   const remainder = seconds % 60;
   return [hours, minutes, remainder].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+export function selectCaptionTrack(value: Record<string, unknown>): MediaCaptionTrack | undefined {
+  const manual = availableCaptionLanguages(value.subtitles);
+  if (manual.length) return { language: preferredCaptionLanguage(manual, false), automatic: false };
+  const automatic = availableCaptionLanguages(value.automatic_captions);
+  if (automatic.length) return { language: preferredCaptionLanguage(automatic, true), automatic: true };
+  return undefined;
+}
+
+export function parseCaptionTranscript(source: string, format: string): string {
+  const cues: Array<{ startSeconds: number; text: string }> = [];
+  if (format.toLowerCase() === "json3") {
+    const parsed = JSON.parse(source) as { events?: unknown };
+    if (!Array.isArray(parsed.events)) return "";
+    for (const event of parsed.events) {
+      if (!event || typeof event !== "object") continue;
+      const item = event as { tStartMs?: unknown; segs?: unknown };
+      if (!Array.isArray(item.segs)) continue;
+      const text = normalizeCaptionText(item.segs.map((segment) => {
+        if (!segment || typeof segment !== "object") return "";
+        const utf8 = (segment as { utf8?: unknown }).utf8;
+        return typeof utf8 === "string" ? utf8 : "";
+      }).join(""));
+      if (text) appendCaptionCue(cues, Number(item.tStartMs) / 1000, text);
+    }
+  } else {
+    for (const block of source.replace(/^\uFEFF/u, "").split(/\r?\n\s*\r?\n/u)) {
+      const lines = block.split(/\r?\n/u).map((line) => line.trim());
+      const timingIndex = lines.findIndex((line) => line.includes("-->"));
+      if (timingIndex < 0) continue;
+      const start = parseCaptionTimestamp(lines[timingIndex]!.split("-->")[0]!.trim());
+      const text = normalizeCaptionText(lines.slice(timingIndex + 1).join(" "));
+      if (Number.isFinite(start) && text) appendCaptionCue(cues, start, text);
+    }
+  }
+  return cues.map((cue) => `[${formatTimestamp(cue.startSeconds)}] ${cue.text}`).join("\n");
+}
+
+function availableCaptionLanguages(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  return Object.entries(value as Record<string, unknown>)
+    .filter(([, tracks]) => Array.isArray(tracks) && tracks.some((track) => {
+      if (!track || typeof track !== "object") return false;
+      const candidate = track as { url?: unknown; data?: unknown };
+      return typeof candidate.url === "string" || typeof candidate.data === "string";
+    }))
+    .map(([language]) => language);
+}
+
+function preferredCaptionLanguage(languages: readonly string[], automatic: boolean): string {
+  const score = (language: string): number => {
+    const normalized = language.toLowerCase();
+    if (automatic && normalized.endsWith("-orig")) return 0;
+    if (normalized === "ru" || normalized.startsWith("ru-")) return 1;
+    if (!automatic && normalized.endsWith("-orig")) return 2;
+    if (normalized === "en" || normalized.startsWith("en-")) return 3;
+    return 4;
+  };
+  return [...languages].sort((left, right) => score(left) - score(right) || left.localeCompare(right))[0]!;
+}
+
+function normalizeCaptionText(value: string): string {
+  return value
+    .replace(/<\/?c(?:\.[^>]*)?>/giu, "")
+    .replace(/<\d{2}:\d{2}:\d{2}[.,]\d{3}>/gu, "")
+    .replace(/<[^>]+>/gu, "")
+    .replace(/&nbsp;|&#160;/giu, " ")
+    .replace(/&amp;/giu, "&")
+    .replace(/&lt;/giu, "<")
+    .replace(/&gt;/giu, ">")
+    .replace(/&quot;/giu, '"')
+    .replace(/&#(?:39|x27);/giu, "'")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function appendCaptionCue(cues: Array<{ startSeconds: number; text: string }>, startSeconds: number, text: string): void {
+  const start = Number.isFinite(startSeconds) && startSeconds >= 0 ? startSeconds : 0;
+  const previous = cues.at(-1);
+  if (previous && start - previous.startSeconds <= 8) {
+    if (text === previous.text || previous.text.startsWith(text)) return;
+    if (text.startsWith(previous.text)) {
+      previous.text = text;
+      return;
+    }
+  }
+  cues.push({ startSeconds: start, text });
+}
+
+function parseCaptionTimestamp(value: string): number {
+  const match = /^(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{3})/u.exec(value);
+  if (!match) return Number.NaN;
+  return Number(match[1] ?? 0) * 3600 + Number(match[2]) * 60 + Number(match[3]) + Number(match[4]) / 1000;
+}
+
+function captionFormatRank(name: string): number {
+  return name.endsWith(".json3") ? 0 : name.endsWith(".vtt") ? 1 : 2;
 }
 
 function formatDuration(value: number): string {

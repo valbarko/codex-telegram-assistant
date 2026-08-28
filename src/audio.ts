@@ -1,6 +1,7 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
@@ -32,6 +33,10 @@ export interface TranscriptionOptions {
   model?: string;
 }
 
+export interface BatchTranscriptionOptions extends TranscriptionOptions {
+  onResult?: (result: AudioTranscript, index: number) => void | Promise<void>;
+}
+
 export async function transcribeAudio(file: string, options: TranscriptionOptions = {}): Promise<string> {
   return (await transcribeAudioDetailed(file, options)).text;
 }
@@ -53,7 +58,92 @@ export async function transcribeAudioDetailed(file: string, options: Transcripti
     timeout: options.timeoutMs ?? 30 * 60_000,
     maxBuffer: 16 * 1024 * 1024,
   });
-  const parsed = JSON.parse(stdout.trim()) as { text?: unknown; segments?: unknown };
+  return parseTranscriptPayload(JSON.parse(stdout.trim()));
+}
+
+export async function transcribeAudioBatchDetailed(files: readonly string[],
+  options: BatchTranscriptionOptions = {}): Promise<AudioTranscript[]> {
+  if (!files.length) return [];
+  const localPython = path.join(process.cwd(), ".venv", "bin", "python");
+  const python = options.python?.trim() || process.env.WHISPER_PYTHON?.trim() || (existsSync(localPython) ? localPython : "python3");
+  const model = options.model?.trim() || process.env.WHISPER_MODEL?.trim() || DEFAULT_MODEL;
+  const language = options.language === undefined ? "ru" : options.language;
+  const program = [
+    "import json,sys",
+    "import mlx_whisper",
+    "model=sys.argv[1]",
+    "detected_language=sys.argv[2] or None",
+    "for index,file in enumerate(sys.argv[3:]):",
+    " result=mlx_whisper.transcribe(file,path_or_hf_repo=model,language=detected_language)",
+    " if detected_language is None: detected_language=result.get('language')",
+    " segments=[{'start':item.get('start',0),'end':item.get('end',0),'text':item.get('text','')} for item in result.get('segments',[])]",
+    " print(json.dumps({'index':index,'text':result.get('text',''),'segments':segments},ensure_ascii=False),flush=True)",
+  ].join("\n");
+  const timeoutMs = options.timeoutMs ?? 30 * 60_000;
+  const child = spawn(python, ["-c", program, model, language ?? "", ...files], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const lines = createInterface({ input: child.stdout });
+  const results: AudioTranscript[] = [];
+  let stderr = "";
+  let settled = false;
+  let timedOut = false;
+  let timer: NodeJS.Timeout;
+  let callbacks = Promise.resolve();
+  const armTimeout = (): void => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+    timer.unref?.();
+  };
+  armTimeout();
+  child.stderr.on("data", (data: Buffer) => {
+    stderr = `${stderr}${data.toString("utf8")}`.slice(-16 * 1024);
+  });
+  lines.on("line", (line) => {
+    armTimeout();
+    callbacks = callbacks.then(async () => {
+      const payload = JSON.parse(line) as { index?: unknown } & Record<string, unknown>;
+      const index = Number(payload.index);
+      if (!Number.isSafeInteger(index) || index !== results.length) throw new Error("Whisper вернул фрагменты в неожиданном порядке");
+      const result = parseTranscriptPayload(payload);
+      results.push(result);
+      await options.onResult?.(result, index);
+    });
+  });
+  return await new Promise<AudioTranscript[]>((resolve, reject) => {
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill("SIGTERM");
+      reject(error);
+    };
+    child.once("error", fail);
+    child.once("close", (code, signal) => {
+      void callbacks.then(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (timedOut) {
+          reject(new Error(`Whisper timeout after ${Math.ceil(timeoutMs / 60_000)} min without a completed fragment`));
+          return;
+        }
+        if (code !== 0 || results.length !== files.length) {
+          const detail = stderr.trim().split(/\r?\n/u).filter(Boolean).at(-1);
+          reject(new Error(detail || `Whisper завершился преждевременно${signal ? ` (${signal})` : ""}`));
+          return;
+        }
+        resolve(results);
+      }).catch(fail);
+    });
+  });
+}
+
+function parseTranscriptPayload(value: unknown): AudioTranscript {
+  const parsed = value as { text?: unknown; segments?: unknown };
   if (typeof parsed.text !== "string" || !parsed.text.trim()) throw new Error("Распознавание вернуло пустой текст");
   const segments = Array.isArray(parsed.segments) ? parsed.segments.map(parseSegment).filter((item): item is TranscriptSegment => Boolean(item)) : [];
   return { text: parsed.text.trim(), segments };

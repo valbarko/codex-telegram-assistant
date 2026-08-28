@@ -84,6 +84,48 @@ describe("AssistantDatabase", () => {
     expect(database.claimAssistantJob(Date.now())).toMatchObject({ id: created.id, progressMessageId: 42, state: "running" });
   });
 
+  it("keeps media checkpoints across process recovery and persists completed chunks", () => {
+    const created = database.enqueueAssistantJob({
+      owner: "1", context: "1", chatId: "1", body: "https://youtu.be/example", prompt: "https://youtu.be/example",
+      fingerprint: "media-example", kind: "media_summary", maxAttempts: 3,
+    }).job;
+    database.saveMediaJobCheckpoint({
+      jobId: created.id,
+      sourceUrl: created.body,
+      stage: "prepared",
+      title: "Видео",
+      durationSeconds: 5_301,
+      mediaPath: "/tmp/source.m4a",
+      chunks: ["/tmp/chunk-0000.mka", "/tmp/chunk-0001.mka"],
+      transcriptParts: ["[00:00:00] Первая часть", null],
+    });
+    database.claimAssistantJob(created.createdAt + 1);
+
+    expect(database.recoverAssistantJobs(created.createdAt + 2)).toEqual({ retried: 1, failed: 0 });
+    expect(database.mediaJobCheckpoint(created.id)).toMatchObject({
+      stage: "prepared",
+      title: "Видео",
+      chunks: ["/tmp/chunk-0000.mka", "/tmp/chunk-0001.mka"],
+      transcriptParts: ["[00:00:00] Первая часть", null],
+    });
+
+    database.saveMediaJobCheckpoint({
+      jobId: created.id,
+      sourceUrl: created.body,
+      stage: "transcribing",
+      title: "Видео",
+      durationSeconds: 5_301,
+      mediaPath: "/tmp/source.m4a",
+      chunks: ["/tmp/chunk-0000.mka", "/tmp/chunk-0001.mka"],
+      transcriptParts: ["[00:00:00] Первая часть", "[00:30:00] Вторая часть"],
+    });
+    expect(database.mediaJobCheckpoint(created.id)?.transcriptParts).toEqual([
+      "[00:00:00] Первая часть", "[00:30:00] Вторая часть",
+    ]);
+    expect(database.deleteMediaJobCheckpoint(created.id)).toBe(true);
+    expect(database.mediaJobCheckpoint(created.id)).toBeUndefined();
+  });
+
   it("persists the voice-writing mode per Telegram context", () => {
     expect(database.voiceWritingSettings("1:42", "1")).toMatchObject({ mode: "transcript" });
     database.setVoiceWritingSettings({ context: "1:42", owner: "1", mode: "diary" });

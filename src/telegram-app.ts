@@ -98,7 +98,7 @@ export class TelegramApplication {
     this.forwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueForwardedVoiceBatch(batch));
     this.restrictedForwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueRestrictedForwardedVoiceBatch(batch));
     this.restrictedTextEditor = new EphemeralTextEditor(configuration);
-    this.mediaSummary = new MediaSummaryService(configuration, this.restrictedTextEditor);
+    this.mediaSummary = new MediaSummaryService(configuration, database, this.restrictedTextEditor);
     this.workTaskArchive = new WorkTaskArchive(configuration.writingArchiveDirectory);
     this.articleIdeas = new ArticleIdeaService(configuration, hub);
     this.assistantJobs = new AssistantJobWorker(database, {
@@ -947,26 +947,38 @@ export class TelegramApplication {
 
   private async mediaSummaryMessage(ctx: Context, sourceUrl: string): Promise<void> {
     if (!ctx.chat) return;
-    const progress = await ctx.reply("🔎 Проверяю видео…");
-    let lastStatus = "";
-    const updateProgress = async (state: MediaSummaryProgress): Promise<void> => {
-      const status = mediaSummaryProgressText(state);
-      if (status === lastStatus) return;
-      lastStatus = status;
-      await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, status).catch(() => undefined);
-    };
+    const normalizedUrl = parseSupportedMediaUrl(sourceUrl);
+    if (!normalizedUrl) return;
+    const result = this.database.enqueueAssistantJob({
+      owner: ownerId(ctx),
+      context: contextId(ctx),
+      chatId: String(ctx.chat.id),
+      messageThreadId: ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id,
+      sourceUpdateId: ctx.update.update_id,
+      body: normalizedUrl,
+      prompt: normalizedUrl,
+      fingerprint: assistantRequestFingerprint(`media-summary:${normalizedUrl}`),
+      kind: "media_summary",
+      workspace: this.memoryProject(ctx),
+      maxAttempts: this.configuration.assistantJobMaxAttempts,
+      nextAttemptAt: Date.now() + 60_000,
+    });
+    if (result.duplicate) {
+      if (result.job.sourceUpdateId !== ctx.update.update_id) {
+        await ctx.reply(result.job.state === "running" ? "Это видео уже обрабатывается." : "Это видео уже стоит в очереди.");
+      }
+      return;
+    }
     try {
-      const result = await this.mediaSummary.summarize(sourceUrl, updateProgress);
-      await ctx.api.deleteMessage(ctx.chat.id, progress.message_id).catch(() => undefined);
-      await sendTelegramMarkdown(ctx.api, ctx.chat.id, result.markdown, TELEGRAM_LIMIT - 100);
-      await this.memory.record({
-        owner: ownerId(ctx), body: result.markdown, role: "assistant", kind: "response",
-        project: this.memoryProject(ctx), source: "media-summary",
-      });
+      const counts = this.database.assistantJobCounts();
+      const queued = counts.running + counts.queued + counts.retryWait;
+      const message = await ctx.reply(`Видео принято.${queued > 1 ? ` Перед ним в очереди: ${queued - 1}.` : " Начинаю."}`);
+      this.database.updateAssistantJobProgressMessage(result.job.id, message.message_id);
     } catch (error) {
-      logInternalError("Media summary failed", error);
-      await ctx.api.editMessageText(ctx.chat.id, progress.message_id,
-        publicErrorMessage("media-summary")).catch(() => undefined);
+      logInternalError("Media summary job acknowledgement failed", error);
+    } finally {
+      this.database.releaseAssistantJob(result.job.id);
+      this.assistantJobs.notify();
     }
   }
 
@@ -1124,6 +1136,7 @@ export class TelegramApplication {
   }
 
   private async executeAssistantJob(job: AssistantJob): Promise<string> {
+    if (job.kind === "media_summary") return this.executeMediaSummaryJob(job);
     const ctx = this.assistantJobContext(job);
     const conversation = await this.conversationFor(job.context);
     if (job.workspace && conversation.snapshot().workspace !== job.workspace) conversation.selectWorkspace(job.workspace);
@@ -1168,6 +1181,40 @@ export class TelegramApplication {
     }
   }
 
+  private async executeMediaSummaryJob(job: AssistantJob): Promise<string> {
+    let lastStatus = "";
+    const touch = (): void => this.database.touchAssistantJob(job.id);
+    const heartbeat = setInterval(touch, 15_000);
+    heartbeat.unref?.();
+    try {
+      touch();
+      const result = await this.mediaSummary.summarize(job.body, async (progress) => {
+        touch();
+        const status = mediaSummaryProgressText(progress);
+        if (status === lastStatus) return;
+        lastStatus = status;
+        await this.updateAssistantJobMessage(job, status).catch((error) => {
+          logInternalError("Media summary progress update failed", error);
+        });
+      }, job.id);
+      await this.memory.upsertExternal({
+        owner: job.owner,
+        body: result.markdown,
+        role: "assistant",
+        kind: "response",
+        project: job.workspace ?? this.database.conversation(job.context)?.workspace,
+        source: `media-summary:${job.id}`,
+        sourceChangedAt: job.createdAt,
+      });
+      return result.markdown;
+    } catch (error) {
+      logInternalError(`Media summary job ${job.id} failed`, error);
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }
+
   private async announceAssistantSuccess(job: AssistantJob, answer: string): Promise<void> {
     for (const chunk of telegramMarkdownChunks(answer, TELEGRAM_LIMIT - 100)) {
       await this.bot.api.sendMessage(Number(job.chatId), chunk.html, {
@@ -1181,11 +1228,15 @@ export class TelegramApplication {
     if (job.progressMessageId) {
       await this.bot.api.deleteMessage(Number(job.chatId), job.progressMessageId).catch(() => undefined);
     }
+    if (job.kind === "media_summary") {
+      await this.mediaSummary.cleanup(job.id).catch((error) => logInternalError("Media summary cleanup failed", error));
+    }
   }
 
   private async announceAssistantRetry(job: AssistantJob, _failure: AssistantJobFailure, retryAt: number): Promise<void> {
     const seconds = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
-    await this.updateAssistantJobMessage(job, `⚠️ Codex перестал отвечать. Автоматически повторю через ${seconds} сек.`);
+    const subject = job.kind === "media_summary" ? "Обработка видео прервалась" : "Codex перестал отвечать";
+    await this.updateAssistantJobMessage(job, `⚠️ ${subject}. Автоматически повторю через ${seconds} сек.`);
   }
 
   private async announceAssistantFailure(job: AssistantJob, failure: AssistantJobFailure): Promise<void> {
@@ -1209,6 +1260,7 @@ export class TelegramApplication {
     }
     const message = await this.bot.api.sendMessage(Number(job.chatId), text, telegramPlainOptions(job.messageThreadId));
     this.database.updateAssistantJobProgressMessage(job.id, message.message_id);
+    job.progressMessageId = message.message_id;
   }
 
   private async retryAssistantJob(ctx: Context): Promise<void> {
