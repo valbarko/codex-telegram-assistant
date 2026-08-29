@@ -415,6 +415,7 @@ export class TelegramApplication {
       if (bytes.byteLength > this.configuration.maxUploadBytes) throw new Error("Файл превышает допустимый размер");
       await writeFile(target, bytes);
       const raw = await transcribeAudio(target, {
+        fluidAudioExecutable: this.configuration.fluidAudioExecutable,
         python: this.configuration.whisperPython,
         model: this.configuration.whisperModel,
       });

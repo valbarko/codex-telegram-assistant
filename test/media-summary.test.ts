@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import { mediaPartSummaryPrompt, mediaSummaryPrompt } from "../src/ephemeral-text-editor.js";
-import { fluidAudioArguments, formatTimestamp, formatTimestampedTranscript, MEDIA_FORMAT_SELECTOR, parseCaptionTranscript,
-  parseFluidAudioTranscript, parseSupportedMediaUrl, selectCaptionTrack, shouldUseFluidAudio } from "../src/media-summary.js";
+import { fluidAudioArguments, parseFluidAudioTranscript } from "../src/fluid-audio.js";
+import { formatTimestamp, formatTimestampedTranscript, MEDIA_FORMAT_SELECTOR, parseCaptionTranscript,
+  parseSupportedMediaUrl, selectCaptionTrack, shouldUseFluidAudio } from "../src/media-summary.js";
 
 describe("parseSupportedMediaUrl", () => {
   it.each([

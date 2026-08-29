@@ -4,6 +4,8 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
+import { transcribeWithFluidAudioDetailed } from "./fluid-audio.js";
+
 const execute = promisify(execFile);
 const DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo";
 
@@ -31,6 +33,7 @@ export interface TranscriptionOptions {
   timeoutMs?: number;
   python?: string;
   model?: string;
+  fluidAudioExecutable?: string;
 }
 
 export interface BatchTranscriptionOptions extends TranscriptionOptions {
@@ -42,6 +45,22 @@ export async function transcribeAudio(file: string, options: TranscriptionOption
 }
 
 export async function transcribeAudioDetailed(file: string, options: TranscriptionOptions = {}): Promise<AudioTranscript> {
+  const fluidAudioExecutable = options.fluidAudioExecutable?.trim();
+  if (fluidAudioExecutable && options.language !== null) {
+    try {
+      return await transcribeWithFluidAudioDetailed(file, {
+        executable: fluidAudioExecutable,
+        language: options.language,
+        timeoutMs: options.timeoutMs,
+      });
+    } catch (error) {
+      console.warn("FluidAudio transcription failed; falling back to MLX Whisper", error);
+    }
+  }
+  return transcribeWithMlxWhisperDetailed(file, options);
+}
+
+async function transcribeWithMlxWhisperDetailed(file: string, options: TranscriptionOptions): Promise<AudioTranscript> {
   const localPython = path.join(process.cwd(), ".venv", "bin", "python");
   const python = options.python?.trim() || process.env.WHISPER_PYTHON?.trim() || (existsSync(localPython) ? localPython : "python3");
   const model = options.model?.trim() || process.env.WHISPER_MODEL?.trim() || DEFAULT_MODEL;
