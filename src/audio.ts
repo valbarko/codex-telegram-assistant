@@ -27,6 +27,12 @@ export interface AudioTranscript {
   segments: readonly TranscriptSegment[];
 }
 
+export type AudioTranscriptionEngine = "fluid-audio" | "mlx-whisper";
+
+export interface DetailedAudioTranscript extends AudioTranscript {
+  engine: AudioTranscriptionEngine;
+}
+
 export interface TranscriptionOptions {
   /** `null` enables Whisper language auto-detection. The default preserves the existing Russian voice-message behavior. */
   language?: string | null;
@@ -44,20 +50,22 @@ export async function transcribeAudio(file: string, options: TranscriptionOption
   return (await transcribeAudioDetailed(file, options)).text;
 }
 
-export async function transcribeAudioDetailed(file: string, options: TranscriptionOptions = {}): Promise<AudioTranscript> {
+export async function transcribeAudioDetailed(file: string,
+  options: TranscriptionOptions = {}): Promise<DetailedAudioTranscript> {
   const fluidAudioExecutable = options.fluidAudioExecutable?.trim();
   if (fluidAudioExecutable && options.language !== null) {
     try {
-      return await transcribeWithFluidAudioDetailed(file, {
+      const result = await transcribeWithFluidAudioDetailed(file, {
         executable: fluidAudioExecutable,
         language: options.language,
         timeoutMs: options.timeoutMs,
       });
+      return { ...result, engine: "fluid-audio" };
     } catch (error) {
       console.warn("FluidAudio transcription failed; falling back to MLX Whisper", error);
     }
   }
-  return transcribeWithMlxWhisperDetailed(file, options);
+  return { ...await transcribeWithMlxWhisperDetailed(file, options), engine: "mlx-whisper" };
 }
 
 async function transcribeWithMlxWhisperDetailed(file: string, options: TranscriptionOptions): Promise<AudioTranscript> {

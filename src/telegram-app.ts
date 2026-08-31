@@ -12,7 +12,8 @@ import { articleBankExecutionPrompt, isArticleBankDeliveryRequest, snapshotArtic
   validateArticleBankDelivery } from "./article-bank-job.js";
 import type { AppConfiguration } from "./configuration.js";
 import { ArticleIdeaService, isArticleIdeaRequest, type CapturedArticleIdea } from "./article-idea.js";
-import { formatPlainTranscript, formatVoiceTranscript, structureTranscript, transcribeAudio } from "./audio.js";
+import { formatPlainTranscript, formatVoiceTranscript, structureTranscript, transcribeAudioDetailed,
+  type AudioTranscriptionEngine } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
 import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
@@ -402,6 +403,12 @@ export class TelegramApplication {
       await ctx.reply("Файл слишком большой для распознавания.");
       return;
     }
+    const startedAt = Date.now();
+    let downloadedAt: number | undefined;
+    let transcribedAt: number | undefined;
+    let transcriptionEngine: AudioTranscriptionEngine | undefined;
+    let transcriptCharacters: number | undefined;
+    let route = "failed";
     const progress = await ctx.reply("🎙 Расшифровываю голосовое…");
     const directory = await mkdtemp(path.join(os.tmpdir(), "codex-audio-"));
     const extension = ctx.message?.voice ? ".ogg" : path.extname(ctx.message?.audio?.file_name ?? "") || ".audio";
@@ -414,11 +421,16 @@ export class TelegramApplication {
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (bytes.byteLength > this.configuration.maxUploadBytes) throw new Error("Файл превышает допустимый размер");
       await writeFile(target, bytes);
-      const raw = await transcribeAudio(target, {
+      downloadedAt = Date.now();
+      const transcript = await transcribeAudioDetailed(target, {
         fluidAudioExecutable: this.configuration.fluidAudioExecutable,
         python: this.configuration.whisperPython,
         model: this.configuration.whisperModel,
       });
+      const raw = transcript.text;
+      transcribedAt = Date.now();
+      transcriptionEngine = transcript.engine;
+      transcriptCharacters = raw.length;
       const forwarded = forwardedSource(ctx);
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : Date.now());
@@ -437,17 +449,22 @@ export class TelegramApplication {
             messageThreadId: ctx.message?.message_thread_id,
           };
           const count = this.restrictedForwardedVoiceBatcher.add(batchKey, fragment);
+          route = "restricted-forwarded-batch";
           await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
             `🎙 Фрагмент ${count} принят · собираю пересылки ещё 45 секунд…`).catch(() => undefined);
           return;
         }
+        route = "restricted-transcript";
         await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, await this.formatSourceText(raw));
+        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, formatPlainTranscript(raw));
         return;
       }
       const command = parseSpokenVoiceCommand(raw);
       if (!forwarded.key && (command.kind === "assistant" || command.kind === "blog") && command.label) {
-        if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
+        if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) {
+          route = `command:${command.kind}`;
+          return;
+        }
       }
       const voiceMemory = {
         owner: ownerId(ctx),
@@ -483,18 +500,35 @@ export class TelegramApplication {
           messageThreadId: ctx.message?.message_thread_id,
         };
         const count = this.forwardedVoiceBatcher.add(batchKey, fragment);
+        route = "forwarded-batch";
         await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
           `🎙 Фрагмент ${count} принят · собираю пересылки ещё 45 секунд…`).catch(() => undefined);
         return;
       }
-      if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
+      if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) {
+        route = `command:${command.kind}`;
+        return;
+      }
+      route = "direct-transcript";
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatPlainTranscript(command.content), TELEGRAM_LIMIT - 100);
     } catch (error) {
       console.error("Voice transcription failed", error);
       await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, publicTranscriptionErrorMessage(error)).catch(() => undefined);
     } finally {
       await rm(directory, { recursive: true, force: true });
+      const finishedAt = Date.now();
+      console.info("[voice-timing]", JSON.stringify({
+        updateId: ctx.update.update_id,
+        audioDurationSeconds: media.duration,
+        route,
+        engine: transcriptionEngine,
+        transcriptCharacters,
+        downloadMs: downloadedAt === undefined ? undefined : downloadedAt - startedAt,
+        transcribeMs: downloadedAt === undefined || transcribedAt === undefined ? undefined : transcribedAt - downloadedAt,
+        postprocessMs: transcribedAt === undefined ? undefined : finishedAt - transcribedAt,
+        totalMs: finishedAt - startedAt,
+      }));
     }
   }
 
@@ -627,7 +661,7 @@ export class TelegramApplication {
     }
     if (command.kind === "transcript") {
       await clearProgress();
-      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatPlainTranscript(command.content), TELEGRAM_LIMIT - 100);
       return true;
     }
     if (command.kind === "blog") {
@@ -822,15 +856,6 @@ export class TelegramApplication {
     await ctx.replyWithDocument(new InputFile(Buffer.from(day.markdown, "utf8"), day.fileName), {
       caption: "Markdown дневника за сегодня",
     });
-  }
-
-  private async formatPersonalText(source: string): Promise<string> {
-    try {
-      return await this.restrictedTextEditor.formatPersonalText(source);
-    } catch (error) {
-      logInternalError("Personal text editing failed; using deterministic formatting", error);
-      return formatPlainTranscript(source);
-    }
   }
 
   private async formatBlogText(source: string): Promise<string> {

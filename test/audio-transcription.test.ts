@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { transcribeAudio } from "../src/audio.js";
+import { transcribeAudio, transcribeAudioDetailed } from "../src/audio.js";
 
 const folders: string[] = [];
 
@@ -24,12 +24,12 @@ describe("FluidAudio-first voice transcription", () => {
       "printf '%s\\n' '{\"text\":\"Текст из FluidAudio\",\"wordTimings\":[]}' > \"$8\"",
     ].join("\n"));
 
-    const result = await transcribeAudio(audio, {
+    const result = await transcribeAudioDetailed(audio, {
       fluidAudioExecutable: fluidAudio,
       python: path.join(directory, "missing-python"),
     });
 
-    expect(result).toBe("Текст из FluidAudio");
+    expect(result).toMatchObject({ text: "Текст из FluidAudio", engine: "fluid-audio" });
     expect((await readdir(directory)).some((name) => name.startsWith(".fluid-transcript-"))).toBe(false);
   });
 
@@ -46,13 +46,13 @@ describe("FluidAudio-first voice transcription", () => {
     ].join("\n"));
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    const result = await transcribeAudio(audio, {
+    const result = await transcribeAudioDetailed(audio, {
       fluidAudioExecutable: fluidAudio,
       python,
       model: "test-model",
     });
 
-    expect(result).toBe("Текст из MLX Whisper");
+    expect(result).toMatchObject({ text: "Текст из MLX Whisper", engine: "mlx-whisper" });
     expect(warning).toHaveBeenCalledWith("FluidAudio transcription failed; falling back to MLX Whisper", expect.any(Error));
     expect((await readdir(directory)).some((name) => name.startsWith(".fluid-transcript-"))).toBe(false);
   });
