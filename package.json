@@ -28,6 +28,7 @@
     "hindsight:logs": "docker compose --env-file .env -f infra/hindsight/compose.yaml logs --tail=100 hindsight",
     "hindsight:smoke": "tsx src/hindsight-smoke.ts",
     "hindsight:backfill": "tsx src/hindsight-backfill.ts",
+    "fluid-audio:install": "scripts/install-fluidaudio-cli.sh",
     "article:backfill": "tsx src/article-idea-cli.ts",
     "telegram:connect": "tsx src/telegram-reader-cli.ts connect",
     "telegram:connect-qr": "tsx src/telegram-reader-cli.ts connect-qr",

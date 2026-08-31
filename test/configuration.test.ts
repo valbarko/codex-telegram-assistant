@@ -27,7 +27,9 @@ describe("readConfiguration", () => {
     expect(config.profiles.map((profile) => profile.id)).toEqual(["default", "review", "readonly"]);
     expect(config).toMatchObject({ weatherLocation: "Москва", weatherLatitude: 55.7558, weatherLongitude: 37.6173 });
     expect(config).toMatchObject({
-      mediaDownloaderExecutable: "yt-dlp", ffmpegExecutable: "ffmpeg", mediaSummaryMaxDurationSeconds: 21_600,
+      mediaDownloaderExecutable: "yt-dlp", ffmpegExecutable: "ffmpeg",
+      fluidAudioExecutable: "/home/person/.local/share/codex-telegram-assistant/bin/fluidaudiocli",
+      mediaSummaryMaxDurationSeconds: 21_600,
     });
     expect(config).toMatchObject({
       articleBankDirectory: "/home/person/WORK/valentin-writing",
@@ -52,11 +54,11 @@ describe("readConfiguration", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
     const config = readConfiguration(cwd, {
       TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12",
-      MEDIA_DOWNLOADER_BIN: "/opt/bin/yt-dlp", FFMPEG_BIN: "/opt/bin/ffmpeg",
+      MEDIA_DOWNLOADER_BIN: "/opt/bin/yt-dlp", FFMPEG_BIN: "/opt/bin/ffmpeg", FLUIDAUDIO_BIN: "/opt/bin/fluid",
       MEDIA_SUMMARY_MAX_DURATION_SECONDS: "10800", MEDIA_COOKIES_FROM_BROWSER: "chrome:Profile 1",
     });
     expect(config).toMatchObject({
-      mediaDownloaderExecutable: "/opt/bin/yt-dlp", ffmpegExecutable: "/opt/bin/ffmpeg",
+      mediaDownloaderExecutable: "/opt/bin/yt-dlp", ffmpegExecutable: "/opt/bin/ffmpeg", fluidAudioExecutable: "/opt/bin/fluid",
       mediaSummaryMaxDurationSeconds: 10_800, mediaCookiesFromBrowser: "chrome:Profile 1",
     });
   });

@@ -38,7 +38,7 @@ The application is a private-by-default Telegram client for a local Codex instal
 ### Inputs and artifacts
 
 - Unlabelled voice and audio are transcription-only. A label at the start of a voice or text message routes only that message; there is no persistent voice mode.
-- Voice output contains sender/date metadata when Telegram supplies it, concise summary bullets, and a structured transcript with meaningful bold emphasis.
+- Direct unlabelled voice output contains only locally normalized prose and does not start Codex. Forwarded packages may include sender/date metadata, concise summary bullets, and a structured transcript with meaningful emphasis.
 - Rapidly forwarded voice messages from one original sender are buffered for 45 seconds and grouped while consecutive source timestamps remain within 10 minutes. Files are transcribed independently, ordered by source time, and formatted by Codex as one coherent transcript or multiple topic sections. Forwarded speech never executes spoken commands.
 - Supported text and spoken labels include post, announcement, reply, diary, story, calendar, task, reminder, inbox/idea, and memory. Diary, story, post, announcement, and reply labels use dedicated read-only Codex editorial threads without modifying the user's active project conversation.
 - Post, announcement, and reply labels retrieve relevant examples from an ignored private corpus, apply the versioned authorial profile, and return a ready Telegram draft. Examples influence voice and rhythm only: their facts and distinctive passages must not be copied. Retrieval falls back to the private local JSONL corpus if semantic search is unavailable.

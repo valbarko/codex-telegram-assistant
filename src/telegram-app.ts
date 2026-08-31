@@ -12,7 +12,8 @@ import { articleBankExecutionPrompt, isArticleBankDeliveryRequest, snapshotArtic
   validateArticleBankDelivery } from "./article-bank-job.js";
 import type { AppConfiguration } from "./configuration.js";
 import { ArticleIdeaService, isArticleIdeaRequest, type CapturedArticleIdea } from "./article-idea.js";
-import { formatPlainTranscript, formatVoiceTranscript, structureTranscript, transcribeAudio } from "./audio.js";
+import { formatPlainTranscript, formatVoiceTranscript, structureTranscript, transcribeAudioDetailed,
+  type AudioTranscriptionEngine } from "./audio.js";
 import { CodexHub, type ApprovalChoice, type ApprovalPrompt, type Conversation, type StoredThread, type TurnObserver,
   type UserInputAnswers, type UserInputPrompt, type UserInputQuestion } from "./codex-engine.js";
 import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
@@ -98,7 +99,7 @@ export class TelegramApplication {
     this.forwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueForwardedVoiceBatch(batch));
     this.restrictedForwardedVoiceBatcher = new ForwardedVoiceBatcher((batch) => this.enqueueRestrictedForwardedVoiceBatch(batch));
     this.restrictedTextEditor = new EphemeralTextEditor(configuration);
-    this.mediaSummary = new MediaSummaryService(configuration, this.restrictedTextEditor);
+    this.mediaSummary = new MediaSummaryService(configuration, database, this.restrictedTextEditor);
     this.workTaskArchive = new WorkTaskArchive(configuration.writingArchiveDirectory);
     this.articleIdeas = new ArticleIdeaService(configuration, hub);
     this.assistantJobs = new AssistantJobWorker(database, {
@@ -402,6 +403,12 @@ export class TelegramApplication {
       await ctx.reply("Файл слишком большой для распознавания.");
       return;
     }
+    const startedAt = Date.now();
+    let downloadedAt: number | undefined;
+    let transcribedAt: number | undefined;
+    let transcriptionEngine: AudioTranscriptionEngine | undefined;
+    let transcriptCharacters: number | undefined;
+    let route = "failed";
     const progress = await ctx.reply("🎙 Расшифровываю голосовое…");
     const directory = await mkdtemp(path.join(os.tmpdir(), "codex-audio-"));
     const extension = ctx.message?.voice ? ".ogg" : path.extname(ctx.message?.audio?.file_name ?? "") || ".audio";
@@ -414,10 +421,16 @@ export class TelegramApplication {
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (bytes.byteLength > this.configuration.maxUploadBytes) throw new Error("Файл превышает допустимый размер");
       await writeFile(target, bytes);
-      const raw = await transcribeAudio(target, {
+      downloadedAt = Date.now();
+      const transcript = await transcribeAudioDetailed(target, {
+        fluidAudioExecutable: this.configuration.fluidAudioExecutable,
         python: this.configuration.whisperPython,
         model: this.configuration.whisperModel,
       });
+      const raw = transcript.text;
+      transcribedAt = Date.now();
+      transcriptionEngine = transcript.engine;
+      transcriptCharacters = raw.length;
       const forwarded = forwardedSource(ctx);
       const sender = forwarded.sender || [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || undefined;
       const sentAt = forwarded.time || (ctx.message?.date ? ctx.message.date * 1000 : Date.now());
@@ -436,17 +449,22 @@ export class TelegramApplication {
             messageThreadId: ctx.message?.message_thread_id,
           };
           const count = this.restrictedForwardedVoiceBatcher.add(batchKey, fragment);
+          route = "restricted-forwarded-batch";
           await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
             `🎙 Фрагмент ${count} принят · собираю пересылки ещё 45 секунд…`).catch(() => undefined);
           return;
         }
+        route = "restricted-transcript";
         await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, await this.formatSourceText(raw));
+        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, formatPlainTranscript(raw));
         return;
       }
       const command = parseSpokenVoiceCommand(raw);
       if (!forwarded.key && (command.kind === "assistant" || command.kind === "blog") && command.label) {
-        if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
+        if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) {
+          route = `command:${command.kind}`;
+          return;
+        }
       }
       const voiceMemory = {
         owner: ownerId(ctx),
@@ -482,18 +500,35 @@ export class TelegramApplication {
           messageThreadId: ctx.message?.message_thread_id,
         };
         const count = this.forwardedVoiceBatcher.add(batchKey, fragment);
+        route = "forwarded-batch";
         await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
           `🎙 Фрагмент ${count} принят · собираю пересылки ещё 45 секунд…`).catch(() => undefined);
         return;
       }
-      if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) return;
+      if (await this.handleLabeledCommand(ctx, command, raw, sentAt, sender, progress.message_id, "voice")) {
+        route = `command:${command.kind}`;
+        return;
+      }
+      route = "direct-transcript";
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatPlainTranscript(command.content), TELEGRAM_LIMIT - 100);
     } catch (error) {
       console.error("Voice transcription failed", error);
       await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, publicTranscriptionErrorMessage(error)).catch(() => undefined);
     } finally {
       await rm(directory, { recursive: true, force: true });
+      const finishedAt = Date.now();
+      console.info("[voice-timing]", JSON.stringify({
+        updateId: ctx.update.update_id,
+        audioDurationSeconds: media.duration,
+        route,
+        engine: transcriptionEngine,
+        transcriptCharacters,
+        downloadMs: downloadedAt === undefined ? undefined : downloadedAt - startedAt,
+        transcribeMs: downloadedAt === undefined || transcribedAt === undefined ? undefined : transcribedAt - downloadedAt,
+        postprocessMs: transcribedAt === undefined ? undefined : finishedAt - transcribedAt,
+        totalMs: finishedAt - startedAt,
+      }));
     }
   }
 
@@ -626,7 +661,7 @@ export class TelegramApplication {
     }
     if (command.kind === "transcript") {
       await clearProgress();
-      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, await this.formatPersonalText(command.content), TELEGRAM_LIMIT - 100);
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatPlainTranscript(command.content), TELEGRAM_LIMIT - 100);
       return true;
     }
     if (command.kind === "blog") {
@@ -823,15 +858,6 @@ export class TelegramApplication {
     });
   }
 
-  private async formatPersonalText(source: string): Promise<string> {
-    try {
-      return await this.restrictedTextEditor.formatPersonalText(source);
-    } catch (error) {
-      logInternalError("Personal text editing failed; using deterministic formatting", error);
-      return formatPlainTranscript(source);
-    }
-  }
-
   private async formatBlogText(source: string): Promise<string> {
     try {
       return await this.restrictedTextEditor.formatBlogText(source);
@@ -947,26 +973,38 @@ export class TelegramApplication {
 
   private async mediaSummaryMessage(ctx: Context, sourceUrl: string): Promise<void> {
     if (!ctx.chat) return;
-    const progress = await ctx.reply("🔎 Проверяю видео…");
-    let lastStatus = "";
-    const updateProgress = async (state: MediaSummaryProgress): Promise<void> => {
-      const status = mediaSummaryProgressText(state);
-      if (status === lastStatus) return;
-      lastStatus = status;
-      await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, status).catch(() => undefined);
-    };
+    const normalizedUrl = parseSupportedMediaUrl(sourceUrl);
+    if (!normalizedUrl) return;
+    const result = this.database.enqueueAssistantJob({
+      owner: ownerId(ctx),
+      context: contextId(ctx),
+      chatId: String(ctx.chat.id),
+      messageThreadId: ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id,
+      sourceUpdateId: ctx.update.update_id,
+      body: normalizedUrl,
+      prompt: normalizedUrl,
+      fingerprint: assistantRequestFingerprint(`media-summary:${normalizedUrl}`),
+      kind: "media_summary",
+      workspace: this.memoryProject(ctx),
+      maxAttempts: this.configuration.assistantJobMaxAttempts,
+      nextAttemptAt: Date.now() + 60_000,
+    });
+    if (result.duplicate) {
+      if (result.job.sourceUpdateId !== ctx.update.update_id) {
+        await ctx.reply(result.job.state === "running" ? "Это видео уже обрабатывается." : "Это видео уже стоит в очереди.");
+      }
+      return;
+    }
     try {
-      const result = await this.mediaSummary.summarize(sourceUrl, updateProgress);
-      await ctx.api.deleteMessage(ctx.chat.id, progress.message_id).catch(() => undefined);
-      await sendTelegramMarkdown(ctx.api, ctx.chat.id, result.markdown, TELEGRAM_LIMIT - 100);
-      await this.memory.record({
-        owner: ownerId(ctx), body: result.markdown, role: "assistant", kind: "response",
-        project: this.memoryProject(ctx), source: "media-summary",
-      });
+      const counts = this.database.assistantJobCounts();
+      const queued = counts.running + counts.queued + counts.retryWait;
+      const message = await ctx.reply(`Видео принято.${queued > 1 ? ` Перед ним в очереди: ${queued - 1}.` : " Начинаю."}`);
+      this.database.updateAssistantJobProgressMessage(result.job.id, message.message_id);
     } catch (error) {
-      logInternalError("Media summary failed", error);
-      await ctx.api.editMessageText(ctx.chat.id, progress.message_id,
-        publicErrorMessage("media-summary")).catch(() => undefined);
+      logInternalError("Media summary job acknowledgement failed", error);
+    } finally {
+      this.database.releaseAssistantJob(result.job.id);
+      this.assistantJobs.notify();
     }
   }
 
@@ -1124,6 +1162,7 @@ export class TelegramApplication {
   }
 
   private async executeAssistantJob(job: AssistantJob): Promise<string> {
+    if (job.kind === "media_summary") return this.executeMediaSummaryJob(job);
     const ctx = this.assistantJobContext(job);
     const conversation = await this.conversationFor(job.context);
     if (job.workspace && conversation.snapshot().workspace !== job.workspace) conversation.selectWorkspace(job.workspace);
@@ -1168,6 +1207,40 @@ export class TelegramApplication {
     }
   }
 
+  private async executeMediaSummaryJob(job: AssistantJob): Promise<string> {
+    let lastStatus = "";
+    const touch = (): void => this.database.touchAssistantJob(job.id);
+    const heartbeat = setInterval(touch, 15_000);
+    heartbeat.unref?.();
+    try {
+      touch();
+      const result = await this.mediaSummary.summarize(job.body, async (progress) => {
+        touch();
+        const status = mediaSummaryProgressText(progress);
+        if (status === lastStatus) return;
+        lastStatus = status;
+        await this.updateAssistantJobMessage(job, status).catch((error) => {
+          logInternalError("Media summary progress update failed", error);
+        });
+      }, job.id);
+      await this.memory.upsertExternal({
+        owner: job.owner,
+        body: result.markdown,
+        role: "assistant",
+        kind: "response",
+        project: job.workspace ?? this.database.conversation(job.context)?.workspace,
+        source: `media-summary:${job.id}`,
+        sourceChangedAt: job.createdAt,
+      });
+      return result.markdown;
+    } catch (error) {
+      logInternalError(`Media summary job ${job.id} failed`, error);
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }
+
   private async announceAssistantSuccess(job: AssistantJob, answer: string): Promise<void> {
     for (const chunk of telegramMarkdownChunks(answer, TELEGRAM_LIMIT - 100)) {
       await this.bot.api.sendMessage(Number(job.chatId), chunk.html, {
@@ -1181,11 +1254,15 @@ export class TelegramApplication {
     if (job.progressMessageId) {
       await this.bot.api.deleteMessage(Number(job.chatId), job.progressMessageId).catch(() => undefined);
     }
+    if (job.kind === "media_summary") {
+      await this.mediaSummary.cleanup(job.id).catch((error) => logInternalError("Media summary cleanup failed", error));
+    }
   }
 
   private async announceAssistantRetry(job: AssistantJob, _failure: AssistantJobFailure, retryAt: number): Promise<void> {
     const seconds = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
-    await this.updateAssistantJobMessage(job, `⚠️ Codex перестал отвечать. Автоматически повторю через ${seconds} сек.`);
+    const subject = job.kind === "media_summary" ? "Обработка видео прервалась" : "Codex перестал отвечать";
+    await this.updateAssistantJobMessage(job, `⚠️ ${subject}. Автоматически повторю через ${seconds} сек.`);
   }
 
   private async announceAssistantFailure(job: AssistantJob, failure: AssistantJobFailure): Promise<void> {
@@ -1209,6 +1286,7 @@ export class TelegramApplication {
     }
     const message = await this.bot.api.sendMessage(Number(job.chatId), text, telegramPlainOptions(job.messageThreadId));
     this.database.updateAssistantJobProgressMessage(job.id, message.message_id);
+    job.progressMessageId = message.message_id;
   }
 
   private async retryAssistantJob(ctx: Context): Promise<void> {

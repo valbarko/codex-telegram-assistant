@@ -8,7 +8,7 @@ This repository is an independent implementation with its own source structure, 
 
 - **Codex from Telegram:** create, resume, queue, interrupt, and hand off threads with separate contexts for chats and forum topics.
 - **Live agent interaction:** stream answers and handle command, file, user-input, and permission approvals without returning to the Mac.
-- **Voice-first writing:** transcribe locally with MLX Whisper, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
+- **Voice-first writing:** transcribe locally with FluidAudio Parakeet v3 and an automatic MLX Whisper fallback, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
 - **Video-link summaries:** turn a standalone YouTube, RuTube, or VK Video link into a personal Russian-language summary with key ideas, useful takeaways, actions, and selected source timestamps.
 - **Style-aware drafts:** turn a text or voice note beginning with `Блог`, `Пост`, `Анонс`, or `Ответ` into a clean Telegram-ready text using a private, locally indexed corpus of the owner's accepted writing.
 - **Forwarded voice packages:** collect rapidly forwarded voice messages from the same original sender, preserve their order, and use Codex to merge one topic or split genuine topic changes.
@@ -32,7 +32,7 @@ This repository is an independent implementation with its own source structure, 
 - A Telegram bot token from BotFather
 - MemSearch with local ONNX embeddings (`uv tool install "memsearch[onnx]"`)
 - Optional Hindsight knowledge layer: a Docker runtime, ChatGPT Plus/Pro, and a dedicated Codex login
-- Optional voice support: Python with `mlx-whisper`
+- Optional local speech transcription: the pinned FluidAudio CLI plus Python with `mlx-whisper` as a fallback
 - Optional video-link summaries: `yt-dlp` and `ffmpeg` (`brew install yt-dlp ffmpeg`)
 
 ## Local setup
@@ -55,7 +55,7 @@ IDs in `TELEGRAM_TRANSCRIPTION_ONLY_USER_IDS` have three content-only modes:
 - forwarded voice messages are collected for 45 seconds per Telegram chat and original sender, ordered by source time, and returned with a short summary, topic-aware sections, and a complete edited transcript;
 - a text message is proofread for spelling, punctuation, capitalization, and natural paragraph breaks without changing its meaning.
 
-These inputs never route to commands or the owner's assistant workflows. Audio is deleted after local Whisper transcription, and neither source text nor edited output is written to persistent Codex threads, the assistant database, long-term memory, diary, or story archives. Text proofreading and forwarded-voice editing use a one-shot `codex exec --ephemeral` process in an empty temporary directory with a read-only sandbox; the directory is removed after every result. Short results include a native `Copy` button; longer results use Telegram's copyable text block.
+These inputs never route to commands or the owner's assistant workflows. Audio is deleted after local transcription, and neither source text nor edited output is written to persistent Codex threads, the assistant database, long-term memory, diary, or story archives. Text proofreading and forwarded-voice editing use a one-shot `codex exec --ephemeral` process in an empty temporary directory with a read-only sandbox; the directory is removed after every result. Short results include a native `Copy` button; longer results use Telegram's copyable text block.
 
 ## Telegram flow
 
@@ -225,11 +225,11 @@ The generated views live under `ASSISTANT_DATA_DIR/personal-context/<owner>/`. `
 
 ## Voice messages
 
-Install the local transcription dependency in a dedicated Python environment and set `WHISPER_PYTHON` to its interpreter. The default model is `mlx-community/whisper-large-v3-turbo`.
+Install the pinned FluidAudio CLI with `npm run fluid-audio:install`. FluidAudio Parakeet v3 is the primary local engine for voice, audio, and video transcription. Install MLX Whisper in a dedicated Python environment and set `WHISPER_PYTHON` to its interpreter for automatic fallback; the default fallback model is `mlx-community/whisper-large-v3-turbo`.
 
-An unlabelled voice message is a plain transcription. The bot returns sender/date metadata, concise bullets, and a structured transcript with semantic bold emphasis. Audio is processed in a temporary directory and removed afterward.
+Telegram OGG/Opus voice messages are passed directly to FluidAudio without an intermediate conversion. If FluidAudio is unavailable, rejects the file, or returns no text, the same temporary source is retried with MLX Whisper. An unlabelled voice message is normalized locally for punctuation, capitalization, spacing, and paragraphs, then returned immediately without starting Codex. A recognized label routes the remaining text to its dedicated command or AI writing workflow. Audio and FluidAudio's temporary JSON result are removed afterward. Each completed attempt writes a `[voice-timing]` log record with the engine, route, and download, transcription, post-processing, and total durations, but never the transcript text.
 
-A standalone YouTube, RuTube, or VK Video URL starts the private media-summary flow. The bot downloads only the audio track, rejects live streams and recordings above the configured duration limit, converts the audio into 30-minute local chunks, transcribes each chunk with automatic language detection, and asks an ephemeral Codex process for a concise personal summary. Only the finished summary is added to assistant memory; downloaded audio, chunks, and the raw transcript are deleted when the run finishes. Use `/summary <url>` when you want to make the intent explicit.
+A standalone YouTube, RuTube, or VK Video URL starts the private media-summary flow. Install the pinned FluidAudio CLI once with `npm run fluid-audio:install`. The durable job first uses real author or automatic captions when the source provides them. Otherwise `yt-dlp` selects an audio-only stream (or the smallest low-resolution stream containing audio) and FluidAudio Parakeet v3 transcribes the original audio directly with timestamped words. It uses Apple Neural Engine acceleration and avoids an application-level split or audio conversion. If FluidAudio is unavailable or rejects a recording, `ffmpeg` splits the original codec into lossless 30-minute Matroska chunks and one resident MLX Whisper process handles all unfinished chunks. Completed transcript parts and fallback chunks are checkpointed, so a bot or Mac restart resumes without repeating finished work. Only the finished summary is added to assistant memory; temporary media and the raw transcript are removed after Telegram delivery, while a failed job retains its checkpoint for an explicit retry. Use `/summary <url>` when you want to make the intent explicit.
 
 YouTube may require a browser check even for public videos. Authentication is opt-in: set either `MEDIA_COOKIES_FROM_BROWSER=chrome` (or another browser supported by `yt-dlp`) or `MEDIA_COOKIES_FILE=/absolute/path/to/cookies.txt`. The browser option allows `yt-dlp` to read that browser's cookies, so it is never enabled implicitly. A dedicated cookies file is preferable for an always-on background service.
 
