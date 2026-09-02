@@ -21,7 +21,7 @@ describe("FluidAudio-first voice transcription", () => {
     await writeFile(audio, "audio");
     await executable(fluidAudio, [
       "#!/bin/sh",
-      "printf '%s\\n' '{\"text\":\"Текст из FluidAudio\",\"wordTimings\":[]}' > \"$8\"",
+      "printf '%s\\n' '{\"text\":\"Текст из FluidAudio\",\"wordTimings\":[]}' > \"$6\"",
     ].join("\n"));
 
     const result = await transcribeAudioDetailed(audio, {
@@ -65,7 +65,7 @@ describe("FluidAudio-first voice transcription", () => {
     await writeFile(audio, "audio");
     await executable(fluidAudio, [
       "#!/bin/sh",
-      "printf '%s\\n' '{\"text\":\"Неверный основной путь\",\"wordTimings\":[]}' > \"$8\"",
+      "printf '%s\\n' '{\"text\":\"Неверный основной путь\",\"wordTimings\":[]}' > \"$6\"",
     ].join("\n"));
     await executable(python, [
       "#!/bin/sh",

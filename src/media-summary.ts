@@ -9,6 +9,7 @@ import { transcribeAudioBatchDetailed, type AudioTranscript } from "./audio.js";
 import type { AppConfiguration } from "./configuration.js";
 import { EphemeralTextEditor } from "./ephemeral-text-editor.js";
 import { transcribeWithFluidAudioDetailed } from "./fluid-audio.js";
+import { assertUsableMediaTranscript, mediaTranscriptQualityIssue } from "./media-transcript-quality.js";
 import type { AssistantDatabase, MediaJobCheckpoint } from "./storage.js";
 
 const execute = promisify(execFile);
@@ -81,6 +82,13 @@ export class MediaSummaryService {
       transcriptParts: [],
     }, persistent);
     try {
+      // Do not keep reusing a corrupt checkpoint produced by an older decoder configuration.
+      const validatedParts = checkpoint.transcriptParts.map((part) =>
+        part && mediaTranscriptQualityIssue(part) ? null : part);
+      if (validatedParts.some((part, index) => part !== checkpoint!.transcriptParts[index])) {
+        console.warn("Discarding unusable media transcript checkpoint parts");
+        checkpoint = this.saveCheckpoint({ ...checkpoint, transcriptParts: validatedParts }, persistent);
+      }
       if (checkpoint.stage === "queued") {
         await progress({ stage: "inspect" });
         const inspected = await this.inspect(normalizedUrl);
@@ -100,6 +108,7 @@ export class MediaSummaryService {
         await progress({ stage: "download" });
         try {
           const transcript = await this.downloadCaption(normalizedUrl, checkpoint.captionLanguage, directory);
+          assertUsableMediaTranscript(transcript);
           checkpoint = this.saveCheckpoint({
             ...checkpoint,
             stage: "transcribed",
@@ -124,13 +133,15 @@ export class MediaSummaryService {
           try {
             const result = await transcribeWithFluidAudioDetailed(checkpoint.mediaPath!, {
               executable: this.configuration.fluidAudioExecutable,
-              language: "ru",
               timeoutMs: COMMAND_TIMEOUT_MS,
             });
+            assertUsableMediaTranscript(result.text);
+            const transcript = formatTimestampedTranscript(result);
+            assertUsableMediaTranscript(transcript);
             checkpoint = this.saveCheckpoint({
               ...checkpoint,
               stage: "transcribed",
-              transcriptParts: [formatTimestampedTranscript(result)],
+              transcriptParts: [transcript],
             }, persistent);
           } catch (error) {
             console.warn("FluidAudio transcription failed; falling back to MLX Whisper", error);
@@ -161,7 +172,10 @@ export class MediaSummaryService {
               onResult: async (result, pendingIndex) => {
                 const originalIndex = pending[pendingIndex]!.index;
                 const parts = [...checkpoint!.transcriptParts];
-                parts[originalIndex] = formatTimestampedTranscript(result, originalIndex * CHUNK_SECONDS);
+                assertUsableMediaTranscript(result.text);
+                const transcript = formatTimestampedTranscript(result, originalIndex * CHUNK_SECONDS);
+                assertUsableMediaTranscript(transcript);
+                parts[originalIndex] = transcript;
                 checkpoint = this.saveCheckpoint({ ...checkpoint!, stage: "transcribing", transcriptParts: parts }, persistent);
                 const next = pending[pendingIndex + 1];
                 if (next) await progress({ stage: "transcribe", current: next.index + 1, total: checkpoint!.chunks.length });
@@ -173,7 +187,7 @@ export class MediaSummaryService {
       }
 
       const transcript = checkpoint.transcriptParts.filter((part): part is string => Boolean(part)).join("\n");
-      if (!transcript.trim()) throw new Error("Распознавание не вернуло текст из видео");
+      assertUsableMediaTranscript(transcript);
       await progress({ stage: "summarize" });
       const markdown = await this.editor.summarizeMediaTranscript({
         title: checkpoint.title,
