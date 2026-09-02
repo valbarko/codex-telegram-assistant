@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as audio from "../src/audio.js";
 import * as fluid from "../src/fluid-audio.js";
 import { EphemeralTextEditor } from "../src/ephemeral-text-editor.js";
-import { MediaSummaryService } from "../src/media-summary.js";
+import { MediaSummaryService, type MediaInfo } from "../src/media-summary.js";
 import { UnusableMediaTranscriptError } from "../src/media-transcript-quality.js";
 import { AssistantDatabase } from "../src/storage.js";
 
@@ -38,7 +38,7 @@ async function fixture() {
     fluidAudioExecutable: "fluid-test", mediaSummaryMaxDurationSeconds: 3600,
   }, database, editor);
   const io = service as unknown as {
-    inspect(): Promise<{ title: string; durationSeconds: number; caption?: { language: string; automatic: boolean } }>;
+    inspect(): Promise<MediaInfo>;
     download(): Promise<string>;
     downloadCaption(): Promise<string>;
     splitAudio(): Promise<string[]>;
@@ -126,5 +126,62 @@ describe("media transcription quality fallback", () => {
     const f = await fixture();
     f.summarize.mockRejectedValue(new UnusableMediaTranscriptError());
     await expect(f.service.summarize(sourceUrl)).rejects.toBeInstanceOf(UnusableMediaTranscriptError);
+  });
+
+  it("uses confirmed audio language only for the fallback after a clear conflict", async () => {
+    const f = await fixture();
+    f.inspect.mockResolvedValue({ languageHint: { language: "en", source: "audio" } });
+    f.primary.mockResolvedValue({ text: "Начните работать, не дожидаясь идеальных условий.", segments: [] });
+    await f.service.summarize(sourceUrl);
+    expect(f.primary).toHaveBeenCalledWith(f.mediaPath, { executable: "fluid-test", timeoutMs: 30 * 60_000 });
+    expect(f.fallback).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({ language: "en" }));
+    expect(f.summarize).toHaveBeenCalledWith(expect.objectContaining({ transcript: `[00:00:00] ${readable}` }));
+  });
+
+  it("does not force a title-derived language when unrestricted Whisper confirms different speech", async () => {
+    const f = await fixture();
+    f.inspect.mockResolvedValue({ languageHint: { language: "ru", source: "text" } });
+    await f.service.summarize(sourceUrl);
+    expect(f.fallback).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({ language: null }));
+    expect(f.summarize).toHaveBeenCalledWith(expect.objectContaining({ transcript: `[00:00:00] ${readable}` }));
+  });
+
+  it("accepts translated captions in their declared language instead of comparing them to the audio", async () => {
+    const f = await fixture();
+    const russian = "Начните работать, не дожидаясь идеальных условий.";
+    f.inspect.mockResolvedValue({ languageHint: { language: "en", source: "audio" },
+      caption: { language: "ru", automatic: false } });
+    f.captions.mockResolvedValue(russian);
+    await f.service.summarize(sourceUrl);
+    expect(f.primary).not.toHaveBeenCalled();
+    expect(f.summarize).toHaveBeenCalledWith(expect.objectContaining({ transcript: russian }));
+  });
+
+  it("rejects captions that clearly conflict with their own declared language", async () => {
+    const f = await fixture();
+    f.inspect.mockResolvedValue({ languageHint: { language: "en", source: "audio" },
+      caption: { language: "ru", automatic: false } });
+    await f.service.summarize(sourceUrl);
+    expect(f.primary).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when the fallback still conflicts with confirmed audio metadata", async () => {
+    const f = await fixture();
+    f.inspect.mockResolvedValue({ languageHint: { language: "ru", source: "audio" } });
+    await expect(f.service.summarize(sourceUrl)).rejects.toBeInstanceOf(UnusableMediaTranscriptError);
+    expect(f.summarize).not.toHaveBeenCalled();
+  });
+
+  it("persists the hint and replaces a conflicting cached transcript on retry", async () => {
+    const f = await fixture();
+    const jobId = f.database.enqueueAssistantJob({ owner: "1", context: "1", chatId: "1", body: sourceUrl,
+      prompt: sourceUrl, fingerprint: sourceUrl, kind: "media_summary", maxAttempts: 3 }).job.id;
+    f.database.saveMediaJobCheckpoint({ jobId, sourceUrl, stage: "transcribed", mediaPath: f.mediaPath,
+      languageHint: { language: "en", source: "audio" }, chunks: [],
+      transcriptParts: ["Начните работать, не дожидаясь идеальных условий."] });
+    await f.service.summarize(sourceUrl, () => undefined, jobId);
+    expect(f.inspect).not.toHaveBeenCalled();
+    expect(f.primary).toHaveBeenCalledOnce();
+    expect(f.database.mediaJobCheckpoint(jobId)?.languageHint).toEqual({ language: "en", source: "audio" });
   });
 });

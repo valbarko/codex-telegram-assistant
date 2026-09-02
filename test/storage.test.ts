@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { AssistantDatabase } from "../src/storage.js";
@@ -124,6 +125,25 @@ describe("AssistantDatabase", () => {
     ]);
     expect(database.deleteMediaJobCheckpoint(created.id)).toBe(true);
     expect(database.mediaJobCheckpoint(created.id)).toBeUndefined();
+  });
+
+  it("migrates legacy media checkpoints without losing jobs or completed transcript parts", () => {
+    const job = database.enqueueAssistantJob({ owner: "1", context: "1", chatId: "1", body: "https://youtu.be/example",
+      prompt: "summary", fingerprint: "legacy", kind: "media_summary", maxAttempts: 3 }).job;
+    database.saveMediaJobCheckpoint({ jobId: job.id, sourceUrl: job.body, stage: "transcribed",
+      chunks: [], transcriptParts: ["Existing transcript"] });
+    database.close();
+    const legacy = new Database(path.join(folder, "assistant.sqlite"));
+    legacy.exec("ALTER TABLE media_job_checkpoints DROP COLUMN language_hint_json");
+    legacy.close();
+    database = new AssistantDatabase(path.join(folder, "assistant.sqlite"));
+    expect(database.assistantJob(job.id)?.state).toBe("queued");
+    expect(database.mediaJobCheckpoint(job.id)?.transcriptParts).toEqual(["Existing transcript"]);
+    expect(database.mediaJobCheckpoint(job.id)?.languageHint).toBeUndefined();
+    database.saveMediaJobCheckpoint({ ...database.mediaJobCheckpoint(job.id)!, languageHint: { language: "en", source: "audio" } });
+    database.close();
+    database = new AssistantDatabase(path.join(folder, "assistant.sqlite"));
+    expect(database.mediaJobCheckpoint(job.id)?.languageHint).toEqual({ language: "en", source: "audio" });
   });
 
   it("persists the voice-writing mode per Telegram context", () => {
