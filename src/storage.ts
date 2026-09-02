@@ -4,6 +4,8 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
+import { parseMediaLanguageHint, type MediaLanguageHint } from "./media-language.js";
+
 export type WorkStatus = "todo" | "queued" | "running" | "waiting" | "done" | "cancelled";
 
 export interface WorkItem {
@@ -195,6 +197,7 @@ export interface MediaJobCheckpoint {
   title?: string;
   durationSeconds?: number;
   captionLanguage?: string;
+  languageHint?: MediaLanguageHint;
   mediaPath?: string;
   chunks: string[];
   transcriptParts: Array<string | null>;
@@ -319,15 +322,16 @@ export class AssistantDatabase {
     };
     this.sql.prepare(`INSERT INTO media_job_checkpoints(
       job_id,source_url,stage,title,duration_seconds,caption_language,media_path,chunks_json,transcript_parts_json,
-      created_at,changed_at
+      created_at,changed_at,language_hint_json
     ) VALUES(
       @jobId,@sourceUrl,@stage,@title,@durationSeconds,@captionLanguage,@mediaPath,@chunksJson,@transcriptPartsJson,
-      @createdAt,@changedAt
+      @createdAt,@changedAt,@languageHintJson
     ) ON CONFLICT(job_id) DO UPDATE SET
       source_url=excluded.source_url,stage=excluded.stage,title=excluded.title,
       duration_seconds=excluded.duration_seconds,caption_language=excluded.caption_language,
       media_path=excluded.media_path,chunks_json=excluded.chunks_json,
-      transcript_parts_json=excluded.transcript_parts_json,changed_at=excluded.changed_at`).run(nullable({
+      transcript_parts_json=excluded.transcript_parts_json,changed_at=excluded.changed_at,
+      language_hint_json=excluded.language_hint_json`).run(nullable({
       ...checkpoint,
       title: checkpoint.title,
       durationSeconds: checkpoint.durationSeconds,
@@ -335,6 +339,7 @@ export class AssistantDatabase {
       mediaPath: checkpoint.mediaPath,
       chunksJson: JSON.stringify(checkpoint.chunks),
       transcriptPartsJson: JSON.stringify(checkpoint.transcriptParts),
+      languageHintJson: checkpoint.languageHint ? JSON.stringify(checkpoint.languageHint) : undefined,
     }));
     return checkpoint;
   }
@@ -858,6 +863,7 @@ export class AssistantDatabase {
         title TEXT,
         duration_seconds REAL,
         caption_language TEXT,
+        language_hint_json TEXT,
         media_path TEXT,
         chunks_json TEXT NOT NULL,
         transcript_parts_json TEXT NOT NULL,
@@ -911,6 +917,10 @@ export class AssistantDatabase {
         selected_at INTEGER NOT NULL
       );
     `);
+    const checkpointColumns = this.sql.pragma("table_info(media_job_checkpoints)") as Array<{ name: string }>;
+    if (!checkpointColumns.some((column) => column.name === "language_hint_json")) {
+      this.sql.exec("ALTER TABLE media_job_checkpoints ADD COLUMN language_hint_json TEXT");
+    }
   }
 }
 
@@ -1037,6 +1047,7 @@ function mapMediaJobCheckpoint(row: unknown): MediaJobCheckpoint | undefined {
     title: maybe(r.title),
     durationSeconds: num(r.duration_seconds),
     captionLanguage: maybe(r.caption_language),
+    languageHint: parseMediaLanguageHint(r.language_hint_json),
     mediaPath: maybe(r.media_path),
     chunks,
     transcriptParts,
