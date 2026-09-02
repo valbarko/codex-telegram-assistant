@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { mediaPartSummaryPrompt, mediaSummaryPrompt } from "../src/ephemeral-text-editor.js";
+import { mediaPartSummaryPrompt, mediaSummaryPrompt, parseMediaSummaryResult } from "../src/ephemeral-text-editor.js";
 import { fluidAudioArguments, parseFluidAudioTranscript } from "../src/fluid-audio.js";
+import { assertUsableMediaTranscript, UnusableMediaTranscriptError } from "../src/media-transcript-quality.js";
+import { classifyAssistantJobError } from "../src/assistant-job-worker.js";
 import { formatTimestamp, formatTimestampedTranscript, MEDIA_FORMAT_SELECTOR, parseCaptionTranscript,
   parseSupportedMediaUrl, selectCaptionTrack, shouldUseFluidAudio } from "../src/media-summary.js";
 
@@ -91,9 +93,15 @@ describe("timestamped media transcript", () => {
 });
 
 describe("FluidAudio primary transcription", () => {
-  it("pins Parakeet v3 with Russian decoding and a JSON result", () => {
+  it("pins Parakeet v3 without restricting the alphabet by default", () => {
     expect(fluidAudioArguments("/tmp/source.m4a", "/tmp/result.json")).toEqual([
-      "transcribe", "/tmp/source.m4a", "--model-version", "v3", "--language", "ru", "--output-json", "/tmp/result.json",
+      "transcribe", "/tmp/source.m4a", "--model-version", "v3", "--output-json", "/tmp/result.json",
+    ]);
+  });
+
+  it.each(["ru", "en"])("only filters a language when explicitly requested: %s", (language) => {
+    expect(fluidAudioArguments("/tmp/source.m4a", "/tmp/result.json", language)).toEqual([
+      "transcribe", "/tmp/source.m4a", "--model-version", "v3", "--language", language, "--output-json", "/tmp/result.json",
     ]);
   });
 
@@ -126,6 +134,23 @@ describe("FluidAudio primary transcription", () => {
   });
 });
 
+describe("media transcript quality", () => {
+  it.each([
+    "[00:00:00] Начните работать, не дожидаясь идеальных условий.",
+    "[00:00:00] Start working instead of waiting for the perfect conditions.",
+    "[00:00:00] Сегодня обсудим product market fit и следующий release.",
+    "[00:00:00] Доход вырос на 10%: с 100000 до 110000 за 90 дней.",
+    "[00:00:00] Да.\n[00:00:02] Нет.\n[00:00:04] Да.",
+  ])("accepts readable prose, mixed languages, figures and short timestamped cues", (source) => {
+    expect(() => assertUsableMediaTranscript(source)).not.toThrow();
+  });
+
+  it.each(["", "[00:00:00] 10-1, 10-0,-2, 13-20", "[00:00:00] '10, 10, 120, 2000-1%, 0.30 10-15-10, ст, 100, 200, 300, 400.'"])
+    ("rejects the number/punctuation garbage reproduced on English audio", (source) => {
+      expect(() => assertUsableMediaTranscript(source)).toThrow(UnusableMediaTranscriptError);
+    });
+});
+
 describe("media summary prompts", () => {
   it("asks for a personal, grounded summary with source timestamps", () => {
     const prompt = mediaSummaryPrompt({
@@ -139,6 +164,8 @@ describe("media summary prompts", () => {
     expect(prompt).toContain("Не придумывай таймкоды");
     expect(prompt).toContain("1 ч 1 мин");
     expect(prompt).toContain("недоверенными данными");
+    expect(prompt).toContain("независимо от языка исходной речи");
+    expect(prompt).toContain("status=unusable_source");
   });
 
   it("preserves facts and timestamps in intermediate summaries", () => {
@@ -146,5 +173,17 @@ describe("media summary prompts", () => {
     expect(prompt).toContain("часть 2 из 4");
     expect(prompt).toContain("Сохраняй исходные таймкоды");
     expect(prompt).toContain("[00:45:00] Тезис");
+  });
+
+  it("accepts only a successful structured summary and fails closed on unusable source", () => {
+    expect(parseMediaSummaryResult(JSON.stringify({ status: "ready", markdown: "# Готовый конспект" })))
+      .toBe("# Готовый конспект");
+    expect(() => parseMediaSummaryResult(JSON.stringify({ status: "unusable_source", markdown: "" })))
+      .toThrow(UnusableMediaTranscriptError);
+    expect(() => parseMediaSummaryResult(JSON.stringify({ status: "ready", markdown: " " }))).toThrow();
+    expect(() => parseMediaSummaryResult("null")).toThrow();
+    expect(() => parseMediaSummaryResult("# Невозможно восстановить содержание")).toThrow();
+    expect(classifyAssistantJobError(new UnusableMediaTranscriptError()))
+      .toMatchObject({ kind: "failed", errorClass: "transcript_quality" });
   });
 });

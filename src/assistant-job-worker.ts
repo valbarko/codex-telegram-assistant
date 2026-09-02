@@ -1,5 +1,6 @@
 import type { AssistantJob } from "./storage.js";
 import { AssistantDatabase } from "./storage.js";
+import { UnusableMediaTranscriptError } from "./media-transcript-quality.js";
 
 export type AssistantJobFailureKind = "retryable" | "blocked" | "failed";
 
@@ -148,6 +149,9 @@ export class AssistantJobWorker {
 
 export function classifyAssistantJobError(error: unknown): AssistantJobFailure {
   const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof UnusableMediaTranscriptError) {
+    return { kind: "failed", errorClass: "transcript_quality", message };
+  }
   if (error instanceof AssistantJobBlockedError) {
     return { kind: "blocked", errorClass: error.errorClass, message };
   }

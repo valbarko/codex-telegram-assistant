@@ -34,8 +34,11 @@ export async function transcribeWithFluidAudioDetailed(file: string,
   }
 }
 
-export function fluidAudioArguments(mediaFile: string, outputFile: string, language = "ru"): string[] {
-  return ["transcribe", mediaFile, "--model-version", "v3", "--language", language, "--output-json", outputFile];
+export function fluidAudioArguments(mediaFile: string, outputFile: string, language?: string): string[] {
+  // This option is an alphabet filter, not the desired output/translation language.
+  // Leave multilingual decoding unrestricted unless a caller explicitly selects it.
+  return ["transcribe", mediaFile, "--model-version", "v3",
+    ...(language ? ["--language", language] : []), "--output-json", outputFile];
 }
 
 export function parseFluidAudioTranscript(value: unknown): AudioTranscript {
