@@ -50,6 +50,14 @@ describe("readConfiguration", () => {
     expect(config).toMatchObject({ weatherLocation: "Сочи", weatherLatitude: 43.5855, weatherLongitude: 39.7231 });
   });
 
+  it("enables the balance snapshot only with an explicit path", () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
+    const env = { TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12" };
+    expect(readConfiguration(cwd, env).apiBalancesFile).toBeUndefined();
+    expect(readConfiguration(cwd, { ...env, API_BALANCES_FILE: ".private/balances.json" }).apiBalancesFile)
+      .toBe(path.join(cwd, ".private/balances.json"));
+  });
+
   it("loads media summary executables and duration limit", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
     const config = readConfiguration(cwd, {

@@ -37,6 +37,7 @@ export interface AppConfiguration {
   weatherLocation: string;
   weatherLatitude: number;
   weatherLongitude: number;
+  apiBalancesFile?: string;
   mediaDownloaderExecutable: string;
   ffmpegExecutable: string;
   fluidAudioExecutable: string;
@@ -118,6 +119,7 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     weatherLocation: optional(env.WEATHER_LOCATION) || "Москва",
     weatherLatitude: parseCoordinate(env.WEATHER_LATITUDE, 55.7558, -90, 90, "WEATHER_LATITUDE"),
     weatherLongitude: parseCoordinate(env.WEATHER_LONGITUDE, 37.6173, -180, 180, "WEATHER_LONGITUDE"),
+    apiBalancesFile: optional(env.API_BALANCES_FILE) ? path.resolve(cwd, env.API_BALANCES_FILE!.trim()) : undefined,
     mediaDownloaderExecutable: optional(env.MEDIA_DOWNLOADER_BIN) || "yt-dlp",
     ffmpegExecutable: optional(env.FFMPEG_BIN) || "ffmpeg",
     fluidAudioExecutable: optional(env.FLUIDAUDIO_BIN) || path.join(dataDirectory, "bin", "fluidaudiocli"),
