@@ -4,6 +4,7 @@ import path from "node:path";
 import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
+import { readApiBalances, summarizeApiBalances, type ApiBalanceSummary } from "./api-balances.js";
 import { syncContentAnalytics, syncMetrikaAnalytics, syncSearchAnalytics } from "./content-analytics-sync.js";
 import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex-engine.js";
 import type { ContentRadarPost } from "./content-radar.js";
@@ -233,7 +234,10 @@ export class BackgroundScheduler {
     const inbox = this.database.captures(owner, "new", 100).length;
     const tasks = this.database.tasks(owner, undefined, 500);
     const summaryThread = this.database.conversation(`daily-summary:${owner}`)?.threadId;
-    const [weather, calendar, inspiration, threads, systems] = await Promise.allSettled([
+    // Financial balances are private to the sole full-access owner.
+    const balanceFile = this.configuration.allowedUsers.size === 1 && this.configuration.allowedUsers.has(Number(owner))
+      ? this.configuration.apiBalancesFile : undefined;
+    const [weather, calendar, inspiration, threads, systems, balances] = await Promise.allSettled([
       todayWeather({
         label: this.configuration.weatherLocation,
         latitude: this.configuration.weatherLatitude,
@@ -243,6 +247,7 @@ export class BackgroundScheduler {
       within(todayInspiration(), 15_000, "daily inspiration"),
       within(this.hub.threads(150), 7_000, "Codex threads"),
       within(checkPublicServices(), 20_000, "public services"),
+      within(readApiBalances(balanceFile), 2_000, "API balances"),
     ]);
     if (weather.status === "rejected") console.error("Morning weather failed", weather.reason);
     if (calendar.status === "rejected") console.error("Morning calendar failed", calendar.reason);
@@ -259,6 +264,7 @@ export class BackgroundScheduler {
       calendar: calendar.status === "fulfilled" ? calendar.value : undefined,
       inspiration: inspiration.status === "fulfilled" ? inspiration.value : undefined,
       systems: systems.status === "fulfilled" ? systems.value : undefined,
+      balances: balances.status === "fulfilled" ? balances.value : balanceFile ? summarizeApiBalances(undefined) : undefined,
       groups,
       inbox,
       tasks,
@@ -447,6 +453,7 @@ export interface MorningDigestInput {
   calendar?: readonly CalendarEntry[];
   inspiration?: string;
   systems?: SystemHealthSummary;
+  balances?: ApiBalanceSummary;
   groups: readonly UnifiedWorkGroup[];
   inbox: number;
   tasks: readonly WorkItem[];
@@ -479,6 +486,7 @@ export function morningDigestText(input: MorningDigestInput): string {
   });
   const failedServices = input.systems?.services.filter((service) => !service.ok) ?? [];
   const recommendations = [
+    ...(input.balances?.recommendations ?? []),
     ...(failedServices.length ? [`Проверить доступность: ${failedServices.map((service) => service.label).join(", ")}.`] : []),
     ...attention.map(({ item, reason }) => reason === "Просрочено"
       ? `Закрыть просроченное по проекту ${item.projectLabel}: ${digestText(item.title, 100)}.`
@@ -521,6 +529,7 @@ export function morningDigestText(input: MorningDigestInput): string {
     "",
     ...formatSystemHealth(input.systems),
     "",
+    ...(input.balances ? ["**💳 Балансы API**", "", ...input.balances.lines, ""] : []),
     "**Что стоит сделать сегодня**",
     "",
     ...(recommendations.length

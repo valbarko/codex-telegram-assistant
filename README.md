@@ -76,6 +76,32 @@ These inputs never route to commands or the owner's assistant workflows. Audio i
 
 The persistent Telegram keyboard keeps common actions one tap away. Codex requests are stored in SQLite before execution and processed in order. A text sent while Codex is working becomes the next durable turn instead of blocking Telegram polling or being lost during a restart.
 
+### Morning API balances
+
+Set `API_BALANCES_FILE` to an absolute private JSON file to include Google Gemini
+and OpenAI API credit balances in the main 06:00 digest. This section is only
+delivered when exactly one full-access Telegram owner is configured. Subscription
+quotas, monthly spending limits and billing-report costs are not credit balances.
+
+A separate authorized collector reads the billing dashboards before the digest
+(05:50 Moscow time) and atomically replaces the file with permissions `0600`:
+
+```json
+{"version":1,"providers":{"google":{"status":"ok","amount":350,"currency":"TRY","checkedAt":"2026-09-14T02:52:00Z"},"openai":{"status":"unavailable","reason":"login_required","checkedAt":"2026-09-14T02:53:00Z"}}}
+```
+
+Use `status: "unavailable"` with `reason: "login_required"` or `"unavailable"`
+when a dashboard cannot be checked. Do not copy cookies, credentials, payment
+details, or browser session URLs into the snapshot. The collector does not send
+a separate Telegram message or change billing settings. A browser-based Codex
+collector needs the Mac, Codex and the authorized Chrome session to be available.
+
+Only checks from the current Moscow date and at most two hours old are shown as
+current amounts. Missing, stale or invalid data produces an explicit unavailable
+line without delaying the digest. Balances at or below TRY 100 / USD 5 receive a
+top-up flag and an action in the daily recommendations. These are fixed warning
+thresholds, not predictions of remaining days. No database migration is needed.
+
 An explicit request such as `делаем в банк статей` is routed to `ARTICLE_BANK_DIR`. It is considered successful only when a changed article package contains the main, Telegram, and vc.ru variants, metadata, 4:5 and 16:9 covers, and the bank validator exits successfully.
 
 ## Чтение и публикация в Telegram-каналах
