@@ -37,13 +37,13 @@ export function summarizeApiBalances(value: unknown, now = Date.now()): ApiBalan
     const fresh = validDate && now - checkedAt <= maximumAgeMs && day.format(checkedAt) === day.format(now);
     if (!fresh) {
       const last = validDate ? `; последняя проверка ${dateTime.format(checkedAt)} МСК` : "";
-      return `- **${provider.label}:** нет свежих данных${last}.`;
+      return `- **${provider.label}**: нет свежих данных${last}.`;
     }
     if (item?.status !== "ok" || item.currency !== provider.currency
       || typeof item.amount !== "number" || !Number.isFinite(item.amount) || Math.abs(item.amount) > 1e12) {
       const reason = item?.status === "unavailable" && item.reason === "login_required"
         ? "нужно войти в кабинет" : "не удалось проверить";
-      return `- **${provider.label}:** ${reason} (${time.format(checkedAt)} МСК).`;
+      return `- **${provider.label}**: ${reason} (${time.format(checkedAt)} МСК).`;
     }
     const low = item.amount <= provider.threshold;
     if (low) recommendations.push(`Пополнить ${provider.label}: осталось ${money.format(item.amount)} ${provider.symbol}.`);
