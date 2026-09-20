@@ -4,7 +4,8 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { isArticleBankDeliveryRequest, snapshotArticleBank, validateArticleBankDelivery } from "../src/article-bank-job.js";
+import { deserializeArticleBankSnapshot, isArticleBankDeliveryRequest, serializeArticleBankSnapshot,
+  snapshotArticleBank, validateArticleBankDelivery } from "../src/article-bank-job.js";
 
 const folders: string[] = [];
 afterEach(() => { for (const folder of folders.splice(0)) rmSync(folder, { recursive: true, force: true }); });
@@ -29,7 +30,34 @@ describe("article bank job contract", () => {
       media: { feed_4x5: "assets/cover-4x5.png", article_16x9: "assets/cover-16x9.png" },
     }));
 
-    await expect(validateArticleBankDelivery(root, before)).resolves.toEqual(["new-article"]);
+    await expect(validateArticleBankDelivery(root, before)).resolves.toEqual({
+      slugs: ["new-article"], outcome: "changed",
+    });
+  });
+
+  it("accepts a verified unchanged package for an artifact delivered earlier", async () => {
+    const root = bankRoot();
+    const article = path.join(root, "articles", "existing-article");
+    mkdirSync(path.join(article, "assets"), { recursive: true });
+    writeFileSync(path.join(article, "article.md"), "Основной текст");
+    writeFileSync(path.join(article, "telegram.md"), "Telegram");
+    writeFileSync(path.join(article, "vc.md"), "vc.ru");
+    writeFileSync(path.join(article, "assets", "cover-4x5.png"), pngHeader(1080, 1350));
+    writeFileSync(path.join(article, "assets", "cover-16x9.png"), pngHeader(1600, 900));
+    writeFileSync(path.join(article, "metadata.json"), JSON.stringify({
+      media: { feed_4x5: "assets/cover-4x5.png", article_16x9: "assets/cover-16x9.png" },
+    }));
+    const before = await snapshotArticleBank(root);
+
+    await expect(validateArticleBankDelivery(root, before, { knownSlug: "existing-article" })).resolves.toEqual({
+      slugs: ["existing-article"], outcome: "already_exists",
+    });
+  });
+
+  it("round-trips a persisted baseline without losing signatures", async () => {
+    const root = bankRoot();
+    const baseline = await snapshotArticleBank(root);
+    expect(deserializeArticleBankSnapshot(serializeArticleBankSnapshot(baseline))).toEqual(baseline);
   });
 
   it("rejects a completed Codex turn that did not save a complete package", async () => {

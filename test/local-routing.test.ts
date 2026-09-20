@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { localCommandFallbackPrompt, quietCodexPrompt } from "../src/prompt-policy.js";
-import { localIntent } from "../src/telegram-app.js";
+import { contentArtifactArticlePrompt, isContextualArticleBankRequest, localIntent } from "../src/telegram-app.js";
 
 describe("local Telegram routing", () => {
   it("keeps alarms and calendar actions out of Codex", () => {
@@ -14,6 +14,22 @@ describe("local Telegram routing", () => {
   });
 
   it("leaves unrelated work for Codex", () => expect(localIntent("проверь git status проекта")).toBeNull());
+
+  it("resolves only short contextual article-bank commands through a concrete artifact", () => {
+    expect(isContextualArticleBankRequest("добавь это в банк статей")).toBe(true);
+    expect(isContextualArticleBankRequest("сохрани пост в Банке статей")).toBe(true);
+    expect(isContextualArticleBankRequest("добавь в банк статей", true)).toBe(true);
+    expect(isContextualArticleBankRequest("добавь в банк статей статью о восстановлении после тренировок")).toBe(false);
+    expect(isContextualArticleBankRequest("проверь, есть ли это в банке статей")).toBe(false);
+  });
+
+  it("makes an artifact delivery prompt self-contained", () => {
+    const prompt = contentArtifactArticlePrompt({ id: "artifact-1", kind: "post", body: "Точный текст", bodyHash: "abc" });
+    expect(prompt).toContain("Идентификатор материала: artifact-1");
+    expect(prompt).toContain("SHA-256 материала: abc");
+    expect(prompt).toContain("--- НАЧАЛО МАТЕРИАЛА ---\nТочный текст\n--- КОНЕЦ МАТЕРИАЛА ---");
+    expect(prompt).toContain("Не подменяй его содержанием предыдущих сообщений");
+  });
 });
 
 describe("quiet Codex policy", () => {

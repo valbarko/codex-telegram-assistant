@@ -11,6 +11,15 @@ const ARTICLE_BANK = /банк(?:а|е|у|ом)?\s+статей/iu;
 
 export type ArticleBankSnapshot = ReadonlyMap<string, string>;
 
+export interface ArticleBankDeliveryResult {
+  slugs: string[];
+  outcome: "changed" | "already_exists";
+}
+
+interface ArticleBankDeliveryOptions {
+  knownSlug?: string;
+}
+
 export function isArticleBankDeliveryRequest(value: string): boolean {
   const normalized = value.replace(/\s+/gu, " ").trim();
   return ARTICLE_BANK.test(normalized) && DELIVERY_ACTION.test(normalized);
@@ -36,7 +45,24 @@ export async function snapshotArticleBank(root: string): Promise<ArticleBankSnap
   return files;
 }
 
-export async function validateArticleBankDelivery(root: string, before: ArticleBankSnapshot): Promise<string[]> {
+export function serializeArticleBankSnapshot(snapshot: ArticleBankSnapshot): string {
+  return JSON.stringify([...snapshot.entries()]);
+}
+
+export function deserializeArticleBankSnapshot(value: string): ArticleBankSnapshot {
+  const parsed = JSON.parse(value) as unknown;
+  if (!Array.isArray(parsed)) throw new Error("Invalid article bank baseline");
+  const entries = parsed.map((entry): [string, string] => {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string" || typeof entry[1] !== "string") {
+      throw new Error("Invalid article bank baseline entry");
+    }
+    return [entry[0], entry[1]];
+  });
+  return new Map(entries);
+}
+
+export async function validateArticleBankDelivery(root: string, before: ArticleBankSnapshot,
+  options: ArticleBankDeliveryOptions = {}): Promise<ArticleBankDeliveryResult> {
   const after = await snapshotArticleBank(root);
   const slugs = new Set<string>();
   for (const [file, signature] of after) {
@@ -44,6 +70,9 @@ export async function validateArticleBankDelivery(root: string, before: ArticleB
     const [slug] = file.split(path.sep);
     if (slug && !slug.startsWith(".")) slugs.add(slug);
   }
+  const knownSlug = safeSlug(options.knownSlug);
+  const outcome = slugs.size ? "changed" : "already_exists";
+  if (!slugs.size && knownSlug) slugs.add(knownSlug);
   if (!slugs.size) {
     throw new AssistantJobBlockedError(
       "Codex завершил ход, но не создал и не изменил пакет в articles/<slug>",
@@ -85,7 +114,12 @@ export async function validateArticleBankDelivery(root: string, before: ArticleB
     const message = error instanceof Error ? error.message : String(error);
     throw new AssistantJobBlockedError(`Валидация Банка статей не прошла: ${message}`, "article_validation");
   }
-  return completed;
+  return { slugs: completed, outcome };
+}
+
+function safeSlug(value: string | undefined): string | undefined {
+  const slug = value?.trim();
+  return slug && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(slug) ? slug : undefined;
 }
 
 async function missingPackageFiles(directory: string): Promise<string[]> {

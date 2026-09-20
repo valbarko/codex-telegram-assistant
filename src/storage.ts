@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
@@ -144,6 +144,27 @@ export interface SavedConversation {
   changedAt: number;
 }
 
+export type ContentArtifactKind = "post" | "announcement" | "reply" | "blog" | "telegram-message";
+
+export interface ContentArtifact {
+  id: string;
+  owner: string;
+  context: string;
+  kind: ContentArtifactKind;
+  body: string;
+  sourceBody?: string;
+  bodyHash: string;
+  sourceUpdateId?: number;
+  createdAt: number;
+}
+
+export interface ContentArtifactDelivery {
+  owner: string;
+  bodyHash: string;
+  slug: string;
+  deliveredAt: number;
+}
+
 export type AssistantJobState = "queued" | "running" | "retry_wait" | "succeeded" | "blocked" | "failed" | "cancelled";
 export type AssistantJobKind = "assistant" | "article_bank" | "media_summary";
 
@@ -154,6 +175,7 @@ export interface AssistantJob {
   chatId: string;
   messageThreadId?: number;
   sourceUpdateId?: number;
+  sourceArtifactId?: string;
   body: string;
   prompt: string;
   fingerprint: string;
@@ -173,6 +195,7 @@ export interface AssistantJob {
   startedAt?: number;
   finishedAt?: number;
   notifiedAt?: number;
+  articleBankBaseline?: string;
 }
 
 export interface AssistantJobEnqueueResult {
@@ -255,9 +278,86 @@ export class AssistantDatabase {
     return mapConversation(this.sql.prepare("SELECT * FROM conversations WHERE context=?").get(context));
   }
 
+  createContentArtifact(input: {
+    owner: string;
+    context: string;
+    kind: ContentArtifactKind;
+    body: string;
+    sourceBody?: string;
+    sourceUpdateId?: number;
+  }): ContentArtifact {
+    const normalized = {
+      owner: input.owner.trim(),
+      context: input.context.trim(),
+      kind: input.kind,
+      body: input.body.trim(),
+      sourceBody: input.sourceBody?.trim() || undefined,
+      sourceUpdateId: input.sourceUpdateId,
+    };
+    if (!normalized.owner || !normalized.context || !normalized.body) {
+      throw new Error("Content artifact fields are required");
+    }
+    if (normalized.sourceUpdateId !== undefined) {
+      const existing = mapContentArtifact(this.sql.prepare(
+        "SELECT * FROM content_artifacts WHERE owner=? AND source_update_id=? LIMIT 1",
+      ).get(normalized.owner, normalized.sourceUpdateId));
+      if (existing) return existing;
+    }
+    const artifact: ContentArtifact = {
+      id: randomUUID(),
+      ...normalized,
+      bodyHash: contentArtifactHash(normalized.body),
+      createdAt: Date.now(),
+    };
+    this.sql.prepare(`INSERT INTO content_artifacts(
+      id,owner,context,kind,body,source_body,body_hash,source_update_id,created_at
+    ) VALUES(@id,@owner,@context,@kind,@body,@sourceBody,@bodyHash,@sourceUpdateId,@createdAt)`)
+      .run(nullable(artifact));
+    return artifact;
+  }
+
+  contentArtifact(id: string, owner?: string): ContentArtifact | undefined {
+    return mapContentArtifact(owner
+      ? this.sql.prepare("SELECT * FROM content_artifacts WHERE id=? AND owner=?").get(id, owner)
+      : this.sql.prepare("SELECT * FROM content_artifacts WHERE id=?").get(id));
+  }
+
+  latestContentArtifact(owner: string, context: string, since = 0): ContentArtifact | undefined {
+    return mapContentArtifact(this.sql.prepare(`SELECT * FROM content_artifacts
+      WHERE owner=? AND context=? AND created_at>=? ORDER BY created_at DESC LIMIT 1`).get(owner, context, since));
+  }
+
+  linkContentArtifactMessage(artifactId: string, chatId: string, messageId: number): void {
+    this.sql.prepare(`INSERT INTO content_artifact_messages(artifact_id,chat_id,message_id)
+      VALUES(?,?,?) ON CONFLICT(chat_id,message_id) DO UPDATE SET artifact_id=excluded.artifact_id`)
+      .run(artifactId, chatId, messageId);
+  }
+
+  contentArtifactByMessage(owner: string, context: string, chatId: string, messageId: number): ContentArtifact | undefined {
+    return mapContentArtifact(this.sql.prepare(`SELECT artifact.* FROM content_artifacts artifact
+      JOIN content_artifact_messages message ON message.artifact_id=artifact.id
+      WHERE artifact.owner=? AND artifact.context=? AND message.chat_id=? AND message.message_id=? LIMIT 1`)
+      .get(owner, context, chatId, messageId));
+  }
+
+  contentArtifactDelivery(owner: string, bodyHash: string): ContentArtifactDelivery | undefined {
+    return mapContentArtifactDelivery(this.sql.prepare(
+      "SELECT * FROM content_artifact_deliveries WHERE owner=? AND body_hash=?",
+    ).get(owner, bodyHash));
+  }
+
+  recordContentArtifactDelivery(owner: string, bodyHash: string, slug: string): ContentArtifactDelivery {
+    const delivery: ContentArtifactDelivery = { owner, bodyHash, slug, deliveredAt: Date.now() };
+    this.sql.prepare(`INSERT INTO content_artifact_deliveries(owner,body_hash,slug,delivered_at)
+      VALUES(@owner,@bodyHash,@slug,@deliveredAt)
+      ON CONFLICT(owner,body_hash) DO UPDATE SET slug=excluded.slug,delivered_at=excluded.delivered_at`)
+      .run(delivery);
+    return delivery;
+  }
+
   enqueueAssistantJob(input: Pick<AssistantJob,
     "owner" | "context" | "chatId" | "body" | "prompt" | "fingerprint" | "kind" | "maxAttempts"> &
-    Partial<Pick<AssistantJob, "messageThreadId" | "sourceUpdateId" | "workspace" | "nextAttemptAt">>): AssistantJobEnqueueResult {
+    Partial<Pick<AssistantJob, "messageThreadId" | "sourceUpdateId" | "sourceArtifactId" | "workspace" | "nextAttemptAt">>): AssistantJobEnqueueResult {
     const normalized = {
       ...input,
       owner: input.owner.trim(),
@@ -266,6 +366,7 @@ export class AssistantDatabase {
       body: input.body.trim(),
       prompt: input.prompt.trim(),
       fingerprint: input.fingerprint.trim(),
+      sourceArtifactId: input.sourceArtifactId?.trim() || undefined,
       workspace: input.workspace?.trim() || undefined,
     };
     if (!normalized.owner || !normalized.context || !normalized.chatId || !normalized.body ||
@@ -286,16 +387,17 @@ export class AssistantDatabase {
         nextAttemptAt: normalized.nextAttemptAt ?? now, createdAt: now, changedAt: now,
       };
       this.sql.prepare(`INSERT INTO assistant_jobs(
-        id,owner,context,chat_id,message_thread_id,source_update_id,body,prompt,fingerprint,kind,workspace,state,
+        id,owner,context,chat_id,message_thread_id,source_update_id,source_artifact_id,body,prompt,fingerprint,kind,workspace,state,
         attempts,max_attempts,next_attempt_at,progress_message_id,last_event_at,error_class,error,result,
-        created_at,changed_at,started_at,finished_at,notified_at
+        created_at,changed_at,started_at,finished_at,notified_at,article_bank_baseline_json
       ) VALUES(
-        @id,@owner,@context,@chatId,@messageThreadId,@sourceUpdateId,@body,@prompt,@fingerprint,@kind,@workspace,@state,
-        @attempts,@maxAttempts,@nextAttemptAt,NULL,NULL,NULL,NULL,NULL,@createdAt,@changedAt,NULL,NULL,NULL
+        @id,@owner,@context,@chatId,@messageThreadId,@sourceUpdateId,@sourceArtifactId,@body,@prompt,@fingerprint,@kind,@workspace,@state,
+        @attempts,@maxAttempts,@nextAttemptAt,NULL,NULL,NULL,NULL,NULL,@createdAt,@changedAt,NULL,NULL,NULL,NULL
       )`).run(nullable({
         ...job,
         messageThreadId: job.messageThreadId,
         sourceUpdateId: job.sourceUpdateId,
+        sourceArtifactId: job.sourceArtifactId,
         workspace: job.workspace,
       }));
       return { job, duplicate: false };
@@ -304,6 +406,12 @@ export class AssistantDatabase {
 
   assistantJob(id: string): AssistantJob | undefined {
     return mapAssistantJob(this.sql.prepare("SELECT * FROM assistant_jobs WHERE id=?").get(id));
+  }
+
+  ensureAssistantJobArticleBankBaseline(id: string, baseline: string): string {
+    this.sql.prepare(`UPDATE assistant_jobs SET article_bank_baseline_json=?,changed_at=?
+      WHERE id=? AND article_bank_baseline_json IS NULL`).run(baseline, Date.now(), id);
+    return this.assistantJob(id)?.articleBankBaseline ?? baseline;
   }
 
   mediaJobCheckpoint(jobId: string): MediaJobCheckpoint | undefined {
@@ -823,6 +931,35 @@ export class AssistantDatabase {
   private install(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS conversations(context TEXT PRIMARY KEY, thread_id TEXT, workspace TEXT NOT NULL, model TEXT, effort TEXT, profile_id TEXT NOT NULL, changed_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS content_artifacts(
+        id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        context TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        body TEXT NOT NULL,
+        source_body TEXT,
+        body_hash TEXT NOT NULL,
+        source_update_id INTEGER,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS content_artifact_source_update ON content_artifacts(owner,source_update_id)
+        WHERE source_update_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS content_artifact_owner_context ON content_artifacts(owner,context,created_at);
+      CREATE TABLE IF NOT EXISTS content_artifact_messages(
+        artifact_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        PRIMARY KEY(chat_id,message_id),
+        FOREIGN KEY(artifact_id) REFERENCES content_artifacts(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS content_artifact_message_artifact ON content_artifact_messages(artifact_id);
+      CREATE TABLE IF NOT EXISTS content_artifact_deliveries(
+        owner TEXT NOT NULL,
+        body_hash TEXT NOT NULL,
+        slug TEXT NOT NULL,
+        delivered_at INTEGER NOT NULL,
+        PRIMARY KEY(owner,body_hash)
+      );
       CREATE TABLE IF NOT EXISTS assistant_jobs(
         id TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -830,6 +967,7 @@ export class AssistantDatabase {
         chat_id TEXT NOT NULL,
         message_thread_id INTEGER,
         source_update_id INTEGER,
+        source_artifact_id TEXT,
         body TEXT NOT NULL,
         prompt TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
@@ -848,7 +986,8 @@ export class AssistantDatabase {
         changed_at INTEGER NOT NULL,
         started_at INTEGER,
         finished_at INTEGER,
-        notified_at INTEGER
+        notified_at INTEGER,
+        article_bank_baseline_json TEXT
       );
       CREATE UNIQUE INDEX IF NOT EXISTS assistant_job_source_update ON assistant_jobs(source_update_id)
         WHERE source_update_id IS NOT NULL;
@@ -921,7 +1060,21 @@ export class AssistantDatabase {
     if (!checkpointColumns.some((column) => column.name === "language_hint_json")) {
       this.sql.exec("ALTER TABLE media_job_checkpoints ADD COLUMN language_hint_json TEXT");
     }
+    const assistantJobColumns = this.sql.pragma("table_info(assistant_jobs)") as Array<{ name: string }>;
+    if (!assistantJobColumns.some((column) => column.name === "source_artifact_id")) {
+      this.sql.exec("ALTER TABLE assistant_jobs ADD COLUMN source_artifact_id TEXT");
+    }
+    if (!assistantJobColumns.some((column) => column.name === "article_bank_baseline_json")) {
+      this.sql.exec("ALTER TABLE assistant_jobs ADD COLUMN article_bank_baseline_json TEXT");
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS assistant_job_source_artifact
+      ON assistant_jobs(source_artifact_id) WHERE source_artifact_id IS NOT NULL`);
   }
+}
+
+export function contentArtifactHash(value: string): string {
+  const normalized = value.normalize("NFKC").trim().replace(/\s+/gu, " ");
+  return createHash("sha256").update(normalized).digest("hex");
 }
 
 function following(previous: number, cadence: Alarm["cadence"], now: number): number | undefined {
@@ -1021,11 +1174,26 @@ function mapConversation(row: unknown): SavedConversation | undefined {
   return { context: str(r.context), threadId: maybe(r.thread_id), workspace: str(r.workspace), model: maybe(r.model), effort: maybe(r.effort), profileId: str(r.profile_id), changedAt: Number(r.changed_at) };
 }
 
+function mapContentArtifact(row: unknown): ContentArtifact | undefined {
+  const r = object(row); if (!r) return undefined;
+  return {
+    id: str(r.id), owner: str(r.owner), context: str(r.context), kind: str(r.kind) as ContentArtifactKind,
+    body: str(r.body), sourceBody: maybe(r.source_body), bodyHash: str(r.body_hash),
+    sourceUpdateId: num(r.source_update_id), createdAt: Number(r.created_at),
+  };
+}
+
+function mapContentArtifactDelivery(row: unknown): ContentArtifactDelivery | undefined {
+  const r = object(row); if (!r) return undefined;
+  return { owner: str(r.owner), bodyHash: str(r.body_hash), slug: str(r.slug), deliveredAt: Number(r.delivered_at) };
+}
+
 function mapAssistantJob(row: unknown): AssistantJob | undefined {
   const r = object(row); if (!r) return undefined;
   return {
     id: str(r.id), owner: str(r.owner), context: str(r.context), chatId: str(r.chat_id),
-    messageThreadId: num(r.message_thread_id), sourceUpdateId: num(r.source_update_id), body: str(r.body),
+    messageThreadId: num(r.message_thread_id), sourceUpdateId: num(r.source_update_id),
+    sourceArtifactId: maybe(r.source_artifact_id), body: str(r.body),
     prompt: str(r.prompt), fingerprint: str(r.fingerprint), kind: str(r.kind) as AssistantJobKind,
     workspace: maybe(r.workspace), state: str(r.state) as AssistantJobState, attempts: Number(r.attempts),
     maxAttempts: Number(r.max_attempts), nextAttemptAt: Number(r.next_attempt_at),
@@ -1033,6 +1201,7 @@ function mapAssistantJob(row: unknown): AssistantJob | undefined {
     errorClass: maybe(r.error_class), error: maybe(r.error), result: maybe(r.result), createdAt: Number(r.created_at),
     changedAt: Number(r.changed_at), startedAt: num(r.started_at), finishedAt: num(r.finished_at),
     notifiedAt: num(r.notified_at),
+    articleBankBaseline: maybe(r.article_bank_baseline_json),
   };
 }
 
