@@ -5,7 +5,7 @@ import type { Bot, Context } from "grammy";
 
 import type { AppConfiguration } from "./configuration.js";
 import { readApiBalances, summarizeApiBalances, type ApiBalanceSummary } from "./api-balances.js";
-import { syncContentAnalytics, syncMetrikaAnalytics, syncSearchAnalytics } from "./content-analytics-sync.js";
+import { instagramAnalyticsAuthorizationFailed, syncContentAnalytics, syncMetrikaAnalytics, syncSearchAnalytics } from "./content-analytics-sync.js";
 import type { CodexHub, Conversation, StoredThread, TurnObserver } from "./codex-engine.js";
 import type { ContentRadarPost } from "./content-radar.js";
 import { findDailyBlogStudies, type BlogStudy } from "./daily-blog-topic.js";
@@ -58,6 +58,7 @@ export class BackgroundScheduler {
   private active = false;
   private lastPublicationSyncAt = 0;
   private lastContentAnalyticsSyncAt = 0;
+  private instagramAnalyticsAuthorizationBlocked = false;
   private lastSearchAnalyticsSyncAt = 0;
   private lastMetrikaAnalyticsSyncAt = 0;
   private readonly textEditor: EphemeralTextEditor;
@@ -116,7 +117,17 @@ export class BackgroundScheduler {
     if (now - this.lastContentAnalyticsSyncAt < 60 * 60_000) return;
     this.lastContentAnalyticsSyncAt = now;
     try {
-      await syncContentAnalytics();
+      const source = this.instagramAnalyticsAuthorizationBlocked ? "telegram" : "all";
+      const result = await syncContentAnalytics(undefined, undefined, source);
+      if (instagramAnalyticsAuthorizationFailed(result)) {
+        this.instagramAnalyticsAuthorizationBlocked = true;
+        console.warn(`Instagram analytics authorization required: ${result.instagram?.reason}`);
+      } else if (result.instagram?.status === "failed" || result.instagram?.status === "partial") {
+        console.warn(`Instagram analytics sync ${result.instagram.status}: ${result.instagram.reason ?? "unknown"}`);
+      }
+      if (result.telegram?.status === "failed") {
+        console.warn(`Telegram analytics sync failed: ${result.telegram.reason ?? "unknown"}`);
+      }
     } catch (error) {
       console.error("Content analytics sync failed", error);
     }
