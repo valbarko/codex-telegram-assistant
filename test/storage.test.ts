@@ -5,7 +5,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { AssistantDatabase } from "../src/storage.js";
+import { AssistantDatabase, contentArtifactHash } from "../src/storage.js";
 
 describe("AssistantDatabase", () => {
   let folder: string;
@@ -35,22 +35,48 @@ describe("AssistantDatabase", () => {
     expect(database.conversation("1:42")).toMatchObject({ threadId: "thr", workspace: "/work", profileId: "review" });
   });
 
+  it("stores generated content as an addressable artifact and remembers its verified delivery", () => {
+    const artifact = database.createContentArtifact({
+      owner: "1", context: "1:42", kind: "post", body: "  Готовый\n\nпост  ",
+      sourceBody: "Пост исходная мысль", sourceUpdateId: 700,
+    });
+    const replay = database.createContentArtifact({
+      owner: "1", context: "1:42", kind: "post", body: "Повтор", sourceUpdateId: 700,
+    });
+    database.linkContentArtifactMessage(artifact.id, "1", 55);
+
+    expect(replay.id).toBe(artifact.id);
+    expect(artifact.bodyHash).toBe(contentArtifactHash("Готовый пост"));
+    expect(database.latestContentArtifact("1", "1:42")).toMatchObject({ id: artifact.id, body: "Готовый\n\nпост" });
+    expect(database.contentArtifactByMessage("1", "1:42", "1", 55)?.id).toBe(artifact.id);
+    expect(database.contentArtifactByMessage("1", "другой", "1", 55)).toBeUndefined();
+    expect(database.recordContentArtifactDelivery("1", artifact.bodyHash, "gotovyi-post")).toMatchObject({
+      bodyHash: artifact.bodyHash, slug: "gotovyi-post",
+    });
+    expect(database.contentArtifactDelivery("1", artifact.bodyHash)?.slug).toBe("gotovyi-post");
+  });
+
   it("persists assistant jobs before execution and suppresses replayed Telegram updates", () => {
+    const artifact = database.createContentArtifact({ owner: "1", context: "1:42", kind: "post", body: "Пост" });
     const input = {
       owner: "1", context: "1:42", chatId: "1", messageThreadId: 42, sourceUpdateId: 900,
       body: "Сделай статью", prompt: "Подготовь пакет", fingerprint: "article", kind: "article_bank" as const,
-      workspace: "/bank", maxAttempts: 3,
+      workspace: "/bank", sourceArtifactId: artifact.id, maxAttempts: 3,
     };
     const first = database.enqueueAssistantJob(input);
     const replay = database.enqueueAssistantJob({ ...input, body: "Повтор из Telegram" });
     const sameOpenRequest = database.enqueueAssistantJob({ ...input, sourceUpdateId: 901 });
 
-    expect(first).toMatchObject({ duplicate: false, job: { state: "queued", attempts: 0 } });
+    expect(first).toMatchObject({ duplicate: false, job: {
+      state: "queued", attempts: 0, sourceArtifactId: artifact.id,
+    } });
     expect(replay).toMatchObject({ duplicate: true, job: { id: first.job.id } });
     expect(sameOpenRequest).toMatchObject({ duplicate: true, job: { id: first.job.id } });
 
     const running = database.claimAssistantJob(first.job.createdAt + 1);
     expect(running).toMatchObject({ id: first.job.id, state: "running", attempts: 1 });
+    expect(database.ensureAssistantJobArticleBankBaseline(first.job.id, '[["file","1:2"]]')).toBe('[["file","1:2"]]');
+    expect(database.ensureAssistantJobArticleBankBaseline(first.job.id, "[]")).toBe('[["file","1:2"]]');
     database.touchAssistantJob(first.job.id, 12_345);
     expect(database.completeAssistantJob(first.job.id, "Готово")).toBe(true);
     expect(database.assistantJob(first.job.id)).toMatchObject({ state: "succeeded", result: "Готово", lastEventAt: 12_345 });
@@ -144,6 +170,25 @@ describe("AssistantDatabase", () => {
     database.close();
     database = new AssistantDatabase(path.join(folder, "assistant.sqlite"));
     expect(database.mediaJobCheckpoint(job.id)?.languageHint).toEqual({ language: "en", source: "audio" });
+  });
+
+  it("migrates legacy assistant jobs for artifact identity and stable article baselines", () => {
+    database.close();
+    const legacy = new Database(path.join(folder, "assistant.sqlite"));
+    legacy.exec("DROP INDEX assistant_job_source_artifact");
+    legacy.exec("ALTER TABLE assistant_jobs DROP COLUMN source_artifact_id");
+    legacy.exec("ALTER TABLE assistant_jobs DROP COLUMN article_bank_baseline_json");
+    legacy.close();
+
+    database = new AssistantDatabase(path.join(folder, "assistant.sqlite"));
+    const artifact = database.createContentArtifact({ owner: "1", context: "1", kind: "post", body: "Пост" });
+    const job = database.enqueueAssistantJob({
+      owner: "1", context: "1", chatId: "1", body: "Добавь материал в Банк статей", prompt: "Материал",
+      fingerprint: "artifact-migration", kind: "article_bank", maxAttempts: 3, sourceArtifactId: artifact.id,
+    }).job;
+
+    expect(database.assistantJob(job.id)?.sourceArtifactId).toBe(artifact.id);
+    expect(database.ensureAssistantJobArticleBankBaseline(job.id, "[]")).toBe("[]");
   });
 
   it("persists the voice-writing mode per Telegram context", () => {
