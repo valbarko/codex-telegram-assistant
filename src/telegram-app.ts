@@ -455,8 +455,11 @@ export class TelegramApplication {
           return;
         }
         route = "restricted-transcript";
+        await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
+          "✍️ Расшифровка готова · исправляю текст…").catch(() => undefined);
+        const formatted = await this.formatDirectTranscript(raw);
         await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, formatPlainTranscript(raw));
+        await this.sendRestrictedResult(ctx.chat!.id, ctx.message?.message_thread_id, formatted);
         return;
       }
       const command = parseSpokenVoiceCommand(raw);
@@ -510,8 +513,11 @@ export class TelegramApplication {
         return;
       }
       route = "direct-transcript";
+      await ctx.api.editMessageText(ctx.chat!.id, progress.message_id,
+        "✍️ Расшифровка готова · исправляю текст…").catch(() => undefined);
+      const formatted = await this.formatDirectTranscript(command.content);
       await ctx.api.deleteMessage(ctx.chat!.id, progress.message_id).catch(() => undefined);
-      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatPlainTranscript(command.content), TELEGRAM_LIMIT - 100);
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatted, TELEGRAM_LIMIT - 100);
     } catch (error) {
       console.error("Voice transcription failed", error);
       await ctx.api.editMessageText(ctx.chat!.id, progress.message_id, publicTranscriptionErrorMessage(error)).catch(() => undefined);
@@ -660,8 +666,13 @@ export class TelegramApplication {
       return true;
     }
     if (command.kind === "transcript") {
-      await clearProgress();
-      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatPlainTranscript(command.content), TELEGRAM_LIMIT - 100);
+      let progressId = existingProgressId;
+      if (progressId === undefined) progressId = (await ctx.reply("✍️ Исправляю расшифровку…")).message_id;
+      else await ctx.api.editMessageText(ctx.chat!.id, progressId,
+        "✍️ Расшифровка готова · исправляю текст…").catch(() => undefined);
+      const formatted = await this.formatDirectTranscript(command.content);
+      await ctx.api.deleteMessage(ctx.chat!.id, progressId).catch(() => undefined);
+      await sendTelegramMarkdown(ctx.api, ctx.chat!.id, formatted, TELEGRAM_LIMIT - 100);
       return true;
     }
     if (command.kind === "blog") {
@@ -863,6 +874,15 @@ export class TelegramApplication {
       return await this.restrictedTextEditor.formatBlogText(source);
     } catch (error) {
       logInternalError("Blog text editing failed; using deterministic formatting", error);
+      return formatPlainTranscript(source);
+    }
+  }
+
+  private async formatDirectTranscript(source: string): Promise<string> {
+    try {
+      return await this.restrictedTextEditor.formatVoiceTranscript(source);
+    } catch (error) {
+      logInternalError("Voice transcript editing failed; using deterministic formatting", error);
       return formatPlainTranscript(source);
     }
   }

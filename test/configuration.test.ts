@@ -95,6 +95,23 @@ describe("readConfiguration", () => {
     expect(config).toMatchObject({ whisperPython: "/opt/whisper/bin/python", whisperModel: "local/whisper-model" });
   });
 
+  it("uses a dedicated fast Codex model for voice transcript correction", () => {
+    const defaults = readConfiguration("/tmp", {
+      TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12",
+    });
+    const configured = readConfiguration("/tmp", {
+      TELEGRAM_BOT_TOKEN: "token", TELEGRAM_ALLOWED_USER_IDS: "12",
+      VOICE_EDITOR_MODEL: "gpt-5.6-terra", VOICE_EDITOR_REASONING_EFFORT: "none", VOICE_EDITOR_TIMEOUT_MS: "9000",
+    });
+
+    expect(defaults).toMatchObject({
+      voiceEditorModel: "gpt-5.6-luna", voiceEditorReasoningEffort: "none", voiceEditorTimeoutMs: 20_000,
+    });
+    expect(configured).toMatchObject({
+      voiceEditorModel: "gpt-5.6-terra", voiceEditorReasoningEffort: "none", voiceEditorTimeoutMs: 9_000,
+    });
+  });
+
   it("loads the optional Hindsight knowledge layer", () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "cta-config-")); folders.push(cwd);
     const config = readConfiguration(cwd, {
