@@ -4,6 +4,7 @@ import path from "node:path";
 export type ApprovalPolicy = "never" | "on-request" | "untrusted";
 export type SandboxPreset = "read-only" | "workspace-write" | "danger-full-access";
 export type HindsightBudget = "low" | "mid" | "high";
+export type CodexReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface ExecutionProfile {
   id: string;
@@ -47,6 +48,9 @@ export interface AppConfiguration {
   whisperPython?: string;
   whisperModel?: string;
   defaultModel?: string;
+  voiceEditorModel: string;
+  voiceEditorReasoningEffort: CodexReasoningEffort;
+  voiceEditorTimeoutMs: number;
   defaultProfile: string;
   profiles: readonly ExecutionProfile[];
   maxUploadBytes: number;
@@ -130,6 +134,9 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     whisperPython: optional(env.WHISPER_PYTHON),
     whisperModel: optional(env.WHISPER_MODEL),
     defaultModel: optional(env.CODEX_MODEL),
+    voiceEditorModel: optional(env.VOICE_EDITOR_MODEL) || "gpt-5.6-luna",
+    voiceEditorReasoningEffort: parseCodexReasoningEffort(env.VOICE_EDITOR_REASONING_EFFORT),
+    voiceEditorTimeoutMs: parsePositiveInteger(env.VOICE_EDITOR_TIMEOUT_MS, 20_000, "VOICE_EDITOR_TIMEOUT_MS"),
     defaultProfile,
     profiles,
     maxUploadBytes: parseByteLimit(env.MAX_UPLOAD_BYTES || env.MAX_FILE_SIZE),
@@ -250,6 +257,13 @@ function parseHindsightBudget(value: string | undefined): HindsightBudget {
   const budget = optional(value) || "low";
   if (budget === "low" || budget === "mid" || budget === "high") return budget;
   throw new Error("HINDSIGHT_REFLECT_BUDGET must be low, mid, or high");
+}
+
+function parseCodexReasoningEffort(value: string | undefined): CodexReasoningEffort {
+  const effort = optional(value) || "none";
+  if (effort === "none" || effort === "low" || effort === "medium" || effort === "high"
+    || effort === "xhigh" || effort === "max" || effort === "ultra") return effort;
+  throw new Error("VOICE_EDITOR_REASONING_EFFORT must be none, low, medium, high, xhigh, max, or ultra");
 }
 
 function parseCoordinate(value: string | undefined, fallback: number, minimum: number, maximum: number, key: string): number {
