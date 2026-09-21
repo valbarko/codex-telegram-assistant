@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { deserializeArticleBankSnapshot, isArticleBankDeliveryRequest, serializeArticleBankSnapshot,
+import { articleBankExecutionPrompt, deserializeArticleBankSnapshot, isArticleBankDeliveryRequest, serializeArticleBankSnapshot,
   snapshotArticleBank, validateArticleBankDelivery } from "../src/article-bank-job.js";
 
 const folders: string[] = [];
@@ -14,6 +14,7 @@ describe("article bank job contract", () => {
   it("routes explicit delivery requests but not lookup questions", () => {
     expect(isArticleBankDeliveryRequest("Неплохо, делаем в банк статей — потом поправлю")).toBe(true);
     expect(isArticleBankDeliveryRequest("Проверь, есть ли это в банке статей")).toBe(false);
+    expect(articleBankExecutionPrompt("Делай")).toContain(".private/article-research/<slug>/brief.md");
   });
 
   it("accepts only a changed package with texts, metadata, both covers and bank validation", async () => {
@@ -29,6 +30,17 @@ describe("article bank job contract", () => {
     writeFileSync(path.join(article, "metadata.json"), JSON.stringify({
       media: { feed_4x5: "assets/cover-4x5.png", article_16x9: "assets/cover-16x9.png" },
     }));
+    writeResearch(root, "new-article", {
+      sources: [{
+        id: "source-1", reference: "https://example.com/primary", visibility: "public",
+        authority: "primary", checked_at: "2026-09-21",
+      }],
+      claims: [{
+        id: "claim-1", statement: "A current material claim", importance: "material",
+        risk: "unstable", status: "verified", source_ids: ["source-1"],
+        publication_use: "cite", limitations: "",
+      }],
+    });
 
     await expect(validateArticleBankDelivery(root, before)).resolves.toEqual({
       slugs: ["new-article"], outcome: "changed",
@@ -85,9 +97,41 @@ describe("article bank job contract", () => {
     writeFileSync(path.join(article, "metadata.json"), JSON.stringify({
       media: { feed_4x5: "assets/cover-4x5.png", article_16x9: "assets/cover-16x9.png" },
     }));
+    writeResearch(root, "new-article");
 
     await expect(validateArticleBankDelivery(root, before)).rejects.toMatchObject({
       name: "AssistantJobBlockedError", errorClass: "article_validation",
+    });
+  });
+
+  it("requires a private brief and claim register for a changed complete package", async () => {
+    const root = bankRoot();
+    const before = await snapshotArticleBank(root);
+    writeCompletePackage(root, "new-article");
+
+    await expect(validateArticleBankDelivery(root, before)).rejects.toMatchObject({
+      name: "AssistantJobBlockedError", errorClass: "article_evidence",
+    });
+  });
+
+  it("rejects unsafe source use and high-risk claims without primary evidence", async () => {
+    const root = bankRoot();
+    const before = await snapshotArticleBank(root);
+    writeCompletePackage(root, "new-article");
+    writeResearch(root, "new-article", {
+      sources: [{
+        id: "source-1", reference: "Private note", visibility: "confidential",
+        authority: "secondary", checked_at: "2026-09-21",
+      }],
+      claims: [{
+        id: "claim-1", statement: "A medical recommendation", importance: "material",
+        risk: "high_stakes", status: "verified", source_ids: ["source-1"],
+        publication_use: "cite", limitations: "",
+      }],
+    });
+
+    await expect(validateArticleBankDelivery(root, before)).rejects.toMatchObject({
+      name: "AssistantJobBlockedError", errorClass: "article_evidence",
     });
   });
 });
@@ -111,4 +155,31 @@ function pngHeader(width: number, height: number): Buffer {
   buffer.writeUInt32BE(width, 16);
   buffer.writeUInt32BE(height, 20);
   return buffer;
+}
+
+function writeCompletePackage(root: string, slug: string): void {
+  const article = path.join(root, "articles", slug);
+  mkdirSync(path.join(article, "assets"), { recursive: true });
+  writeFileSync(path.join(article, "article.md"), "Основной текст");
+  writeFileSync(path.join(article, "telegram.md"), "Telegram");
+  writeFileSync(path.join(article, "vc.txt"), "vc.ru");
+  writeFileSync(path.join(article, "assets", "cover-4x5.png"), pngHeader(1080, 1350));
+  writeFileSync(path.join(article, "assets", "cover-16x9.png"), pngHeader(1600, 900));
+  writeFileSync(path.join(article, "metadata.json"), JSON.stringify({
+    media: { feed_4x5: "assets/cover-4x5.png", article_16x9: "assets/cover-16x9.png" },
+  }));
+}
+
+function writeResearch(root: string, slug: string, overrides: Record<string, unknown> = {}): void {
+  const directory = path.join(root, ".private", "article-research", slug);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, "brief.md"), "Reader, page role, unique value, verified facts, and next action.");
+  writeFileSync(path.join(directory, "claims.json"), JSON.stringify({
+    version: 1,
+    slug,
+    mode: "reader_first_seo",
+    sources: [],
+    claims: [],
+    ...overrides,
+  }));
 }

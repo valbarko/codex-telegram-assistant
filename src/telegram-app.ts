@@ -2409,6 +2409,7 @@ function assistantFailureReason(failure: AssistantJobFailure): string {
   if (failure.errorClass === "article_no_changes") return "В Банке статей не появилось сохранённых изменений.";
   if (failure.errorClass === "article_ambiguous") return "Один исходный материал оказался связан сразу с несколькими пакетами.";
   if (failure.errorClass === "article_incomplete") return "Пакет статьи остался неполным: обязательные тексты или обложки не прошли проверку.";
+  if (failure.errorClass === "article_evidence") return "Приватный бриф или реестр проверяемых утверждений не прошёл проверку.";
   if (failure.errorClass === "article_validation") return "Пакет статьи не прошёл проверку Банка статей.";
   if (failure.errorClass === "article_bank_unavailable") return "Каталог Банка статей недоступен.";
   if (failure.errorClass === "empty_answer") return "Codex завершил ход без итогового ответа.";
