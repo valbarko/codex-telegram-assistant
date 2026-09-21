@@ -11,6 +11,7 @@ This repository is an independent implementation with its own source structure, 
 - **Voice-first writing:** transcribe locally with FluidAudio Parakeet v3 and an automatic MLX Whisper fallback, then optionally let Codex clean, structure, format, and proofread diary entries or story cycles.
 - **Video-link summaries:** turn a standalone YouTube, RuTube, or VK Video link into a personal Russian-language summary with key ideas, useful takeaways, actions, and selected source timestamps.
 - **Style-aware drafts:** turn a text or voice note beginning with `Блог`, `Пост`, `Анонс`, or `Ответ` into a clean Telegram-ready text using a private, locally indexed corpus of the owner's accepted writing.
+- **Evidence-aware article packages:** keep the editorial brief, material-claim register, source visibility, and verification dates private while preventing unresolved evidence from being marked ready.
 - **Forwarded voice packages:** collect rapidly forwarded voice messages from the same original sender, preserve their order, and use Codex to merge one topic or split genuine topic changes.
 - **Content-only accounts:** grant selected Telegram users three isolated tools—clean direct-voice transcription, summarized forwarded-voice packages, and text proofreading—without exposing commands, memory, or assistant workflows.
 - **Apple Notes integration:** append diary entries, and incrementally import private non-shared notes into local long-term memory.
