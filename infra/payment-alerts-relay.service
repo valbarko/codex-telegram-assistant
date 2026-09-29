@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram relay for owner payment digests
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/codex-payment-alerts-relay.env
+WorkingDirectory=/opt/inyourbody-telegram-relay
+ExecStart=/usr/bin/python3 /opt/inyourbody-telegram-relay/telegram_relay.py
+Restart=always
+RestartSec=3
+User=telegram-relay
+Group=telegram-relay
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

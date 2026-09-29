@@ -280,9 +280,9 @@ function readPaymentSnapshot(string $project, string $since, string $afterAt, st
     }
 }
 
-function sendPaymentDigest(string $token, string $ownerId, string $text): void
+function sendPaymentDigest(string $relayUrl, string $relaySecret, string $relayCaFile, string $ownerId, string $text): void
 {
-    $curl = curl_init('https://api.telegram.org/bot' . $token . '/sendMessage');
+    $curl = curl_init($relayUrl);
     if ($curl === false) {
         throw new RuntimeException('telegram_unavailable');
     }
@@ -292,10 +292,14 @@ function sendPaymentDigest(string $token, string $ownerId, string $text): void
             'chat_id' => $ownerId,
             'text' => $text,
             'parse_mode' => 'HTML',
-            'link_preview_options' => ['is_disabled' => true],
+            'disable_web_page_preview' => true,
         ], JSON_THROW_ON_ERROR),
-        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $relaySecret],
         CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CAINFO => $relayCaFile,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_CONNECTTIMEOUT => 5,
         CURLOPT_TIMEOUT => 20,
     ]);
     $response = curl_exec($curl);
@@ -325,15 +329,19 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
             exit(0);
         }
         $config = json_decode((string) file_get_contents('/etc/codex-payment-alerts.json'), true, 512, JSON_THROW_ON_ERROR);
-        $token = (string) ($config['telegram_bot_token'] ?? '');
+        $relayUrl = (string) ($config['relay_url'] ?? '');
+        $relaySecret = (string) ($config['relay_secret'] ?? '');
+        $relayCaFile = (string) ($config['relay_ca_file'] ?? '');
         $ownerId = (string) ($config['owner_chat_id'] ?? '');
-        if (!preg_match('/^\d+:[A-Za-z0-9_-]+$/D', $token)
+        if (!preg_match('~^https://[0-9.]+:\d{2,5}/telegram/send$~D', $relayUrl)
+            || !preg_match('/^[A-Za-z0-9_-]{32,128}$/D', $relaySecret)
+            || $relayCaFile !== '/etc/codex-payment-relay.crt'
             || !preg_match('/^[1-9]\d{0,19}$/D', $ownerId)) {
             throw new RuntimeException('invalid_config');
         }
         $database = new PDO('sqlite:/var/lib/codex-payment-alerts/payment-alerts.sqlite');
         $service = new ServerPaymentAlerts($database, Closure::fromCallable('readPaymentSnapshot'),
-            static fn (string $message) => sendPaymentDigest($token, $ownerId, $message));
+            static fn (string $message) => sendPaymentDigest($relayUrl, $relaySecret, $relayCaFile, $ownerId, $message));
         if ($mode === '--init') {
             $service->initialize(new DateTimeImmutable('now'));
             echo "state_initialized\n";
