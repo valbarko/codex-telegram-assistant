@@ -64,11 +64,11 @@ console.log("Codex Telegram Assistant starting");
 console.log(`Data: ${configuration.dataDirectory}`);
 health.start();
 scheduler.start();
+paymentAlerts?.start();
 void appleNotes.start()
   .then((result) => { if (result) console.log(formatAppleNotesImportResult(result)); })
   .catch((error) => console.error("Initial Apple Notes import failed", error));
 await telegram.start();
-paymentAlerts?.start();
 
 function nextLocalTime(hours: number, minutes: number): number {
   const date = new Date();
