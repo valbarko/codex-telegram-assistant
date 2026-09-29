@@ -16,11 +16,13 @@
 
 `payment-alerts.timer` запускает `payment-alerts.service` на сервере. PHP-скрипт
 `scripts/server-payment-alerts.php` читает четыре базы через
-`scripts/payment-snapshot.php` и отправляет сообщения владельцу через Telegram
-Bot API. Компьютер владельца для этого не нужен. Локальная проверка в основном
-процессе помощника удалена, чтобы не было дублей. Токен бота и ID владельца
-хранятся только в `/etc/codex-payment-alerts.json` с правами `0600`; файл не
-попадает в репозиторий. Формат: `telegram_bot_token` и `owner_chat_id`.
+`scripts/payment-snapshot.php` и отправляет сообщения владельцу через отдельный
+Telegram relay на `vps3`. Компьютер владельца для этого не нужен. Локальная
+проверка в основном процессе помощника удалена, чтобы не было дублей. Токен
+бота хранится только на relay-хосте в `/etc/codex-payment-alerts-relay.env` с
+правами `0600`. На сервере проектов в `/etc/codex-payment-alerts.json` находятся
+адрес relay, отдельный секрет доступа, путь к доверенному сертификату и ID
+владельца. Оба приватных файла не попадают в репозиторий.
 
 Курсоры и номера уже отправленных счетов хранятся в
 `/var/lib/codex-payment-alerts/payment-alerts.sqlite`. Имена и суммы в этом файле
@@ -33,8 +35,11 @@ Bot API. Компьютер владельца для этого не нужен
 сбой строго между успешной отправкой и записью в SQLite может дать повтор.
 
 Код живёт в `/opt/codex-payment-alerts/current`; версии можно менять атомарно
-через симлинк. Systemd-файлы находятся в `infra/payment-alerts.service` и
-`infra/payment-alerts.timer`. Проверка расписания:
+через симлинк. На `vps3` отдельный unit из `infra/payment-alerts-relay.service`
+использует существующий код `/opt/inyourbody-telegram-relay/telegram_relay.py`.
+Его порт доступен только серверу проектов, а запросы требуют отдельный секрет.
+Сертификат relay доверен через `/etc/codex-payment-relay.crt` на сервере проектов.
+Проверка расписания:
 
 ```bash
 systemd-analyze calendar '*-*-* 09..20:00:00 Europe/Moscow'
