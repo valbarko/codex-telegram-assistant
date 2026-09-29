@@ -1,0 +1,15 @@
+[Unit]
+Description=Owner payment digest for four projects
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/php /opt/codex-payment-alerts/current/server-payment-alerts.php
+WorkingDirectory=/opt/codex-payment-alerts/current
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/codex-payment-alerts
+TimeoutStartSec=10min

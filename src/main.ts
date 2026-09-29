@@ -5,7 +5,6 @@ import { readConfiguration } from "./configuration.js";
 import { CodexHub } from "./codex-engine.js";
 import { HindsightKnowledgeService } from "./hindsight-service.js";
 import { MemoryService } from "./memory-service.js";
-import { PaymentAlertMonitor } from "./payment-alerts.js";
 import { RuntimeHealthMonitor } from "./runtime-health.js";
 import { BackgroundScheduler } from "./scheduler.js";
 import { AssistantDatabase } from "./storage.js";
@@ -29,17 +28,6 @@ const health = new RuntimeHealthMonitor(configuration.heartbeatFile, configurati
   () => telegram.runtimeHealth());
 telegram.attachHealthMonitor(health);
 const scheduler = new BackgroundScheduler(configuration, database, hub, telegram.bot, memory);
-const paymentAlerts = configuration.paymentAlertsEnabled && configuration.paymentAlertOwnerId !== undefined
-  ? new PaymentAlertMonitor(path.join(configuration.dataDirectory, "payment-alerts.sqlite"),
-    configuration.paymentAlertOwnerId,
-    async (ownerId, text, url) => {
-      await telegram.bot.api.sendMessage(ownerId, text, {
-        parse_mode: "HTML",
-        link_preview_options: { is_disabled: true },
-        reply_markup: { inline_keyboard: [[{ text: "Открыть в проекте", url }]] },
-      });
-    })
-  : undefined;
 
 let stopping = false;
 async function shutdown(signal: string): Promise<void> {
@@ -48,7 +36,6 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`Stopping after ${signal}`);
   appleNotes.stop();
   scheduler.stop();
-  paymentAlerts?.stop();
   health.stop();
   telegram.stop();
   hub.shutdown();
@@ -64,7 +51,6 @@ console.log("Codex Telegram Assistant starting");
 console.log(`Data: ${configuration.dataDirectory}`);
 health.start();
 scheduler.start();
-paymentAlerts?.start();
 void appleNotes.start()
   .then((result) => { if (result) console.log(formatAppleNotesImportResult(result)); })
   .catch((error) => console.error("Initial Apple Notes import failed", error));

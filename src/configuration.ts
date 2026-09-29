@@ -17,8 +17,6 @@ export interface AppConfiguration {
   telegramToken: string;
   allowedUsers: ReadonlySet<number>;
   transcriptionOnlyUsers: ReadonlySet<number>;
-  paymentAlertsEnabled: boolean;
-  paymentAlertOwnerId?: number;
   homeDirectory: string;
   dataDirectory: string;
   writingArchiveDirectory: string;
@@ -75,12 +73,6 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
   if (overlappingUser !== undefined) {
     throw new Error(`Telegram user ${overlappingUser} cannot have both full and transcription-only access`);
   }
-  const paymentAlertsEnabled = parseBoolean(env.PAYMENT_ALERTS_ENABLED, false);
-  const paymentAlertOwnerId = parseOptionalPositiveInteger(env.PAYMENT_ALERT_OWNER_ID, "PAYMENT_ALERT_OWNER_ID")
-    ?? (allowedUsers.size === 1 ? [...allowedUsers][0] : undefined);
-  if (paymentAlertsEnabled && (paymentAlertOwnerId === undefined || !allowedUsers.has(paymentAlertOwnerId))) {
-    throw new Error("PAYMENT_ALERT_OWNER_ID must be a full-access Telegram user");
-  }
   const homeDirectory = env.HOME?.trim() || cwd;
   const defaultWorkspace = path.resolve(env.ASSISTANT_WORKSPACE?.trim() || cwd);
   const dataDirectory = path.resolve(env.ASSISTANT_DATA_DIR?.trim() || path.join(homeDirectory, ".local", "share", "codex-telegram-assistant"));
@@ -109,8 +101,6 @@ export function readConfiguration(cwd = process.cwd(), environment: NodeJS.Proce
     telegramToken,
     allowedUsers,
     transcriptionOnlyUsers,
-    paymentAlertsEnabled,
-    paymentAlertOwnerId,
     homeDirectory,
     dataDirectory,
     writingArchiveDirectory: path.resolve(env.WRITING_ARCHIVE_DIR?.trim() || path.join(homeDirectory, "Documents", "Codex Writer")),

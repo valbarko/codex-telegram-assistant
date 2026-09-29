@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly owner payment digest, 09:00–20:00 Moscow
+
+[Timer]
+OnCalendar=*-*-* 09..20:00:00 Europe/Moscow
+AccuracySec=1min
+Persistent=false
+Unit=payment-alerts.service
+
+[Install]
+WantedBy=timers.target
