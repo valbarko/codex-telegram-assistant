@@ -1,8 +1,11 @@
 # Agent instruction structure
 
-This change covers the repository and Valentin's global Codex instructions in one
-PR. The global files below are reviewed installation sources; opening or merging
-this PR does not activate them in `~/.codex`.
+This one PR versions Valentin's global, shared and project instruction sources.
+The manifest maps 38 files to local targets on his Mac: global/shared rules,
+14 project AGENTS files, their references, and existing runbook/template
+updates. Opening or merging the PR alone does not activate the external targets.
+The installer applies the reviewed bundle separately; no application deployment
+or production-server operation is part of this migration.
 
 ## Three increasingly radical passes
 
@@ -12,8 +15,11 @@ this PR does not activate them in `~/.codex`.
 | 2 — structural | Separate code, authoring, and non-code workflows; give every reference an explicit trigger. | Adopted as the file boundaries. |
 | 3 — radical | Replace copies of canonical policies with pointers; remove eager RTK import and environment caches. | Adopted where a verified source already owns the rule. Owner-specific guardrails remain explicit. |
 
-The three subagents audited independently. The final structure combines the second
-pass's task boundaries with the third pass's pruning; it is one implementation.
+The same three subagents audited both levels, then the other projects. They
+implemented disjoint source folders and cross-reviewed coverage and installation.
+The final structure combines the second pass's task boundaries with the third
+pass's pruning; it is one implementation, not three competing PRs. The installed
+`writing-for-agents` skill supplies the pointer/disclosure/pruning method.
 
 ## File ownership
 
@@ -26,8 +32,10 @@ pass's task boundaries with the third pass's pruning; it is one implementation.
 | [../config/agent-instructions/CODING_STANDARDS.md](../config/agent-instructions/CODING_STANDARDS.md) | Source for `~/.codex/agent-instructions/CODING_STANDARDS.md`; code, copy, UI, browser, LAN, CodeGraph, and shared-host branches. |
 | [../config/agent-instructions/WORKFLOWS.md](../config/agent-instructions/WORKFLOWS.md) | Source for `~/.codex/agent-instructions/WORKFLOWS.md`; completion, release, artifacts, memory, evidence, and tools. |
 
-`AGENTS.global.md` is deliberately not named `AGENTS.md` in the checkout: the
-installation source must not become an extra directory-scoped instruction file.
+Shared sources live in `config/agent-instructions/shared/`; project sources in
+`config/agent-instructions/projects/<project>/`.
+`AGENTS.global.md` and `AGENTS.project.md` are deliberately not named `AGENTS.md`
+in the source bundle: templates must not become directory-scoped instructions.
 Read referenced sections only when their trigger fires. Do not import either
 CODING_STANDARDS or WORKFLOWS unconditionally.
 
@@ -72,32 +80,105 @@ Shared policies, RTK, installed skills, and profiles are dependencies on Valenti
 Mac. Missing dependencies must be reported for the affected branch; their absence
 does not block unrelated work. Existing style and application files are unchanged.
 
-## Apply the global source after review
+## Cross-project migration
 
-Apply from the reviewed checkout on Valentin's Mac:
+The install manifest is the exact source/target inventory. Its baseline hashes
+capture the reviewed local files, including owner-specific additions. It contains
+paths and hashes, never credentials or private corpus/profile contents.
 
-1. Read the current global AGENTS and any existing reference directory. Diff each
-   managed file against its reviewed source and reconcile later edits. In a fresh
-   backup directory under `~/.codex`, snapshot every existing managed file and
-   record its SHA-256 hash; record absence for targets that do not yet exist.
-2. Stage all three reviewed files as temporary siblings of their intended targets.
-   Check staged content and local dependencies before changing live files. Preserve
-   all other files in an existing `~/.codex/agent-instructions/` directory.
-3. Immediately before replacing each reference file, compare that live target with
-   its snapshot hash or recorded absence. Reconcile drift before continuing; then
-   atomically rename the staged reference into place. Record its installed hash.
-4. Compare the live global AGENTS with its snapshot again, and both reference files
-   with their just-installed hashes. If any differs, reconcile before continuing.
-   Activate the staged AGENTS by atomic rename only after both targets are ready.
-5. Record the installed files' hashes and backup path. Start a fresh Codex task to
-   exercise the routing below; this conversation already contains the old rules.
+| Bundle | Installed project level | AGENTS lines before → after |
+| --- | --- | --- |
+| Global | `~/.codex/AGENTS.md` | 198 → 24 |
+| Shared | `WORK/valentin-rules/AGENTS.shared.md` | 331 → 29 |
+| Assistant | `WORK/codex-telegram-assistant` | 33 → 13 |
+| TVK | `WORK/trenervkarmane` | 338 → 34 |
+| GMK | `WORK/gde-moi-klienty` | 344 → 33 |
+| GU | `WORK/gdeucheniki` | 106 → 20 |
+| GMD | `WORK/gde-moi-dengi`, including `app/` | 5 + 200 → 6 + 20 |
+| TVP | `WORK/telovporiadke` | 36 → 19 |
+| Dialogs | `WORK/dialogs` | 15 → 10 |
+| ValBarko | `WORK/valbarko-site` and `Documents/ChatGPT/ValBarko.ru` | 27 → 9 in each |
+| WellTravel | `Documents/WellTravelClub` | 89 → 38 |
+| DDX | `WORK/ddxmoremall` | 20 → 17 |
+| RoadFlow | `WORK/roadflow-lab` | 10 → 6 |
+| Writing bank | `WORK/valentin-writing` | 17 → 15 |
 
-For rollback, first compare live files with the recorded installation hashes.
-Preserve/reconcile later edits rather than overwriting them. Restore the previous
-global AGENTS atomically, then restore only the previously existing managed
-reference files from their snapshots. Remove newly created managed files only
-when their hashes still match this installation. Preserve all other directory
-entries and later edits. Keep the snapshot until the new routing is accepted.
+Counts describe the always-loaded files, not all reference material. DDX keeps
+its useful compact boundaries; the goal is relevant instructions, not minimum
+line count. Small projects reuse existing runbooks instead of gaining empty
+CODING_STANDARDS files. GMD keeps both root routing and app-specific scope.
+
+Shared standards own PHP/CI, analytics, browser/code-map and infrastructure
+branches; shared workflows own lane selection, delivery, cleanup and backup.
+Project standards retain data/product/UI constraints; TVK/GMK/GMD workflows
+retain their distinct wrappers, access, release and isolation requirements.
+Existing canonical browser, UI, SEO, proxy, typography and marketing policies
+remain authoritative. TVK's linked lane document is reconciled with its root
+rules on reclassification, retired staging and WORK checkout examples.
+WellTravel analytics replaces its unavailable static-patch helper reference
+with a snapshot/diff/hash-checked procedure. Weekly analytics discovers an
+existing clean baseline instead of assuming a nonexistent fixed GMK checkout.
+
+Two inspected TVP feature worktrees (`telovporiadke-learning-courses` and
+`telovporiadke-zero-carbs`) are excluded from installation. Their task-specific
+snapshots belong to their branches; this migration does not rewrite other task
+checkouts. Both independent ValBarko copies are mapped explicitly. Sibling
+repositories receive only the listed instruction/reference files as local
+changes; their branches, commits and unrelated files are not synchronized.
+All reviewed migration sources remain versioned in this one PR.
+
+## Plan, apply, verify and restore
+
+Run from this reviewed checkout on Valentin's Mac:
+
+```bash
+rtk proxy python3 -B scripts/agent-instructions.py plan
+rtk proxy python3 -B scripts/agent-instructions.py apply
+rtk proxy python3 -B scripts/agent-instructions.py check
+```
+
+`plan` checks source SHA-256 and every target's reviewed baseline without writing.
+`current` is a safe no-op, `create`/`replace` is planned, and `drift` stops the
+whole apply before replacement. Reconcile drift in the source bundle and manifest
+before retrying. Treat the manifest as a reviewed Mac-specific inventory, not a
+generic installer for another machine. Recompute a source checksum whenever its
+reviewed content changes; new target baselines require a fresh review/snapshot.
+
+`apply` snapshots managed files and original modes in a private directory under
+`~/.codex/backups/agent-instructions-*`, prints its path, and stages all new files.
+References precede project/shared routers; the global router activates last.
+Immediately before each rename it rechecks the live target, staged content and
+already-current/installed references. It then verifies every installed hash.
+Atomicity is per file; the batch is not a filesystem transaction. A conflict or
+interruption may leave a partial install; use its recovery journal. Concurrent
+writers cannot be locked by this utility, so stop editing managed files during
+apply; preflight and immediate rechecks detect observed drift.
+
+Restore only the files owned by that installation:
+
+```bash
+rtk proxy python3 -B scripts/agent-instructions.py rollback --backup /absolute/printed/backup
+```
+
+Rollback checks installed hashes and snapshot integrity, restores routers before
+removing their new references, and preserves unrelated directory entries. Later
+managed-file edits stop rollback; preserve/reconcile those edits first. Keep the
+backup until routing is accepted. RTK, profiles, corpus, skill sources, application
+runtime, databases and production infrastructure are outside the manifest.
+
+## Verification scope
+
+```bash
+rtk proxy python3 -B test/agent-instructions-test.py
+```
+
+Filesystem integration tests cover apply/rollback, permissions, repeat application,
+baseline drift, concurrent edits (including intent-journal writes), changed
+references, symlink targets, modified sources and corrupt snapshots. Cross-project
+checks verify source hashes, target mappings, sibling links, canonical dependencies,
+existing project runbooks, and the old-to-new guard coverage. A temporary replay
+of the full manifest checks installation and restoration without touching live
+paths. These are instruction/configuration checks, not server or product QA.
 
 ## Routing checks
 
@@ -115,8 +196,16 @@ entries and later edits. Keep the snapshot until the new routing is accepted.
 | Preview from a phone | CODING_STANDARDS → Phone previews; LaunchAgent, LAN URL, three-hour TTL. |
 | Enable an optional MCP or challenge a factual correction | WORKFLOWS → the matching RTK policy. |
 | Deliver a spreadsheet | WORKFLOWS → Artifacts; file and verification, clickable link without automatic preview. |
+| TVK Android push/badge source change without a build | Project WORKFLOWS → Store artifacts: frozen RC4 and provider/source scope. |
+| TVK/GMK analytics UI design without editing code | Shared CODING_STANDARDS → Analytics: existing no-banner and private-data boundaries. |
+| TVK Tiny task grows to DB or broader visual QA | Reclassify the same authorized task; read the new lane's checks. |
+| GU production planning | Accepted direct-production ADRs; preserve isolated/exact-main release and reuse decisions. |
+| GMD app code review without implementation | App standards and scope; read-only review does not initiate SSH or local services. |
+| TVK/GMK weekly report | Canonical shared weekly analytics; read-only discovery of an existing clean baseline. |
 
 Validate relative file links and the local-only paths separately. Review every old
 section against the migration map and every trigger against these scenarios.
-Static checks establish reachability and rule ownership; actual agent compliance
-requires exercising the reviewed global bundle in a fresh task after installation.
+Static checks establish reachability and rule ownership. They do not measure
+model-default no-ops or guarantee actual agent compliance. A fresh task after
+installation is needed to assess runtime routing; this conversation already
+contains the previous instructions.

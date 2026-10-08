@@ -1,0 +1,233 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "source": "config/agent-instructions/CODING_STANDARDS.md",
+      "source_sha256": "0436a925cbd2d6cf598b551838e3530044ec7dea3cd1541b19c4765a9d78bf10",
+      "target": "/Users/valentinbarko/.codex/agent-instructions/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/WORKFLOWS.md",
+      "source_sha256": "ac61b3f60fee40057c3abb7a89645e3ccc285bbfd13f9ac21a85f0224e4bb7fc",
+      "target": "/Users/valentinbarko/.codex/agent-instructions/WORKFLOWS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "CODING_STANDARDS.md",
+      "source_sha256": "5f330d94c768a7eb1daa295417bf05365bd224a536894351b02ff0afde7b3726",
+      "target": "/Users/valentinbarko/WORK/codex-telegram-assistant/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "writing/AGENT_WRITING.md",
+      "source_sha256": "cb620f2e7243df15cac14c5e5b4ddeba24ec44e3b584586e24a02db16e84368e",
+      "target": "/Users/valentinbarko/WORK/codex-telegram-assistant/writing/AGENT_WRITING.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "docs/agent-instructions.md",
+      "source_sha256": "81eb8f564d12e9779a9d600cf14c9845acd2382e9eb21683f7002acf3c0cba64",
+      "target": "/Users/valentinbarko/WORK/codex-telegram-assistant/docs/agent-instructions.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/shared/CODING_STANDARDS.md",
+      "source_sha256": "6740dfce993c7de22fe34061bf9a7de071b51a32eb9ca36ddca2a880e176dcc3",
+      "target": "/Users/valentinbarko/WORK/valentin-rules/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/shared/WORKFLOWS.md",
+      "source_sha256": "9979b4a7555fab7eb6f215e2bb7bca5f1c3250fefe4b62e36f291fb227218137",
+      "target": "/Users/valentinbarko/WORK/valentin-rules/WORKFLOWS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/shared/project-rules.template.md",
+      "source_sha256": "444e84a421bd2f9b73c8a126ce78fe3a59c0474105e1f6492e91ddd835eb5984",
+      "target": "/Users/valentinbarko/WORK/valentin-rules/templates/project-rules.md",
+      "expected_sha256": "267c88bcd4af16bd6a4836154526831f9cab4c249cf3fc5becd3a4017fb30d87"
+    },
+    {
+      "source": "config/agent-instructions/shared/codex-weekly-analytics.md",
+      "source_sha256": "e76ece4699fbd0673ff13f4d7deece7925996d89b6358b9693d1cdd14b2dbd18",
+      "target": "/Users/valentinbarko/WORK/valentin-rules/codex-weekly-analytics.md",
+      "expected_sha256": "342e9aa2f0c718a672da52c0401c7bf2658f2b0552fdabbace8cd0a5b795b338"
+    },
+    {
+      "source": "config/agent-instructions/projects/trenervkarmane/CODING_STANDARDS.md",
+      "source_sha256": "8c4846f28779bce9b78f57208d1f642470a4cca8a578099c13cc024f035ebcd8",
+      "target": "/Users/valentinbarko/WORK/trenervkarmane/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/trenervkarmane/WORKFLOWS.md",
+      "source_sha256": "1b7110b624f92f25fe673b27cf168cd50e6b3ad4334ae573d4bceed59fb4e6b0",
+      "target": "/Users/valentinbarko/WORK/trenervkarmane/WORKFLOWS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/trenervkarmane/docs/codex/codex-workflow-routing.md",
+      "source_sha256": "a0c8fc2d7405090768152ffc28e19f2557b89ca56b2b070c0df61785a9904f58",
+      "target": "/Users/valentinbarko/WORK/trenervkarmane/docs/codex/codex-workflow-routing.md",
+      "expected_sha256": "5abeb0ba406bd51bf9d913fb9daef4b07c025d957d995db3b90b78fc136e6007"
+    },
+    {
+      "source": "config/agent-instructions/projects/gde-moi-klienty/CODING_STANDARDS.md",
+      "source_sha256": "69f40c29f2f188f0378e42a8e239988eef3fba66a647c012fe91c33af283803d",
+      "target": "/Users/valentinbarko/WORK/gde-moi-klienty/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/gde-moi-klienty/WORKFLOWS.md",
+      "source_sha256": "9e559c5cedb40308e0f974e30d4ed3a94e6120accea8c9427d10159394f7f30d",
+      "target": "/Users/valentinbarko/WORK/gde-moi-klienty/WORKFLOWS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/gdeucheniki/CODING_STANDARDS.md",
+      "source_sha256": "a2beb5064f405d9299c123bba27738067e1243ea5770a1a058d96df142c2efe8",
+      "target": "/Users/valentinbarko/WORK/gdeucheniki/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/gde-moi-dengi/app/CODING_STANDARDS.md",
+      "source_sha256": "bbc25355217a1e83e78bcb5c238190b207df139a0e57d0afec8c119a800ab681",
+      "target": "/Users/valentinbarko/WORK/gde-moi-dengi/app/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/gde-moi-dengi/app/WORKFLOWS.md",
+      "source_sha256": "324ce1bd27207c5a2d166714763ea7f7035445d28543476bca628eb51867b05e",
+      "target": "/Users/valentinbarko/WORK/gde-moi-dengi/app/WORKFLOWS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/telovporiadke/CODING_STANDARDS.md",
+      "source_sha256": "ef8fa9b73d641b8a11425a7db7bb4ae90a8d76525b6c5bf420a18675da7a1d0f",
+      "target": "/Users/valentinbarko/WORK/telovporiadke/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/dialogs/CODING_STANDARDS.md",
+      "source_sha256": "f20a7bfba23ee0f70a76a8c88d98b6aef1ef6b78ea0c82b744e38caa2752a686",
+      "target": "/Users/valentinbarko/WORK/dialogs/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/valbarko/CODING_STANDARDS.md",
+      "source_sha256": "f4b41539411f0bb00f67d979859af5a0954bbba4a024e4e4a110ed67328dcf63",
+      "target": "/Users/valentinbarko/WORK/valbarko-site/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/valbarko/CODING_STANDARDS.md",
+      "source_sha256": "f4b41539411f0bb00f67d979859af5a0954bbba4a024e4e4a110ed67328dcf63",
+      "target": "/Users/valentinbarko/Documents/ChatGPT/ValBarko.ru/CODING_STANDARDS.md",
+      "expected_sha256": null
+    },
+    {
+      "source": "config/agent-instructions/projects/welltravel/docs/agent-workflows/analytics.md",
+      "source_sha256": "61ce6aee65784485f10ebfd12638f41a40e2494bcb318a050e0c76666cff8baf",
+      "target": "/Users/valentinbarko/Documents/WellTravelClub/docs/agent-workflows/analytics.md",
+      "expected_sha256": "579c41bb0cf9b400c93a5854ebbccd84cddb8b4e5cfa2831802f8d6bd3c45279"
+    },
+    {
+      "source": "config/agent-instructions/shared/AGENTS.shared.md",
+      "source_sha256": "83d3860470be95d0f059ab2d09ceab136a32d9256a8f685f3696370012fbfda0",
+      "target": "/Users/valentinbarko/WORK/valentin-rules/AGENTS.shared.md",
+      "expected_sha256": "445d735cbce7ebe237facd2b6167c297202749989f513740fd1d17515af5d4e5"
+    },
+    {
+      "source": "config/agent-instructions/projects/trenervkarmane/AGENTS.project.md",
+      "source_sha256": "d41c7c21c0c2fca5d124e5c69709be78fd2079ef9a053d3f6fe35580317e98e6",
+      "target": "/Users/valentinbarko/WORK/trenervkarmane/AGENTS.md",
+      "expected_sha256": "d7ab3945217f8498cf42c377306604f7822c66fcd2cd97c10756d22350e8375b"
+    },
+    {
+      "source": "config/agent-instructions/projects/gde-moi-klienty/AGENTS.project.md",
+      "source_sha256": "8404cdda799a207e0626fb46510e463e3e932b25210d04adfaa337623291b243",
+      "target": "/Users/valentinbarko/WORK/gde-moi-klienty/AGENTS.md",
+      "expected_sha256": "4f862ff69fa1a6958d4aa7c75beaf7f738c962ff44e17bedb059eab6d9e47cbb"
+    },
+    {
+      "source": "config/agent-instructions/projects/gdeucheniki/AGENTS.project.md",
+      "source_sha256": "b035e0af5a37979405af28b4405b36382f70bfdea932465d01441b290b3c777f",
+      "target": "/Users/valentinbarko/WORK/gdeucheniki/AGENTS.md",
+      "expected_sha256": "1d9e3e44fda08add8fcffeff0f5f0016bbaef3fa7de57c3939e1bda45449a941"
+    },
+    {
+      "source": "config/agent-instructions/projects/gde-moi-dengi/AGENTS.project.md",
+      "source_sha256": "3b4fc0b94775272a0a75d958c67e6c2e2e9c2df8fbd8b5678f86e017a7f7c153",
+      "target": "/Users/valentinbarko/WORK/gde-moi-dengi/AGENTS.md",
+      "expected_sha256": "e315f0392c5aeeeaaa2deb954c4a37ca525c0d9dc77d4400594d4ad766d22693"
+    },
+    {
+      "source": "config/agent-instructions/projects/gde-moi-dengi/app/AGENTS.project.md",
+      "source_sha256": "0b5bce393a313935e6645d9146402b16eb76c05b176ab1226eeb20995cb6583e",
+      "target": "/Users/valentinbarko/WORK/gde-moi-dengi/app/AGENTS.md",
+      "expected_sha256": "d2a4593fdd4176671c6a5f14573b73e9a1ff554256f441786a3187d1f6f9409f"
+    },
+    {
+      "source": "config/agent-instructions/projects/telovporiadke/AGENTS.project.md",
+      "source_sha256": "bdfc398c060bbb35abcda222dcad60fedfde4e0bab7d811bcd22339ed83879ae",
+      "target": "/Users/valentinbarko/WORK/telovporiadke/AGENTS.md",
+      "expected_sha256": "faddf36be742d20e62886af9c45082135b81cdf03db129238549f0f904ad170e"
+    },
+    {
+      "source": "config/agent-instructions/projects/dialogs/AGENTS.project.md",
+      "source_sha256": "cee0aa47fe0bb8fb987823f198697ec8d6a8e38320e1096a67683012ad17a4ed",
+      "target": "/Users/valentinbarko/WORK/dialogs/AGENTS.md",
+      "expected_sha256": "e4110a48cb93c24e793d63053a1f33b7758d4a89938fd0fa8c42d54b0b3836c3"
+    },
+    {
+      "source": "config/agent-instructions/projects/ddxmoremall/AGENTS.project.md",
+      "source_sha256": "2416168ce41f00380788253a623567880bcfc95cd9d447babfd07e2b3a2afc0b",
+      "target": "/Users/valentinbarko/WORK/ddxmoremall/AGENTS.md",
+      "expected_sha256": "3622de139e3869fa337ccb0b5bc9c2e0c5657c05cfc5799d4b14cefa43a74314"
+    },
+    {
+      "source": "config/agent-instructions/projects/roadflow-lab/AGENTS.project.md",
+      "source_sha256": "6b916bc7073f1993748657ec185e871524d0d4da72544c273cc9cb6fc9b77251",
+      "target": "/Users/valentinbarko/WORK/roadflow-lab/AGENTS.md",
+      "expected_sha256": "153096736ce46cf927df8c0e72a77cd7bc8e312616de0661d29ff51b99cba72c"
+    },
+    {
+      "source": "config/agent-instructions/projects/valentin-writing/AGENTS.project.md",
+      "source_sha256": "d3a55a13aa10300868a5f33f99bf09e8f154ffc47b1aff01f81112834ba8f6c1",
+      "target": "/Users/valentinbarko/WORK/valentin-writing/AGENTS.md",
+      "expected_sha256": "92e1ed9d25d189b9bc815283680305c202db8e2fa98cb25dc225074b2bb36931"
+    },
+    {
+      "source": "config/agent-instructions/projects/valbarko/AGENTS.project.md",
+      "source_sha256": "03a388e8d3c681f4ed78ee17075df04846be2cfee5259d6e564893eadab01075",
+      "target": "/Users/valentinbarko/WORK/valbarko-site/AGENTS.md",
+      "expected_sha256": "cc23c4dc56f28709ed53b2a1f81aed6cde41bcb02968ca76ffc3236779c29eb8"
+    },
+    {
+      "source": "config/agent-instructions/projects/valbarko/AGENTS.project.md",
+      "source_sha256": "03a388e8d3c681f4ed78ee17075df04846be2cfee5259d6e564893eadab01075",
+      "target": "/Users/valentinbarko/Documents/ChatGPT/ValBarko.ru/AGENTS.md",
+      "expected_sha256": "cc23c4dc56f28709ed53b2a1f81aed6cde41bcb02968ca76ffc3236779c29eb8"
+    },
+    {
+      "source": "config/agent-instructions/projects/welltravel/AGENTS.project.md",
+      "source_sha256": "d3444a48d40421f404fbeec66d24a0485bb33ec83fe2f885fd81a005241aea0a",
+      "target": "/Users/valentinbarko/Documents/WellTravelClub/AGENTS.md",
+      "expected_sha256": "4bb9c61a10ad489f333a3d472fbdb93f5ed07e05888f8edfe63d7731e1992a5c"
+    },
+    {
+      "source": "AGENTS.md",
+      "source_sha256": "081d585523bd6e9f320f9abd89334c1bcc748d8d2df84b9a476eff5a36ca6448",
+      "target": "/Users/valentinbarko/WORK/codex-telegram-assistant/AGENTS.md",
+      "expected_sha256": "3e7cba2bca3d63477e83179dbe65afd93d6b43bd57230c56e8bbadd30a1fff70"
+    },
+    {
+      "source": "config/agent-instructions/AGENTS.global.md",
+      "source_sha256": "1308be447fe72f520eeaa9d097fea103df1fe7a8fc9127be22a0d3863eb52657",
+      "target": "/Users/valentinbarko/.codex/AGENTS.md",
+      "expected_sha256": "3587aeaabb7b6c5c61b33bfc3ae2dceede1233d9db1698b920ba4bde8291563c"
+    }
+  ]
+}
