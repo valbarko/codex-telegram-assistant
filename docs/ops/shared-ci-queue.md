@@ -56,6 +56,11 @@ not removed on a listener restart. Preexisting hooks/paths/groups cause refusal.
 Runner `.env`, `.runner`, credentials, labels, ExecStart and application releases
 are not modified. Installation itself does not restart listeners.
 
+The STARTED entrypoint is `/usr/local/libexec/shared-ci-queue-hook.sh`. The
+`.sh` suffix is required by the runner's script interpreter selection; a
+shebang alone does not make an extensionless path acceptable to the runner.
+See GitHub's [runner hook script requirements](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/run-scripts).
+
 ```sh
 rtk proxy ssh gmk-root python3 /var/tmp/REVIEWED-QUEUE.py install --backup /var/backups/shared-ci-queue-TIMESTAMP
 rtk proxy ssh gmk-root /usr/local/sbin/shared-ci-queue reconcile
@@ -120,6 +125,9 @@ cancellation while waiting, abrupt Worker/keeper death, orphan incident latching
 same-unit waiting without state overwrite, group permissions and frozen recovery.
 Fixtures use separate transient units, tiny CPU/memory budgets and private
 temporary storage. They do not mutate production runner units, labels or secrets.
+They reject an extensionless reviewed hook before allocation and execute the
+fixture `.sh` entrypoint with `bash -e`, matching the runner's shell invocation.
+This fixture does not replace the final successful job through the real runner.
 Preserve their evidence and remove only their owned units, processes and group.
 The executable fixture copy is staged under `/var/lib` because `/run` is
 mounted noexec on this host. Evidence defaults to `.private/reports/ci-queue-linux`

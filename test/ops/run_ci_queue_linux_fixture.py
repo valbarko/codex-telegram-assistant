@@ -29,6 +29,23 @@ import traceback
 FIXTURE_PARENT = Path('/var/lib')
 
 
+def hook_command(path):
+    # Runner selects the hook interpreter by extension before starting the
+    # script. Directly exec'ing an extensionless shebang would miss that gate.
+    if Path(path).suffix != '.sh':
+        raise RuntimeError('Fixture requires the runner-supported .sh hook extension')
+    return ['/usr/bin/bash', '-e', str(path)]
+
+
+def reviewed_hook_path(source):
+    match = re.search(r"^HOOK = Path\('([^'\n]+)'\)$", source.decode(), re.MULTILINE)
+    if match is None:
+        raise RuntimeError('Cannot establish reviewed hook path')
+    path = Path(match.group(1))
+    hook_command(path)
+    return path
+
+
 def validate_base(base, fresh=False):
     """Confine destructive cleanup to the root-created, non-symlink fixture dir."""
     if (not base.is_absolute() or base.parent != FIXTURE_PARENT
@@ -89,7 +106,7 @@ def worker(config):
         raise SystemExit(143)
     signal.signal(signal.SIGTERM, cancel)
     with (directory / (identity + '.hook.log')).open('w') as log:
-        hook = subprocess.Popen([config['hook']], stdout=log, stderr=log)
+        hook = subprocess.Popen(hook_command(config['hook']), stdout=log, stderr=log)
         event(directory, identity, 'hook-waiting', hook_pid=hook.pid)
         code = hook.wait(timeout=70)
     event(directory, identity, 'hook-return', hook_code=code)
@@ -147,7 +164,7 @@ class Replay:
                            'c': ('valci', 'valbarko/vbclub-training')}
         self.root = base / 'state'
         self.library = base / 'shared-ci-queue.py'
-        self.hook = base / 'hook'
+        self.hook = base / 'hook.sh'
         self.evidence = {'source_sha256': hashlib.sha256(source).hexdigest(), 'prefix': self.prefix,
                          'started_at': time.time(), 'limits': {'global_seconds': 240, 'step_seconds': 15,
                          'cpu_quota_per_fixture': '10%', 'memory_max_per_fixture': '96M'},
@@ -313,6 +330,7 @@ class Replay:
     def setup(self):
         assert os.geteuid() == 0 and os.uname().nodename == 'gmk-prod-1'
         assert hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal')
+        original_hook = reviewed_hook_path(self.source)
         self.base.chmod(0o755)
         try:
             grp.getgrnam(self.group)
@@ -339,7 +357,9 @@ class Replay:
         assert info.st_uid == 0 and info.st_gid == gid and info.st_mode & 0o777 == 0o640
         fixture = self.source.decode()
         fixture = fixture.replace("ROOT = Path('/run/shared-ci-queue')", f'ROOT = Path({str(self.root)!r})', 1)
-        fixture = fixture.replace("HOOK = Path('/usr/local/libexec/shared-ci-queue-hook')", f'HOOK = Path({str(self.hook)!r})', 1)
+        original_assignment = 'HOOK = Path(' + repr(str(original_hook)) + ')'
+        assert fixture.count(original_assignment) == 1
+        fixture = fixture.replace(original_assignment, f'HOOK = Path({str(self.hook)!r})', 1)
         runners = {self.units[key]: self.identities[key] for key in 'abc'}
         fixture, count = re.subn(r'(?ms)^RUNNERS = \{.*?^\}', 'RUNNERS = ' + repr(runners), fixture, count=1)
         assert count == 1
@@ -380,7 +400,8 @@ class Replay:
                          '-p', 'TasksMax=24', '-p', 'RuntimeMaxSec=240', '-p', 'TimeoutStopSec=3',
                          '-p', 'KillMode=control-group', '--', sys.executable, __file__, '--supervisor', str(config))
         self.check('isolated fixture setup: root lock 0640, setgid state dirs, two UIDs', units=self.units,
-                   uid_valci=pwd.getpwnam('valci').pw_uid, uid_telo_ci=pwd.getpwnam('telo-ci').pw_uid)
+                   uid_valci=pwd.getpwnam('valci').pw_uid, uid_telo_ci=pwd.getpwnam('telo-ci').pw_uid,
+                   reviewed_hook=str(original_hook), hook_interpreter=hook_command(self.hook)[:2])
 
     def tests(self):
         self.start('a', 'serial-a')
@@ -607,6 +628,7 @@ class Replay:
 
 def local(args):
     source = Path(args.source).resolve()
+    reviewed_hook_path(source.read_bytes())  # Reject extension regressions before SSH or fixture allocation.
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     create = subprocess.run(['rtk', 'proxy', 'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.host,
@@ -643,6 +665,12 @@ def self_test():
     from unittest.mock import Mock, patch
 
     class Guards(unittest.TestCase):
+        def test_extensionless_hook_is_rejected_before_replay(self):
+            with self.assertRaisesRegex(RuntimeError, 'supported .sh'):
+                reviewed_hook_path(b"HOOK = Path('/usr/local/libexec/shared-ci-queue-hook')\n")
+            self.assertEqual(reviewed_hook_path(b"HOOK = Path('/usr/local/libexec/shared-ci-queue-hook.sh')\n").suffix, '.sh')
+            self.assertEqual(hook_command('/fixture/hook.sh'), ['/usr/bin/bash', '-e', '/fixture/hook.sh'])
+
         def test_arbitrary_parent_is_rejected_before_inspection(self):
             with self.assertRaisesRegex(RuntimeError, 'Unsafe fixture directory'):
                 validate_base(Path('/srv/telovporiadke/ciq-fixture-TEST'))
