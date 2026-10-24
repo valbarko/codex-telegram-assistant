@@ -19,10 +19,33 @@ import pwd
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
 import traceback
+
+
+FIXTURE_PARENT = Path('/var/lib')
+
+
+def validate_base(base, fresh=False):
+    """Confine destructive cleanup to the root-created, non-symlink fixture dir."""
+    if (not base.is_absolute() or base.parent != FIXTURE_PARENT
+            or not re.fullmatch(r'ciq-fixture-[A-Za-z0-9]+', base.name)
+            or base.is_symlink() or base.resolve() != base):
+        raise RuntimeError('Unsafe fixture directory')
+    info = base.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('Fixture directory must be root-owned and not writable by others')
+    if fresh:
+        expected = {'run-fixtures.py', 'shared-ci-queue.source.py'}
+        if {p.name for p in base.iterdir()} != expected:
+            raise RuntimeError('Fixture directory is not a fresh staged replay')
+        for path in base.iterdir():
+            item = path.lstat()
+            if not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or item.st_mode & 0o022:
+                raise RuntimeError('Unsafe staged fixture file')
 
 
 def atomic(path, value):
@@ -111,6 +134,7 @@ def supervisor(config):
 
 class Replay:
     def __init__(self, base, source):
+        validate_base(base, fresh=True)
         self.base = base
         self.source = source
         self.prefix = base.name
@@ -130,6 +154,7 @@ class Replay:
                          'tests': [], 'recover_operations': []}
         self.created_units = []
         self.group_created = False
+        self.group_gid = None
         self.deadline = time.monotonic() + 230
 
     def command(self, *args, check=True):
@@ -206,11 +231,68 @@ class Replay:
                     pass
         return self.wait(find, letter + ' keeper')
 
-    def signal(self, pid, sig=signal.SIGKILL):
+    def process_identity(self, pid):
         try:
-            os.kill(pid, sig)
+            directory = Path('/proc', str(pid))
+            fields = directory.joinpath('stat').read_text().rsplit(')', 1)[1].split()
+            group = next(line[3:] for line in directory.joinpath('cgroup').read_text().splitlines()
+                         if line.startswith('0::'))
+            return {'start': int(fields[19]), 'group': group}
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    def signal(self, pid, sig=signal.SIGKILL):
+        before = self.process_identity(pid)
+        if before is None:
+            return
+        groups = {'/system.slice/system-valci.slice/' + unit: unit for unit in self.units.values()}
+        if before['group'] not in groups:
+            raise RuntimeError('Refusing signal outside fixture cgroups')
+        if self.owned_unit(groups[before['group']]) is None:
+            raise RuntimeError('Fixture unit disappeared before signal')
+        try:
+            fd = os.pidfd_open(pid)
         except ProcessLookupError:
-            pass
+            return
+        try:
+            if self.process_identity(pid) != before:
+                raise RuntimeError('Fixture process identity changed before signal')
+            try:
+                signal.pidfd_send_signal(fd, sig)
+            except ProcessLookupError:
+                pass
+        finally:
+            os.close(fd)
+
+    def description(self, unit):
+        return 'Shared CI queue fixture ' + unit + ' at ' + str(self.base)
+
+    def unit_properties(self, unit):
+        if unit not in self.units.values():
+            raise RuntimeError('Refusing non-fixture unit')
+        result = self.command('systemctl', 'show', unit, '-p', 'LoadState', '-p', 'ActiveState',
+                              '-p', 'Transient', '-p', 'Description', '-p', 'User', '-p', 'Slice', check=False)
+        props = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+        if 'LoadState' not in props:
+            raise RuntimeError('Cannot establish fixture unit identity')
+        return props
+
+    def owned_unit(self, unit):
+        props = self.unit_properties(unit)
+        if props['LoadState'] == 'not-found':
+            return None
+        letter = next(key for key, name in self.units.items() if name == unit)
+        if (props.get('Transient') != 'yes' or props.get('Description') != self.description(unit)
+                or props.get('User') != self.identities[letter][0] or props.get('Slice') != 'system-valci.slice'):
+            raise RuntimeError('Fixture unit identity mismatch; preserve unit: ' + unit)
+        return props
+
+    def launch(self, unit, *args):
+        if self.unit_properties(unit)['LoadState'] != 'not-found':
+            raise RuntimeError('Fixture unit already exists; preserve it: ' + unit)
+        # An indeterminate systemd-run result can still have created the unit.
+        self.created_units.append(unit)
+        self.command(*args)
 
     def recover(self, letter, should_fail=False):
         unit = self.units[letter]
@@ -230,11 +312,24 @@ class Replay:
 
     def setup(self):
         assert os.geteuid() == 0 and os.uname().nodename == 'gmk-prod-1'
-        assert hasattr(os, 'pidfd_open')
+        assert hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal')
         self.base.chmod(0o755)
-        self.command('groupadd', '--system', self.group)
+        try:
+            grp.getgrnam(self.group)
+        except KeyError:
+            pass
+        else:
+            raise RuntimeError('Fixture group already exists; preserve it')
+        # Record intent before a command whose result may be indeterminate.
         self.group_created = True
-        gid = grp.getgrnam(self.group).gr_gid
+        try:
+            self.command('groupadd', '--system', self.group)
+        finally:
+            try:
+                self.group_gid = grp.getgrnam(self.group).gr_gid
+            except KeyError:
+                pass
+        gid = self.group_gid
         self.root.mkdir(mode=0o755)
         lock = self.root / 'slot.lock'
         lock.touch(mode=0o640)
@@ -278,12 +373,12 @@ class Replay:
             config = self.base / (letter + '.supervisor.json')
             config.write_text(json.dumps({'directory': str(directory), 'unit': unit, 'repository': repository,
                                          'prefix': self.prefix, 'hook': str(self.hook)}))
-            self.command('systemd-run', '--quiet', '--collect', '--unit=' + unit,
+            self.launch(unit, 'systemd-run', '--quiet', '--collect', '--unit=' + unit,
+                         '-p', 'Description=' + self.description(unit),
                          '-p', 'User=' + user, '-p', 'SupplementaryGroups=' + self.group,
                          '-p', 'Slice=system-valci.slice', '-p', 'CPUQuota=10%', '-p', 'MemoryMax=96M',
                          '-p', 'TasksMax=24', '-p', 'RuntimeMaxSec=240', '-p', 'TimeoutStopSec=3',
                          '-p', 'KillMode=control-group', '--', sys.executable, __file__, '--supervisor', str(config))
-            self.created_units.append(unit)
         self.check('isolated fixture setup: root lock 0640, setgid state dirs, two UIDs', units=self.units,
                    uid_valci=pwd.getpwnam('valci').pw_uid, uid_telo_ci=pwd.getpwnam('telo-ci').pw_uid)
 
@@ -415,37 +510,77 @@ class Replay:
 
     def cleanup(self):
         import shutil
-        self.evidence['worker_events'] = {str(p.relative_to(self.base)): json.loads(p.read_text())
-                                          for p in self.root.glob('*/*.event.json')}
-        self.evidence['fixture_journals'] = {unit: self.command('journalctl', '-u', unit, '-n', '50',
-                                          '--no-pager', '-o', 'cat', check=False).stdout for unit in self.created_units}
-        for unit in reversed(self.created_units):
-            assert unit in self.units.values() and unit.startswith(self.prefix)
-            self.command('systemctl', 'stop', unit, check=False)
-            self.command('systemctl', 'reset-failed', unit, check=False)
-        alive = []
-        for unit in self.created_units:
-            result = self.command('systemctl', 'show', unit, '-p', 'ActiveState', '--value', check=False)
-            if result.stdout.strip() in {'active', 'activating', 'deactivating'}:
-                alive.append(unit)
-        if alive:
-            raise RuntimeError('Fixture units still alive: ' + repr(alive))
-        if self.group_created:
-            self.command('groupdel', self.group)
+        errors = []
+        def attempt(label, operation, default=None):
             try:
-                grp.getgrnam(self.group)
-            except KeyError:
-                pass
-            else:
-                raise RuntimeError('Fixture group still exists')
-        self.evidence['cleanup'] = {'units_inactive': True, 'group_removed': True,
+                return operation()
+            except BaseException as error:
+                errors.append(label + ': ' + repr(error))
+                return default
+
+        # Evidence is best effort. Its failure must never bypass unit cleanup.
+        self.evidence['worker_events'] = attempt('worker events', lambda: {
+            str(p.relative_to(self.base)): json.loads(p.read_text())
+            for p in self.root.glob('*/*.event.json')}, {})
+        self.evidence['fixture_journals'] = {}
+        for unit in self.created_units:
+            self.evidence['fixture_journals'][unit] = attempt('journal ' + unit, lambda unit=unit:
+                self.command('journalctl', '-u', unit, '-n', '50', '--no-pager', '-o', 'cat', check=False).stdout, '')
+        for unit in reversed(self.created_units):
+            # Intent was recorded before launch. Inspect the actual unit before
+            # touching it, including when systemd-run timed out after creation.
+            try:
+                owned = self.owned_unit(unit)
+            except BaseException as error:
+                errors.append('unit ownership ' + unit + ': ' + repr(error))
+                continue
+            if owned is not None:
+                attempt('stop ' + unit, lambda unit=unit: self.command('systemctl', 'stop', unit, check=False))
+                attempt('reset ' + unit, lambda unit=unit: self.command('systemctl', 'reset-failed', unit, check=False))
+        unsafe = []
+        for unit in self.created_units:
+            try:
+                owned = self.owned_unit(unit)
+                if owned and owned.get('ActiveState') not in {'inactive', 'failed'}:
+                    unsafe.append(unit)
+            except BaseException as error:
+                errors.append('unit verification ' + unit + ': ' + repr(error))
+                unsafe.append(unit)
+        self.evidence['cleanup'] = {'units_inactive': not unsafe, 'group_removed': False,
                                     'temporary_directory': str(self.base)}
-        # Preserve hook logs and sanitized queue states in stdout before removal.
-        self.evidence['hook_logs'] = {str(p.relative_to(self.base)): p.read_text() for p in self.root.glob('*/*.hook.log')}
-        self.evidence['final_states'] = {letter: self.state(letter) for letter in 'abc'}
+        if unsafe:
+            self.evidence['cleanup_errors'] = errors
+            raise RuntimeError('Fixture units still active or unverified; preserve group/storage: ' + repr(unsafe))
+        if self.group_created:
+            try:
+                group = grp.getgrnam(self.group)
+            except KeyError:
+                group = None
+            if group is not None:
+                if self.group_gid is None or group.gr_gid != self.group_gid or group.gr_mem:
+                    raise RuntimeError('Fixture group identity changed; preserve it and storage')
+                self.command('groupdel', self.group, check=False)
+                try:
+                    grp.getgrnam(self.group)
+                except KeyError:
+                    pass
+                else:
+                    raise RuntimeError('Fixture group still exists; preserve storage')
+        self.evidence['cleanup']['group_removed'] = True
+        self.evidence['hook_logs'] = attempt('hook logs', lambda: {
+            str(p.relative_to(self.base)): p.read_text() for p in self.root.glob('*/*.hook.log')}, {})
+        self.evidence['final_states'] = attempt('final states', lambda: {
+            letter: self.state(letter) for letter in 'abc'}, {})
+        validate_base(self.base)
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise RuntimeError('Refusing fixture removal without symlink-safe rmtree')
         shutil.rmtree(self.base)
-        assert not self.base.exists()
+        if self.base.exists():
+            raise RuntimeError('Fixture directory still exists')
         self.evidence['cleanup']['temporary_directory_removed'] = True
+        if errors:
+            self.evidence['cleanup_errors'] = errors
+            raise RuntimeError('Fixture cleanup completed with evidence/command errors: ' + repr(errors))
 
     def run(self):
         def expired(_signum, _frame):
@@ -500,9 +635,138 @@ def local(args):
     return result.returncode
 
 
+def self_test():
+    """Exercise destructive-operation guards locally; no SSH/systemd is invoked."""
+    import tempfile
+    import types
+    import unittest
+    from unittest.mock import Mock, patch
+
+    class Guards(unittest.TestCase):
+        def test_arbitrary_parent_is_rejected_before_inspection(self):
+            with self.assertRaisesRegex(RuntimeError, 'Unsafe fixture directory'):
+                validate_base(Path('/srv/telovporiadke/ciq-fixture-TEST'))
+
+        def test_symlink_fixture_base_is_rejected(self):
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary).resolve()
+                target = parent / 'keep'
+                target.mkdir()
+                base = parent / 'ciq-fixture-TEST'
+                base.symlink_to(target)
+                with patch.dict(globals(), FIXTURE_PARENT=parent):
+                    with self.assertRaisesRegex(RuntimeError, 'Unsafe fixture directory'):
+                        validate_base(base)
+                self.assertTrue(target.is_dir())
+
+    class Cleanup(unittest.TestCase):
+        def setUp(self):
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.base = Path(self.temp.name) / 'ciq-fixture-TEST'
+            self.base.mkdir()
+            # Filesystem ownership is checked separately; these tests run as the
+            # Mac user and stub only that guard, never subprocess execution.
+            with patch.dict(globals(), validate_base=lambda *args, **kwargs: None):
+                self.replay = Replay(self.base, b'fixture source')
+            self.replay.root.mkdir()
+            self.unit = self.replay.units['a']
+            guard = patch.dict(globals(), validate_base=lambda *args, **kwargs: None)
+            guard.start()
+            self.addCleanup(guard.stop)
+            self.calls, self.active = [], True
+            self.foreign, self.fail_journal = False, False
+            self.replay.command = self.command
+
+        def command(self, *args, **kwargs):
+            self.calls.append(args)
+            if args[0] == 'journalctl' and self.fail_journal:
+                raise subprocess.TimeoutExpired(args, 12)
+            if args[:2] == ('systemctl', 'show'):
+                description = 'foreign service' if self.foreign else self.replay.description(self.unit)
+                text = ('LoadState=loaded\nTransient=yes\nUser=valci\nSlice=system-valci.slice\n'
+                        + 'Description=' + description + '\nActiveState=' + ('active' if self.active else 'inactive'))
+                return types.SimpleNamespace(stdout=text, returncode=0)
+            if args[:2] == ('systemctl', 'stop'):
+                self.active = False
+            return types.SimpleNamespace(stdout='', returncode=0)
+
+        def test_evidence_failure_still_stops_owned_unit_and_removes_storage(self):
+            self.replay.created_units.append(self.unit)
+            self.fail_journal = True
+            bad = self.replay.root / 'events'
+            bad.mkdir()
+            (bad / 'bad.event.json').write_text('invalid json')
+            with self.assertRaisesRegex(RuntimeError, 'cleanup completed with'):
+                self.replay.cleanup()
+            self.assertIn(('systemctl', 'stop', self.unit), self.calls)
+            self.assertFalse(self.base.exists())
+            self.assertTrue(self.replay.evidence['cleanup']['units_inactive'])
+
+        def test_unknown_unit_is_never_stopped_or_storage_removed(self):
+            self.replay.created_units.append(self.unit)
+            self.foreign = True
+            with self.assertRaisesRegex(RuntimeError, 'unverified'):
+                self.replay.cleanup()
+            self.assertFalse(any(c[:2] == ('systemctl', 'stop') for c in self.calls))
+            self.assertTrue(self.base.exists())
+
+        def test_indeterminate_launch_registers_cleanup_before_command(self):
+            def launch(*args, **kwargs):
+                if args[:2] == ('systemctl', 'show'):
+                    return types.SimpleNamespace(stdout='LoadState=not-found', returncode=0)
+                self.assertIn(self.unit, self.replay.created_units)
+                raise subprocess.TimeoutExpired(args, 12)
+            self.replay.command = launch
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.replay.launch(self.unit, 'systemd-run', '--unit=' + self.unit)
+            self.replay.command = self.command
+            self.replay.cleanup()
+            self.assertIn(('systemctl', 'stop', self.unit), self.calls)
+            self.assertFalse(self.base.exists())
+
+        def test_preexisting_unit_is_not_registered_for_cleanup(self):
+            with self.assertRaisesRegex(RuntimeError, 'already exists'):
+                self.replay.launch(self.unit, 'systemd-run', '--unit=' + self.unit)
+            self.assertEqual(self.replay.created_units, [])
+            self.assertFalse(any(c[0] == 'systemd-run' for c in self.calls))
+
+        def test_signal_refuses_production_cgroup(self):
+            self.replay.process_identity = Mock(return_value={'start': 1, 'group': '/system.slice/mysql.service'})
+            with patch.object(os, 'pidfd_open', create=True) as opened:
+                with self.assertRaisesRegex(RuntimeError, 'outside fixture'):
+                    self.replay.signal(123)
+                opened.assert_not_called()
+
+        def test_signal_refuses_changed_identity_and_closes_pidfd(self):
+            group = '/system.slice/system-valci.slice/' + self.unit
+            self.replay.process_identity = Mock(side_effect=[{'start': 1, 'group': group}, {'start': 2, 'group': group}])
+            self.replay.owned_unit = Mock()
+            with patch.object(os, 'pidfd_open', return_value=77, create=True), patch.object(os, 'close') as closed, \
+                    patch.object(signal, 'pidfd_send_signal', create=True) as sent:
+                with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                    self.replay.signal(123)
+                sent.assert_not_called()
+                closed.assert_called_once_with(77)
+
+        def test_signal_uses_verified_pidfd(self):
+            identity = {'start': 1, 'group': '/system.slice/system-valci.slice/' + self.unit}
+            self.replay.process_identity = Mock(return_value=identity)
+            self.replay.owned_unit = Mock()
+            with patch.object(os, 'pidfd_open', return_value=77, create=True), patch.object(os, 'close') as closed, \
+                    patch.object(signal, 'pidfd_send_signal', create=True) as sent:
+                self.replay.signal(123)
+                sent.assert_called_once_with(77, signal.SIGKILL)
+                closed.assert_called_once_with(77)
+
+    suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in [Guards, Cleanup])
+    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source')
+    parser.add_argument('--self-test', action='store_true', help='Local mocked safety checks; never invokes SSH/systemd')
     parser.add_argument('--host', default='gmk-root')
     parser.add_argument('--output', default='.private/reports/ci-queue-linux')
     parser.add_argument('--remote', action='store_true')
@@ -511,7 +775,9 @@ if __name__ == '__main__':
     parser.add_argument('--worker')
     parser.add_argument('--orphan')
     arguments = parser.parse_args()
-    if arguments.supervisor:
+    if arguments.self_test:
+        sys.exit(self_test())
+    elif arguments.supervisor:
         supervisor(json.loads(Path(arguments.supervisor).read_text()))
     elif arguments.worker:
         sys.exit(worker(json.loads(arguments.worker)))

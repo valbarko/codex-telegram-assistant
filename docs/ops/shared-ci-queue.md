@@ -103,7 +103,7 @@ and restarts only safely idle listeners. Busy/incident listeners remain pending
 and keep the installed hook files so their next startup cannot reference a
 missing executable. Repeat after completion or verified incident recovery.
 Only after no listener uses the hook and every lease is terminal are the remaining
-eight managed files removed. The shared cgroup budget remains installed. The
+managed files removed. The shared cgroup budget remains installed. The
 empty dedicated group and runtime evidence are retained until an inspected
 cleanup/reboot; they grant no access to application state.
 
@@ -111,6 +111,7 @@ cleanup/reboot; they grant no access to application state.
 
 ```sh
 rtk proxy python3 -B -m unittest discover -s test/ops -p 'test_*.py' -v
+rtk proxy python3 -B test/ops/run_ci_queue_linux_fixture.py --self-test
 rtk proxy python3 test/ops/run_ci_queue_linux_fixture.py --source scripts/ops/shared-ci-queue.py --host gmk-root
 ```
 
