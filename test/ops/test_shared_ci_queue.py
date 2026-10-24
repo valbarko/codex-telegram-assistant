@@ -200,6 +200,15 @@ class QueueTests(unittest.TestCase):
                 self.assertNotIn(b'ExecStart=', value)
                 self.assertNotIn(b'EnvironmentFile=', value)
 
+    def test_started_hook_uses_runner_supported_shell_extension(self):
+        self.assertEqual(queue.HOOK, Path('/usr/local/libexec/shared-ci-queue-hook.sh'))
+        files = queue.installed_files()
+        self.assertIn(queue.HOOK, files)
+        self.assertTrue(files[queue.HOOK].startswith(b'#!/bin/sh\n'))
+        for path, content in files.items():
+            if path.name == '95-shared-ci-queue.conf':
+                self.assertIn(b'ACTIONS_RUNNER_HOOK_JOB_STARTED=' + str(queue.HOOK).encode(), content)
+
 
 if __name__ == '__main__':
     unittest.main()
