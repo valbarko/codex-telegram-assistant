@@ -111,6 +111,7 @@ cleanup/reboot; they grant no access to application state.
 
 ```sh
 rtk proxy python3 -B -m unittest discover -s test/ops -p 'test_*.py' -v
+rtk proxy python3 test/ops/run_ci_queue_linux_fixture.py --source scripts/ops/shared-ci-queue.py --host gmk-root
 ```
 
 Also replay the real Linux fixture: actual processes, flock, pidfd, both CI UIDs,
@@ -119,3 +120,6 @@ same-unit waiting without state overwrite, group permissions and frozen recovery
 Fixtures use separate transient units, tiny CPU/memory budgets and private
 temporary storage. They do not mutate production runner units, labels or secrets.
 Preserve their evidence and remove only their owned units, processes and group.
+The executable fixture copy is staged under `/var/lib` because `/run` is
+mounted noexec on this host. Evidence defaults to `.private/reports/ci-queue-linux`
+and can be directed outside the task checkout with `--output` before closeout.
