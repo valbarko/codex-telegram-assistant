@@ -46,7 +46,7 @@ def run(*args: str) -> str:
 
 def properties(unit: str) -> dict[str, str]:
     text = run('systemctl', 'show', unit, '-p', 'LoadState', '-p', 'ActiveState',
-               '-p', 'ControlGroup', '-p', 'Slice', '-p', 'MainPID', '-p', 'Restart')
+               '-p', 'ControlGroup', '-p', 'Slice', '-p', 'MainPID', '-p', 'Restart', '-p', 'FreezerState', '-p', 'Type')
     return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
 
 
@@ -77,6 +77,18 @@ def managed_files() -> dict[Path, str]:
     return result
 
 
+def kill_frozen_idle(group: str, root: Path = CGROUP) -> None:
+    if not group.startswith('/') or '..' in Path(group).parts:
+        raise RuntimeError('Invalid cgroup path')
+    directory = root / group.lstrip('/')
+    events = dict(line.split() for line in (directory / 'cgroup.events').read_text().splitlines())
+    if events.get('frozen') != '1':
+        raise RuntimeError('Refusing to terminate an unfrozen listener group')
+    # Atomic kernel operation avoids systemd255 KillUnit auxiliary-process errors.
+    # The caller has verified no workers and effective Restart=no while frozen.
+    (directory / 'cgroup.kill').write_text('1\n')
+
+
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -101,8 +113,11 @@ def preflight() -> None:
     if socket.gethostname() != 'gmk-prod-1' or not (CGROUP / 'cgroup.controllers').is_file():
         raise RuntimeError('This policy is scoped to gmk-prod-1 with cgroup v2')
     for unit in UNITS:
-        if properties(unit).get('LoadState') != 'loaded':
+        state = properties(unit)
+        if state.get('LoadState') != 'loaded':
             raise RuntimeError(f'Required unit missing: {unit}')
+        if unit in RUNNERS and state.get('Type') != 'simple':
+            raise RuntimeError('Idle frozen migration requires Type=simple listeners')
 
 
 def snapshot() -> dict:
@@ -197,20 +212,25 @@ def reconcile(target: str = SLICE) -> dict:
                     # stop thaws a service before signaling it, so stop alone has a
                     # worker-start race. Kill only the inspected idle cgroup while
                     # still frozen; then finish the normal stop/start transaction.
-                    run('systemctl', 'kill', '--kill-whom=all', '--signal=SIGKILL', unit)
+                    kill_frozen_idle(state['ControlGroup'])
                 run('systemctl', 'stop', unit)
-                if unit in frozen:
-                    frozen.remove(unit)
                 run('systemctl', 'start', unit)
+                if unit in frozen:
+                    run('systemctl', 'thaw', unit)
+                    frozen.remove(unit)
                 current = properties(unit)
-                if current['ActiveState'] != 'active' or not in_target(current, target):
+                if current['ActiveState'] != 'active' or current.get('FreezerState') != 'running' or not in_target(current, target):
                     raise RuntimeError(f'{unit} did not enter expected cgroup')
                 migrated.append(unit)
     finally:
         errors = []
         for unit in frozen:
             try:
-                run('systemctl', 'thaw', unit)
+                current = properties(unit)
+                if current.get('ActiveState') == 'active':
+                    run('systemctl', 'thaw', unit)
+                elif current.get('ControlGroup'):
+                    errors.append(unit)
             except Exception:
                 errors.append(unit)
         for path in temporary:

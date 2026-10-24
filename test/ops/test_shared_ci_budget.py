@@ -19,18 +19,29 @@ class MigrationTests(unittest.TestCase):
         self.runtime = patch.object(budget, 'RUNTIME', Path(self.directory.name))
         self.runtime.start()
         self.addCleanup(self.runtime.stop)
-        self.states = {u: {'ActiveState': 'active', 'ControlGroup': f'/system.slice/{u}', 'Restart': 'always'}
+        self.states = {u: {'ActiveState': 'active', 'ControlGroup': f'/system.slice/{u}', 'Restart': 'always', 'FreezerState': 'running'}
                        for u in budget.UNITS}
 
     def command(self, *args):
         self.calls.append(args)
+        if args[:2] == ('systemctl', 'freeze'):
+            self.states[args[2]]['FreezerState'] = 'frozen'
+        if args[:2] == ('systemctl', 'thaw'):
+            self.states[args[2]]['FreezerState'] = 'running'
         if args == ('systemctl', 'daemon-reload'):
             for unit in budget.RUNNERS:
                 path = budget.RUNTIME / f'{unit}.d/zzzz-shared-ci-budget-drain.conf'
                 self.states[unit]['Restart'] = 'no' if path.exists() else 'always'
         if args[:2] == ('systemctl', 'start') and args[2] in self.states:
+            self.states[args[2]]['ActiveState'] = 'active'
             self.states[args[2]]['ControlGroup'] = f'/system.slice/{budget.SLICE}/{args[2]}'
         return ''
+
+    def kill(self, group):
+        unit = Path(group).name
+        self.calls.append(('cgroup', 'kill', unit))
+        self.states[unit]['ActiveState'] = 'failed'
+
 
     def reconcile(self, busy=(), fail_worker_scan=False):
         def workers(group):
@@ -39,6 +50,7 @@ class MigrationTests(unittest.TestCase):
             return [123] if any(group.endswith('/' + u) for u in busy) else []
         with patch.object(budget, 'properties', side_effect=lambda u: self.states[u].copy()), \
                 patch.object(budget, 'run', side_effect=self.command), \
+                patch.object(budget, 'kill_frozen_idle', side_effect=self.kill), \
                 patch.object(budget, 'cgroup_workers', side_effect=workers):
             return budget.reconcile()
 
@@ -62,9 +74,10 @@ class MigrationTests(unittest.TestCase):
         freezes = [c for c in self.calls if c[1] == 'freeze']
         self.assertEqual(len(freezes), 4)
         for unit in budget.RUNNERS:
-            kill = ('systemctl', 'kill', '--kill-whom=all', '--signal=SIGKILL', unit)
+            kill = ('cgroup', 'kill', unit)
             self.assertLess(self.calls.index(('systemctl', 'freeze', unit)), self.calls.index(kill))
             self.assertLess(self.calls.index(kill), self.calls.index(('systemctl', 'stop', unit)))
+            self.assertLess(self.calls.index(('systemctl', 'start', unit)), self.calls.index(('systemctl', 'thaw', unit)))
         self.assertTrue(all(s['Restart'] == 'always' for s in self.states.values()))
         self.assertFalse(list(budget.RUNTIME.glob('*/*.conf')))
 
@@ -132,6 +145,22 @@ class MigrationTests(unittest.TestCase):
 
 
 class InspectionTests(unittest.TestCase):
+    def test_kernel_kill_requires_frozen_group(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            directory = root / 'system.slice/runner.service'
+            directory.mkdir(parents=True)
+            events = directory / 'cgroup.events'
+            events.write_text('populated 1\nfrozen 0\n')
+            kill = directory / 'cgroup.kill'
+            kill.write_text('0\n')
+            with self.assertRaises(RuntimeError):
+                budget.kill_frozen_idle('/system.slice/runner.service', root)
+            self.assertEqual(kill.read_text(), '0\n')
+            events.write_text('populated 1\nfrozen 1\n')
+            budget.kill_frozen_idle('/system.slice/runner.service', root)
+            self.assertEqual(kill.read_text(), '1\n')
+
     def test_nested_worker_is_detected_without_returning_arguments(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
