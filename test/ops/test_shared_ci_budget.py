@@ -123,6 +123,24 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.reconcile()['migrated'], [])
         self.assertEqual(self.calls, [])
 
+    def test_explicit_idle_restart_of_in_slice_listener_preserves_database_and_busy_jobs(self):
+        for unit in budget.UNITS:
+            self.states[unit]['ControlGroup'] = f'/system.slice/{budget.SLICE}/{unit}'
+        unit = budget.RUNNERS[0]
+        with patch.object(budget, 'properties', side_effect=lambda u: self.states[u].copy()), \
+                patch.object(budget, 'run', side_effect=self.command), \
+                patch.object(budget, 'kill_frozen_idle', side_effect=self.kill), \
+                patch.object(budget, 'cgroup_workers', return_value=[]):
+            result = budget.reconcile(restart_units=(unit,))
+        self.assertEqual(result['migrated'], [unit])
+        self.assertNotIn(('systemctl', 'stop', budget.DATABASE), self.calls)
+        self.assertNotIn(('systemctl', 'freeze', budget.RUNNERS[1]), self.calls)
+
+    def test_explicit_restart_rejects_production_units(self):
+        with self.assertRaisesRegex(RuntimeError, 'four CI listeners'):
+            budget.reconcile(restart_units=('actions-runner.service',))
+        self.assertEqual(self.calls, [])
+
     def test_scan_failure_thaws_every_frozen_unit(self):
         with self.assertRaises(RuntimeError):
             self.reconcile(fail_worker_scan=True)

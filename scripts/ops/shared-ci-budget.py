@@ -168,7 +168,12 @@ def in_target(state: dict, target: str) -> bool:
     return f'/{SLICE}/' in group if target == SLICE else group.count('/') == 2 and group.startswith('/system.slice/')
 
 
-def reconcile(target: str = SLICE) -> dict:
+def reconcile(target: str = SLICE, restart_units: tuple[str, ...] = ()) -> dict:
+    if not set(restart_units).issubset(RUNNERS):
+        raise RuntimeError('Idle restart is restricted to the four CI listeners')
+    def needs_restart(unit: str, state: dict) -> bool:
+        return unit in restart_units or not in_target(state, target)
+
     migrated, pending, frozen, temporary = [], [], [], []
     try:
         # Freeze listeners before testing idleness, preventing job startup during inspection.
@@ -176,7 +181,7 @@ def reconcile(target: str = SLICE) -> dict:
         states = {unit: properties(unit) for unit in UNITS}
         drain_paths = [RUNTIME / f'{unit}.d/zzzz-shared-ci-budget-drain.conf'
                        for unit in RUNNERS if states[unit]['ActiveState'] == 'active'
-                       and not in_target(states[unit], target)]
+                       and needs_restart(unit, states[unit])]
         if any(p.exists() or p.is_symlink() for p in drain_paths):
             raise RuntimeError('A previous drain override exists; inspect before continuing')
         for path in drain_paths:
@@ -185,12 +190,12 @@ def reconcile(target: str = SLICE) -> dict:
         if temporary:
             run('systemctl', 'daemon-reload')
             for unit in RUNNERS:
-                if states[unit]['ActiveState'] == 'active' and not in_target(states[unit], target):
+                if states[unit]['ActiveState'] == 'active' and needs_restart(unit, states[unit]):
                     if properties(unit).get('Restart') != 'no':
                         raise RuntimeError('Cannot suppress automatic restart for idle migration')
         database_pending = not in_target(states[DATABASE], target)
         for unit in RUNNERS:
-            if states[unit]['ActiveState'] == 'active' and (database_pending or not in_target(states[unit], target)):
+            if states[unit]['ActiveState'] == 'active' and (database_pending or needs_restart(unit, states[unit])):
                 frozen.append(unit)
                 run('systemctl', 'freeze', unit)
         busy = {unit for unit in frozen if cgroup_workers(states[unit]['ControlGroup'])}
@@ -203,7 +208,7 @@ def reconcile(target: str = SLICE) -> dict:
             state = states[unit]
             if state['ActiveState'] != 'active':
                 pending.append({'unit': unit, 'reason': 'inactive; original activation state preserved'})
-            elif in_target(state, target):
+            elif in_target(state, target) and unit not in restart_units:
                 continue
             elif unit in busy or (unit == DATABASE and not database_safe):
                 pending.append({'unit': unit, 'reason': 'active job or runner not frozen/idle; retry later'})
