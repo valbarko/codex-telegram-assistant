@@ -33,8 +33,9 @@ It verifies units before daemon-reload. Install itself does not restart services
 
 Reconcile freezes runner cgroups briefly for worker inspection, then immediately
 thaws busy groups. A cgroup containing `Runner.Worker` is never stopped. Only an
-inspected idle runner cgroup is killed while still frozen and then stopped and
-started in its configured slice. This narrow idle-only SIGKILL prevents the
+inspected idle runner cgroup is killed atomically through kernel `cgroup.kill`
+while still frozen, then stopped, started and explicitly thawed in its configured
+slice. This narrow idle-only SIGKILL prevents the
 listener from accepting/spawning a new worker during systemd's automatic thaw
 before stop. An assigned but not yet executing GitHub job may need retry after a
 listener disconnect; inspect Actions after migration. No running job is knowingly
@@ -44,6 +45,9 @@ Before inspection, a unique temporary runtime drop-in disables automatic restart
 for the listeners being migrated. Effective `Restart=no` is verified before any
 freeze or kill. Cleanup removes the drop-in and reloads configuration, restoring
 the original restart policy. Preexisting drain files cause a safe refusal.
+Only the verified `Type=simple` listeners are supported. The kernel operation
+avoids systemd255 auxiliary-process KillUnit errors; the explicit post-start thaw
+also handles systemd preserving freezer state across a failed/empty unit.
 
 The isolated test database restarts gracefully only while all four runners are
 active, successfully frozen and idle. Transitional/inactive/missing states fail
