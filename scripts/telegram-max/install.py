@@ -9,6 +9,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 
 from formatting import CHANNEL, SOURCE_CHAT
 from worker import atomic, load, new_state
@@ -71,10 +72,6 @@ def main():
     if args.prepare_only:
         print(json.dumps({'prepared': True, 'enabled': load(root/'settings.json')['enabled'], 'root': str(root)}))
         return
-    if args.enable:
-        settings = load(root / 'settings.json')
-        settings['enabled'] = True
-        atomic(root / 'settings.json', settings)
     node = shutil.which('node')
     if not node:
         raise ValueError('Node is unavailable')
@@ -93,7 +90,20 @@ def main():
     with plist.open('wb') as stream:
         plistlib.dump(data, stream)
     plist.chmod(0o600)
-    subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], check=True, capture_output=True)
+    # launchd can briefly return EIO after a successful bootout while it
+    # finishes unregistering the previous job. Retry this reversible start,
+    # never reset publication state or touch another service.
+    for attempt in range(5):
+        result = subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], capture_output=True)
+        if result.returncode == 0:
+            break
+        if attempt == 4:
+            result.check_returncode()
+        time.sleep(1)
+    if args.enable:
+        settings = load(root / 'settings.json')
+        settings['enabled'] = True
+        atomic(root / 'settings.json', settings)
     print(json.dumps({'service': LABEL, 'installed': True, 'root': str(root), 'baseline_id': load(root/'settings.json')['baseline_id']}))
 
 
