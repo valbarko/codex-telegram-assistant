@@ -1,0 +1,34 @@
+name: Telegram MAX bridge
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/telegram-max/**'
+      - 'test/telegram-max-source.test.ts'
+      - '.github/workflows/telegram-max.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/telegram-max/**'
+      - 'test/telegram-max-source.test.ts'
+      - '.github/workflows/telegram-max.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: npm ci --ignore-scripts
+      - run: python -B -m unittest discover -s scripts/telegram-max -p 'test_*.py' -v
+      - run: npx vitest run test/telegram-max-source.test.ts
+      - run: npx tsc --noEmit --allowImportingTsExtensions --target ES2023 --module NodeNext --moduleResolution NodeNext --strict --esModuleInterop --skipLibCheck scripts/telegram-max/source.mts scripts/telegram-max/catchup.mts
