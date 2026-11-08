@@ -20,6 +20,7 @@ class Platform:
         self.fail_create = False
         self.fail_get = False
         self.change_on_upload = None
+        self.change_on_read = None
 
     def upload(self, media):
         if self.change_on_upload:
@@ -28,6 +29,9 @@ class Platform:
 
     def api(self, method, path, query=None, body=None):
         if method == 'GET':
+            if self.change_on_read:
+                self.change_on_read()
+                self.change_on_read = None
             return {'messages': copy.deepcopy(self.messages)}
         saved = w.load(self.root / 'state.json')
         # Independent assertion: intent was fsynced before the external write.
@@ -183,6 +187,20 @@ class QueueSafety(unittest.TestCase):
     def test_source_edit_during_upload_cancels_send_before_outbox(self):
         self.row(media={'type':'image','sha256':'a','path':'media/a.jpg'})
         self.platform.change_on_upload=lambda:self.row(text='Новая версия',quiet=self.now)
+        self.assertEqual(self.tick()['status'],'source_changed_or_stale')
+        self.assertEqual(self.platform.sends,0)
+        self.assertIsNone(self.state()['outbox'])
+
+    def test_edit_during_final_max_read_cancels_before_post(self):
+        self.row()
+        self.platform.change_on_read=lambda:self.row(text='Последняя правка',quiet=self.now)
+        self.assertEqual(self.tick()['status'],'source_changed_or_stale')
+        self.assertEqual(self.platform.sends,0)
+        self.assertIsNone(self.state()['outbox'])
+
+    def test_pause_during_upload_cancels_before_post(self):
+        self.row(media={'type':'image','sha256':'a','path':'media/a.jpg'})
+        self.platform.change_on_upload=lambda:w.atomic(self.root/'settings.json',{**self.settings,'enabled':False})
         self.assertEqual(self.tick()['status'],'source_changed_or_stale')
         self.assertEqual(self.platform.sends,0)
         self.assertIsNone(self.state()['outbox'])

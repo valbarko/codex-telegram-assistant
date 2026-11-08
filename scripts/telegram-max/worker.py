@@ -143,6 +143,10 @@ def media_for(unit, rows):
 
 def unchanged(root, unit, settings, timestamp):
     """Recheck the source after uploads, before the durable send intent."""
+    current_settings = load(root / 'settings.json', {})
+    if not current_settings.get('enabled') or any(current_settings.get(key) != settings.get(key)
+            for key in ('source_chat', 'max_chat', 'baseline_id', 'delay_seconds', 'interval_seconds')):
+        return False
     ready = load(root / 'source-ready.json', {})
     if not ready.get('ready') or not 0 <= timestamp - ready.get('at', 0) <= 120:
         return False
@@ -269,6 +273,10 @@ def execute(root, state, rows, settings, client, chosen):
         latest = max((m.get('timestamp', 0) / 1000 for m in before.get('messages', [])), default=0)
         if time.time() < latest + settings['interval_seconds']:
             return 'waiting_for_channel_interval'
+    # The final MAX read can itself take time. Recheck the source quiet period,
+    # connection lease and pause flag after that read, immediately before POST.
+    if not unchanged(root, unit, settings, time.time()):
+        return 'source_changed_or_stale'
     outbox = {'operation': operation, 'key': unit['key'], 'part': index,
               'expected': expected, 'types': [item['type'] for item in media],
               'media_hashes': hashes, 'started_ms': int(time.time() * 1000),
