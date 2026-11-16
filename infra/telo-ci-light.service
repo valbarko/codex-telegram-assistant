@@ -1,0 +1,44 @@
+[Unit]
+Description=Telo CI planning and quick checks (no database credentials)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telo-ci-light
+Group=telo-ci-light
+WorkingDirectory=/opt/actions-runner-val-ci/telo-light
+ExecStart=/opt/actions-runner-val-ci/telo-light/runsvc.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillMode=control-group
+Slice=system-valci.slice
+CPUAccounting=yes
+CPUQuota=50%
+CPUWeight=10
+MemoryAccounting=yes
+MemoryHigh=384M
+MemoryMax=512M
+IOAccounting=yes
+IOWeight=10
+TasksMax=128
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/actions-runner-val-ci/telo-light /var/lib/telo-ci-light
+InaccessiblePaths=-/srv -/etc/mysql -/etc/tvk-ci-mysql -/var/lib/mysql -/var/lib/tvk-ci-mysql -/run/mysqld -/run/tvk-ci-mysql -/var/run/docker.sock
+IPAddressDeny=localhost
+IPAddressAllow=127.0.0.53
+
+[Install]
+WantedBy=multi-user.target
