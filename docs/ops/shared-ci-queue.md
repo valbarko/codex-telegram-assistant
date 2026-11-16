@@ -2,7 +2,7 @@
 
 The four existing repository listeners keep their identities, work directories,
 labels, unprivileged users and workflow steps. A root-installed STARTED hook
-admits one heavy job across all four listeners. Production deploy is not hooked.
+admits up to two heavy jobs across all four listeners. Production deploy is not hooked.
 The existing two-core/3 GiB high/4 GiB maximum shared cgroup budget stays in force.
 
 Only the exact `vbclub-training / CI / classify` and
@@ -10,15 +10,17 @@ Only the exact `vbclub-training / CI / classify` and
 slot. New or renamed jobs default to heavy. This is not a FIFO scheduler.
 Waiting happens in the runner hook, so GitHub shows a running job with a
 waiting message, not necessarily a queued workflow. The wait is bounded to
-30 minutes; an expired wait fails before the normal steps run. Telo's job
-timeout is separately increased to 75 minutes to accommodate the wait,
-its previous 40-minute budget and a five-minute margin.
+the workflow's own timeout or cancellation. There is no separate 30-minute
+queue failure. Progress includes elapsed wait once a minute. Telo's workflow
+has a separate 180-minute overall guard; other workflows retain their own guards.
+Repository listeners remain repository-specific: this adds cross-project
+parallelism, not another listener for two simultaneous jobs in the same repository.
 
 ## Lifetime and failure policy
 
 The hook finds its actual Runner.Worker ancestor and verifies its user,
 repository and service cgroup. It takes `flock` on a precreated root-owned
-inode, checks incident records, then transfers the open description to a tiny
+inode for one of two slots, checks incident records, then transfers the open description to a tiny
 independently exec'ed keeper. The hook succeeds only after the keeper has
 recorded ownership and acknowledged the handoff. The keeper receives a minimal
 environment without `RUNNER_TRACKING_ID`; the ordinary runner orphan cleanup
@@ -31,7 +33,12 @@ be stable, including process start identities; unreadable processes fail closed.
 If an orphan is found, the keeper leaves an incident record and releases its FD.
 The record prevents subsequent heavy jobs from proceeding, even if the orphan
 later exits. A keeper crash likewise leaves a nonterminal incident latch. No
-waiting hook overwrites the earlier holder's record. This favors safety over
+waiting hook overwrites the earlier holder's record. Admission and keeper
+acknowledgement are serialized by a short-lived separate `admission.lock`.
+An active holder in another slot is permitted only while its slot lock is still
+held. An incident, duplicate slot record or a nonterminal record with an unlocked
+slot blocks new work. A missing `slot` field means the original slot 1, preserving
+existing keepers during upgrade. This favors safety over
 automatic recovery from an ambiguous process failure.
 
 This coordinates trusted reviewed CI; it is not a sandbox against a malicious
@@ -112,6 +119,58 @@ managed files removed. The shared cgroup budget remains installed. The
 empty dedicated group and runtime evidence are retained until an inspected
 cleanup/reboot; they grant no access to application state.
 
+## Upgrade the existing installation and change capacity
+
+The root-owned `/etc/shared-ci-queue-slots.json` stores `{"slots": 1}` or
+`{"slots": 2}`. Missing policy defaults to one slot for a safe upgrade. It survives
+reboots. `slot.lock` remains slot 1; never replace its inode while a job is active.
+The additional `slot-2.lock` and `admission.lock` are root-owned `0640`, group
+`shared-ci-queue`, and must also appear in the existing tmpfiles policy.
+
+Before publishing an upgrade, verify the old installed source against the
+previous committed source, back up the library, tmpfiles policy and capacity
+policy in a private `/var/backups/shared-ci-queue-upgrade-*` directory, create only
+the two missing lock files without replacing existing inodes, and extend the
+tmpfiles policy. Atomically replace only the library with reviewed merged source.
+No runner restart, database restart or application release switch is necessary.
+
+Record hook processes by PID **and process start ticks** before and immediately
+after publication. Keep capacity at one until those observed hooks have exited:
+an old in-memory hook still uses the old global latch check. Existing keepers and
+Workers finish normally; new hooks use the new source. Only then enable two slots.
+
+```sh
+rtk proxy ssh gmk-root /usr/local/sbin/shared-ci-queue configure --slots 2
+rtk proxy ssh gmk-root /usr/local/sbin/shared-ci-queue status
+# Reversible capacity rollback, without cancelling running jobs:
+rtk proxy ssh gmk-root /usr/local/sbin/shared-ci-queue configure --slots 1
+```
+
+Reducing capacity prevents new slot-2 admissions; an already running job there
+finishes normally. Keep the aggregate two-CPU/4-GiB budget. Check real overlap,
+production HTTPS responses, CPU/memory pressure, swap activity and OOM events.
+For a full code rollback, first reduce to one and wait until all heavy Workers
+and hooks finish, then restore the verified backup. The older full-uninstall
+manifest is tied to the older source: do not use it as a code downgrade tool.
+
+## Disposable MySQL performance
+
+Telo currently has 54 SQL suites and 89 migrations. Many suites independently
+drop and rebuild their disposable schema. CI logs from November 16 show the SQL
+stage taking 25–30 minutes, even without queue wait. Preserve account isolation,
+concurrent saves/deletes, nutrition and mocked billing coverage; scope pure
+mobile changes separately and report suite durations to find repeated setup.
+
+The isolated `tvk-ci-mysql.service` is separate from production `mysql.service`.
+Only on that disposable instance, `innodb_flush_log_at_trx_commit=2` can avoid
+synchronous durable log flushes on every test transaction. Use its existing
+private root client file; verify `@@socket=/run/tvk-ci-mysql/mysql.sock`,
+`@@datadir=/var/lib/tvk-ci-mysql/` and disabled binary logging before any change.
+Record the previous value, benchmark in a uniquely named disposable database,
+and apply with `SET PERSIST` so it survives restarts. This accepts losing recent
+**test-only** transactions during a host crash; every suite recreates its data.
+Production durability, MySQL users/grants and CI memory/CPU limits stay intact.
+
 ## Verification
 
 ```sh
@@ -121,7 +180,8 @@ rtk proxy python3 test/ops/run_ci_queue_linux_fixture.py --source scripts/ops/sh
 ```
 
 Also replay the real Linux fixture: actual processes, flock, pidfd, both CI UIDs,
-cancellation while waiting, abrupt Worker/keeper death, orphan incident latching,
+cancellation while waiting, two simultaneous payloads with a third waiting,
+live reduction to one without cancelling Workers, abrupt Worker/keeper death, orphan incident latching,
 same-unit waiting without state overwrite, group permissions and frozen recovery.
 Fixtures use separate transient units, tiny CPU/memory budgets and private
 temporary storage. They do not mutate production runner units, labels or secrets.

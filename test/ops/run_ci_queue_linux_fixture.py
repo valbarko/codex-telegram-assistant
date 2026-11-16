@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded Linux replay of the real shared CI hook in isolated transient units.
 
-Only ROOT/RUNNERS/HOOK are replaced in the source fixture. No production unit,
+Only ROOT/RUNNERS/HOOK/SLOTS_FILE are replaced in the source fixture. No production unit,
 runner configuration, group membership or installed queue file is changed.
 """
 from __future__ import annotations
@@ -349,14 +349,18 @@ class Replay:
                 pass
         gid = self.group_gid
         self.root.mkdir(mode=0o755)
-        lock = self.root / 'slot.lock'
-        lock.touch(mode=0o640)
-        os.chown(lock, 0, gid)
-        os.chmod(lock, 0o640)
-        info = lock.stat()
-        assert info.st_uid == 0 and info.st_gid == gid and info.st_mode & 0o777 == 0o640
+        for name in ['slot.lock', 'slot-2.lock', 'admission.lock']:
+            lock = self.root / name
+            lock.touch(mode=0o640)
+            os.chown(lock, 0, gid)
+            os.chmod(lock, 0o640)
+            info = lock.stat()
+            assert info.st_uid == 0 and info.st_gid == gid and info.st_mode & 0o777 == 0o640
         fixture = self.source.decode()
         fixture = fixture.replace("ROOT = Path('/run/shared-ci-queue')", f'ROOT = Path({str(self.root)!r})', 1)
+        self.policy = self.base / 'capacity.json'
+        fixture = fixture.replace("SLOTS_FILE = Path('/etc/shared-ci-queue-slots.json')",
+                                  f'SLOTS_FILE = Path({str(self.policy)!r})', 1)
         original_assignment = 'HOOK = Path(' + repr(str(original_hook)) + ')'
         assert fixture.count(original_assignment) == 1
         fixture = fixture.replace(original_assignment, f'HOOK = Path({str(self.hook)!r})', 1)
@@ -428,6 +432,39 @@ class Replay:
         self.check('two heavy jobs never overlap and lightweight classifier bypasses held slot',
                    first_start=first['payload_start'], first_end=ended['payload_end'],
                    second_start=second['payload_start'], light_start=light['payload_start'])
+
+        # The actual admission/keeper code must allow two heavy payloads,
+        # block a third, and release capacity without terminating any Worker.
+        self.policy.write_text('{"slots": 2}\n')
+        self.policy.chmod(0o644)
+        self.start('a', 'parallel-a')
+        first = self.payload('a', 'parallel-a')
+        self.start('b', 'parallel-b')
+        second = self.payload('b', 'parallel-b')
+        assert self.state('a')['slot'] != self.state('b')['slot']
+        third_worker = self.start('c', 'parallel-c')
+        self.wait(lambda: self.read_event('c', 'parallel-c').get('hook_pid'), 'third hook waiting')
+        time.sleep(.5)
+        assert not self.read_event('c', 'parallel-c').get('payload_start')
+        # Reducing capacity preserves both old Workers but prevents a new
+        # admission on slot 2 even if it becomes free first.
+        self.policy.write_text('{"slots": 1}\n')
+        ended_second = self.finish('b', 'parallel-b')
+        self.released('b')
+        time.sleep(.5)
+        assert not self.read_event('c', 'parallel-c').get('payload_start')
+        ended_first = self.finish('a', 'parallel-a')
+        self.released('a')
+        third = self.payload('c', 'parallel-c')
+        assert first['payload_start'] < second['payload_start'] < ended_first['payload_end']
+        assert third['payload_start'] >= ended_first['payload_end']
+        assert third['pid'] == third_worker
+        self.finish('c', 'parallel-c')
+        self.released('c')
+        self.check('two heavy payloads overlap, third waits, reduction to one drains without cancellation',
+                   first_start=first['payload_start'], second_start=second['payload_start'],
+                   first_end=ended_first['payload_end'], second_end=ended_second['payload_end'],
+                   third_start=third['payload_start'])
 
         self.start('a', 'cancel-holder')
         self.payload('a', 'cancel-holder')

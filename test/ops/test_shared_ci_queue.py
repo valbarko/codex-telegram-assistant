@@ -26,6 +26,9 @@ class QueueTests(unittest.TestCase):
             p = patch.object(queue, name, target)
             p.start()
             self.addCleanup(p.stop)
+        p = patch.object(queue, 'SLOTS_FILE', self.root / 'capacity.json')
+        p.start()
+        self.addCleanup(p.stop)
         self.unit = next(iter(queue.RUNNERS))
         self.context = {'unit': self.unit, 'tracking_id': 'test-marker', 'repository': 'valbarko/telovporiadke',
                         'workflow': 'check', 'job': 'check',
@@ -94,7 +97,7 @@ class QueueTests(unittest.TestCase):
             queue.hook()
             lock.assert_not_called()
         with patch.object(queue, 'worker_context', return_value={**light, 'workflow': 'another'}), \
-                patch.object(queue, 'open_lock', side_effect=RuntimeError('heavy lock required')):
+                patch.object(queue, 'try_admit', side_effect=RuntimeError('heavy lock required')):
             with self.assertRaisesRegex(RuntimeError, 'heavy lock required'):
                 queue.hook()
 
@@ -111,10 +114,61 @@ class QueueTests(unittest.TestCase):
             child.terminate.assert_called_once()
 
     def test_wait_timeout_is_bounded(self):
-        with patch.object(queue.fcntl, 'flock', side_effect=BlockingIOError), \
+        with patch.object(queue, 'try_admit', return_value=None), \
                 patch.object(queue.time, 'monotonic', side_effect=[0, 2]):
             with self.assertRaisesRegex(RuntimeError, 'wait exceeded'):
-                queue.acquire(55, limit=1)
+                queue.acquire(self.context, limit=1)
+
+    def test_default_wait_survives_more_than_thirty_minutes(self):
+        with patch.object(queue, 'try_admit', side_effect=[None, 2]), \
+                patch.object(queue.time, 'monotonic', side_effect=[0, 3601]), \
+                patch.object(queue.time, 'sleep'):
+            self.assertEqual(queue.acquire(self.context), 2)
+
+    def test_legacy_capacity_defaults_to_one_and_invalid_policy_fails_closed(self):
+        self.assertEqual(queue.read_capacity(), 1)
+        queue.SLOTS_FILE.write_text('{"slots": 3}')
+        with patch.object(queue.os, 'fstat', return_value=types.SimpleNamespace(st_mode=0o100644, st_uid=0)):
+            with self.assertRaisesRegex(RuntimeError, 'Invalid CI capacity'):
+                queue.read_capacity()
+            queue.SLOTS_FILE.write_text('{"slots": true}')
+            with self.assertRaisesRegex(RuntimeError, 'Invalid CI capacity'):
+                queue.read_capacity()
+            queue.SLOTS_FILE.write_text('{"slots": 2}')
+            self.assertEqual(queue.read_capacity(), 2)
+
+    def test_live_holder_allows_another_unit_but_not_same_unit(self):
+        queue.write_state(self.context, 'holding')
+        fd = os.open(self.root / 'occupied.lock', os.O_CREAT | os.O_RDONLY, 0o600)
+        with patch.object(queue, 'open_lock', return_value=fd), \
+                patch.object(queue.fcntl, 'flock', side_effect=BlockingIOError):
+            queue.check_latches(allow_active=True, requesting_unit='another')
+        with self.assertRaisesRegex(RuntimeError, 'Unreleased CI lease'):
+            queue.check_latches(allow_active=True, requesting_unit=self.unit)
+
+    def test_free_slot_with_nonterminal_legacy_lease_blocks_admission(self):
+        queue.write_state(self.context, 'holding')
+        fd = os.open(self.root / 'lost-keeper.lock', os.O_CREAT | os.O_RDONLY, 0o600)
+        with patch.object(queue, 'open_lock', return_value=fd), \
+                patch.object(queue.fcntl, 'flock'):
+            with self.assertRaisesRegex(RuntimeError, 'Unreleased CI lease'):
+                queue.check_latches(allow_active=True, requesting_unit='another')
+
+    def test_second_slot_is_admitted_when_first_is_busy(self):
+        paths = [self.root / name for name in ['guard', 'first', 'second']]
+        fds = [os.open(path, os.O_CREAT | os.O_RDONLY, 0o600) for path in paths]
+        def flock(fd, flags):
+            if fd == fds[1]:
+                raise BlockingIOError()
+        with patch.object(queue, 'open_root_lock', return_value=fds[0]), \
+                patch.object(queue, 'open_lock', side_effect=fds[1:]), \
+                patch.object(queue, 'check_latches'), patch.object(queue, 'read_capacity', return_value=2), \
+                patch.object(queue.fcntl, 'flock', side_effect=flock), patch.object(queue, 'start_keeper') as keep:
+            self.assertEqual(queue.try_admit(self.context), 2)
+            self.assertEqual(keep.call_args.args[1]['slot'], 2)
+        for fd in fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
 
     def test_indeterminate_freeze_error_still_thaws_listener(self):
         fd = os.open(self.root / 'recovery.lock', os.O_CREAT | os.O_RDWR, 0o600)
@@ -124,7 +178,9 @@ class QueueTests(unittest.TestCase):
             if args[1] == 'freeze':
                 raise RuntimeError('freeze timed out after kernel accepted it')
         fake = types.SimpleNamespace(properties=lambda u: {'ActiveState': 'active', 'FreezerState': 'running'}, run=run)
-        with patch.object(queue, 'open_lock', return_value=fd), patch.object(queue, 'budget_module', return_value=fake):
+        guard = os.open(self.root / 'guard.lock', os.O_CREAT | os.O_RDONLY, 0o600)
+        with patch.object(queue, 'open_root_lock', return_value=guard), \
+                patch.object(queue, 'open_lock', return_value=fd), patch.object(queue, 'budget_module', return_value=fake):
             with self.assertRaisesRegex(RuntimeError, 'freeze timed out'):
                 queue.recover(self.unit)
         self.assertEqual(calls, [('systemctl', 'freeze', self.unit), ('systemctl', 'thaw', self.unit)])
@@ -132,7 +188,9 @@ class QueueTests(unittest.TestCase):
     def test_recovery_preserves_another_operations_freeze(self):
         fd = os.open(self.root / 'recovery.lock', os.O_CREAT | os.O_RDWR, 0o600)
         fake = types.SimpleNamespace(properties=lambda u: {'ActiveState': 'active', 'FreezerState': 'frozen'}, run=Mock())
-        with patch.object(queue, 'open_lock', return_value=fd), patch.object(queue, 'budget_module', return_value=fake):
+        guard = os.open(self.root / 'guard.lock', os.O_CREAT | os.O_RDONLY, 0o600)
+        with patch.object(queue, 'open_root_lock', return_value=guard), \
+                patch.object(queue, 'open_lock', return_value=fd), patch.object(queue, 'budget_module', return_value=fake):
             with self.assertRaisesRegex(RuntimeError, 'already frozen'):
                 queue.recover(self.unit)
         fake.run.assert_not_called()
