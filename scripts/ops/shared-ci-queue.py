@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One heavy job at a time on the existing production-host CI listeners."""
+"""Bounded parallel heavy CI on the existing production-host listeners."""
 from __future__ import annotations
 
 import argparse
@@ -30,7 +30,8 @@ LIBRARY = Path('/usr/local/libexec/shared-ci-queue.py')
 HOOK = Path('/usr/local/libexec/shared-ci-queue-hook.sh')
 OPERATOR = Path('/usr/local/sbin/shared-ci-queue')
 TMPFILES = Path('/etc/tmpfiles.d/shared-ci-queue.conf')
-WAIT_SECONDS = 1800
+SLOTS_FILE = Path('/etc/shared-ci-queue-slots.json')
+MAX_SLOTS = 2
 BACKUPS = Path('/var/backups')
 RUNNERS = {
     'telo-ci.service': ('telo-ci', 'valbarko/telovporiadke'),
@@ -129,25 +130,72 @@ def load_state(unit: str) -> dict | None:
             or len(value['tracking_id']) > 200 or '\0' in value['tracking_id']
             or not isinstance(value.get('worker', {}).get('start'), int)
             or not isinstance(value['worker'].get('pid'), int) or value['worker']['pid'] <= 0
-            or value['worker'].get('group') != '/system.slice/system-valci.slice/' + unit):
+            or value['worker'].get('group') != '/system.slice/system-valci.slice/' + unit
+            or type(value.get('slot', 1)) is not int or value.get('slot', 1) not in range(1, MAX_SLOTS + 1)):
         raise RuntimeError('Invalid queue state; operator inspection required')
     return value
 
 
-def check_latches() -> None:
+def check_latches(allow_active: bool = False, requesting_unit: str = '') -> None:
+    occupied = set()
     for unit in RUNNERS:
         value = load_state(unit)
         if value and value['status'] != 'released':
+            slot = value.get('slot', 1)  # Existing keepers use the original slot.
+            if allow_active and value['status'] == 'holding' and unit != requesting_unit and slot not in occupied:
+                occupied.add(slot)
+                fd = open_lock(slot)
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue  # A live keeper still owns this slot.
+                finally:
+                    os.close(fd)
             raise RuntimeError('Unreleased CI lease; operator inspection required: ' + unit)
 
 
-def open_lock() -> int:
-    fd = os.open(ROOT / 'slot.lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+def open_root_lock(name: str) -> int:
+    fd = os.open(ROOT / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
         os.close(fd)
         raise RuntimeError('Unsafe shared CI lock inode')
     return fd
+
+
+def open_lock(slot: int = 1) -> int:
+    if slot not in range(1, MAX_SLOTS + 1):
+        raise RuntimeError('Invalid CI slot')
+    return open_root_lock('slot.lock' if slot == 1 else f'slot-{slot}.lock')
+
+
+def read_capacity() -> int:
+    try:
+        fd = os.open(SLOTS_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return 1  # Safe upgrade default until the operator enables parallelism.
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError('Unsafe CI capacity policy')
+        value = json.load(stream)
+    slots = value.get('slots')
+    if type(slots) is not int or slots not in range(1, MAX_SLOTS + 1):
+        raise RuntimeError('Invalid CI capacity policy')
+    return slots
+
+
+def configure_slots(slots: int) -> dict:
+    if slots not in range(1, MAX_SLOTS + 1):
+        raise RuntimeError('Invalid CI slot count')
+    fd = open_root_lock('admission.lock')
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        budget_module().atomic_write(SLOTS_FILE, (json.dumps({'slots': slots}) + '\n').encode())
+    finally:
+        os.close(fd)
+    return {'slots': slots, 'running_jobs': 'preserved; reduced capacity drains naturally'}
 
 
 def worker_context() -> dict:
@@ -175,21 +223,42 @@ def worker_context() -> dict:
     raise RuntimeError('No Runner.Worker ancestor')
 
 
-def acquire(fd: int, limit: float = WAIT_SECONDS) -> None:
+def try_admit(context: dict) -> int | None:
+    guard = open_root_lock('admission.lock')
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        check_latches(allow_active=True, requesting_unit=context['unit'])
+        for slot in range(1, read_capacity() + 1):
+            fd = open_lock(slot)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                # Serialize the ownership record and keeper acknowledgement.
+                # No other hook can claim this unit or inspect a partial handoff.
+                start_keeper(fd, {**context, 'slot': slot})
+                return slot
+            finally:
+                os.close(fd)
+        return None
+    finally:
+        os.close(guard)
+
+
+def acquire(context: dict, limit: float | None = None) -> int:
     start, notice = time.monotonic(), -60.0
     while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            check_latches()
-            return
-        except BlockingIOError:
-            elapsed = time.monotonic() - start
-            if elapsed >= limit:
-                raise RuntimeError('Shared CI queue wait exceeded 30 minutes')
-            if elapsed - notice >= 60:
-                print('Shared CI: waiting for the heavy-job slot', flush=True)
-                notice = elapsed
-            time.sleep(0.25)
+        slot = try_admit(context)
+        if slot is not None:
+            return slot
+        elapsed = time.monotonic() - start
+        if limit is not None and elapsed >= limit:
+            raise RuntimeError('Shared CI queue wait exceeded configured limit')
+        if elapsed - notice >= 60:
+            print(f'Shared CI: waiting for a heavy-job slot ({int(elapsed)}s elapsed)', flush=True)
+            notice = elapsed
+        time.sleep(0.25)
 
 
 def keep(fd: int, context_fd: int, ready_fd: int) -> None:
@@ -254,13 +323,8 @@ def hook() -> None:
     if (context['repository'], context['workflow'], context['job']) in LIGHT:
         print('Shared CI: lightweight job, heavy slot not required', flush=True)
         return
-    fd = open_lock()
-    try:
-        acquire(fd)
-        start_keeper(fd, context)
-        print('Shared CI: heavy-job slot acquired', flush=True)
-    finally:
-        os.close(fd)  # The independently exec'ed keeper retains the open description.
+    slot = acquire(context)
+    print(f'Shared CI: heavy-job slot {slot} acquired', flush=True)
 
 
 def budget_module():
@@ -303,6 +367,7 @@ def installed_files() -> dict[Path, bytes]:
     files = {LIBRARY: Path(__file__).read_bytes(), HOOK: (wrapper + ' hook\n').encode(),
              OPERATOR: (wrapper + ' "$@"\n').encode()}
     lines = [f'd {ROOT} 0755 root root -', f'f {ROOT}/slot.lock 0640 root {GROUP} -']
+    lines.extend(f'f {ROOT}/{name} 0640 root {GROUP} -' for name in ['slot-2.lock', 'admission.lock'])
     for unit, (user, _) in RUNNERS.items():
         files[SYSTEMD / f'{unit}.d/95-shared-ci-queue.conf'] = (
             f'[Service]\nSupplementaryGroups={GROUP}\n'
@@ -383,9 +448,13 @@ def reconcile(enabled: bool = True) -> dict:
 def recover(unit: str) -> dict:
     if unit not in RUNNERS:
         raise RuntimeError('Recovery is restricted to managed CI units')
-    fd = open_lock()
+    guard = open_root_lock('admission.lock')
+    fd = None
     module, frozen = budget_module(), False
     try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        context = load_state(unit)
+        fd = open_lock((context or {}).get('slot', 1))
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         state = module.properties(unit)
         if state.get('FreezerState') not in ('running', 'none', ''):
@@ -404,7 +473,9 @@ def recover(unit: str) -> dict:
             if frozen:
                 module.run('systemctl', 'thaw', unit)
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
+            os.close(guard)
 
 
 def rollback(backup: Path) -> dict:
@@ -433,9 +504,10 @@ def rollback(backup: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['hook', 'keep', 'install', 'reconcile', 'status', 'recover', 'rollback'])
+    parser.add_argument('action', choices=['hook', 'keep', 'install', 'reconcile', 'status', 'recover', 'rollback', 'configure'])
     parser.add_argument('--backup', type=Path)
     parser.add_argument('--unit', choices=list(RUNNERS))
+    parser.add_argument('--slots', type=int, choices=range(1, MAX_SLOTS + 1))
     for name in ['lock-fd', 'context-fd', 'ready-fd']:
         parser.add_argument('--' + name, type=int)
     args = parser.parse_args()
@@ -458,8 +530,12 @@ def main() -> None:
         if not args.unit:
             parser.error('--unit required')
         result = recover(args.unit)
+    elif args.action == 'configure':
+        if args.slots is None:
+            parser.error('--slots required')
+        result = configure_slots(args.slots)
     else:
-        result = {'runtime_enabled': {u: runtime_enabled(u) for u in RUNNERS},
+        result = {'slots': read_capacity(), 'runtime_enabled': {u: runtime_enabled(u) for u in RUNNERS},
                   'leases': {u: {k: v for k, v in (load_state(u) or {}).items() if k != 'tracking_id'} for u in RUNNERS}}
     print(json.dumps(result, indent=2))
 
